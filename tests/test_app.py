@@ -183,3 +183,16 @@ def test_login_failures_are_throttled(monkeypatch):
     response = session.get('/', auth=('admin', 'wrong'))
     assert response.status_code == 429
     assert response.headers['Retry-After'] == '60'
+
+
+@pytest.mark.parametrize(('message','expected'), [
+    ('This video is DRM protected', 'DRM-protected'),
+    ('Video is not available in your country', 'region'),
+    ('Sign in to confirm your age', 'age verification'),
+    ('Private video', 'private access'),
+    ('This video has been removed', 'removed'),
+    ('HTTP Error 429: Too Many Requests', 'HTTP 429'),
+    ('Unsupported URL: https://threads.net/example', 'not supported'),
+])
+def test_source_restrictions_are_explained(message, expected):
+    assert expected in main.download_error(RuntimeError(message))

@@ -55,11 +55,23 @@ def options():
 def download_error(exc):
     # Classify errors without sending source URLs, credentials, or local paths to the browser.
     message = str(exc).lower()
+    if 'drm' in message:
+        return 'This video is DRM-protected and cannot be downloaded by StreamVault.'
+    if any(text in message for text in ('not available in your country', 'geo restricted', 'geographic restriction', 'geo-restricted')):
+        return 'This video is unavailable in your region. Download access follows the source restrictions.'
+    if any(text in message for text in ('private video', 'sign in', 'login required', 'login-required', 'log in', 'age-restricted', 'confirm your age')):
+        return 'This video requires sign-in, age verification, or private access. Try a publicly accessible video.'
+    if any(text in message for text in ('video unavailable', 'has been removed', 'has been deleted', 'not found', 'http error 404')):
+        return 'The video is unavailable or has been removed. Check the link and its availability on the source website.'
+    if '429' in message or 'too many requests' in message:
+        return 'The source is limiting download requests (HTTP 429). Wait before retrying.'
+    if 'unsupported url' in message:
+        return 'This video link is not supported by the current downloader. Try the direct video link; this platform may need a future update.'
     if '403' in message or 'forbidden' in message:
         return 'The video server rejected the download (HTTP 403). Update yt-dlp with its default dependencies, check the JavaScript runtime, and retry. If it persists, check source access and the terminal warnings.'
     if 'requested format' in message:
         return 'The selected quality is unavailable. Analyze the video again or try a lower resolution.'
-    if 'sign in' in message or 'login' in message or 'private video' in message:
+    if 'login' in message:
         return 'This video requires access or sign-in. Try a publicly accessible video.'
     if 'timed out' in message or 'timeout' in message:
         return 'The source connection timed out. Check your connection and retry.'

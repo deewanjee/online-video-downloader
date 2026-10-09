@@ -68,3 +68,17 @@ The optional **compose.online.yaml** template runs the app behind Caddy with aut
 4. Visit your HTTPS domain and sign in through the browser prompt. Verify analysis, an authorized test download, file delivery and history after a restart.
 
 The app port is exposed only to the internal Docker network. This template trusts proxy headers from that internal network; do not publish the backend port directly. HTTPS certificates and live downloads require external connectivity. Hosting configuration is a template, not evidence of a published online website.
+
+## Platform and browser verification
+
+| Platform | Current evidence |
+| --- | --- |
+| YouTube | One Windows download was confirmed by the user with working picture and audio; other links can fail for source-specific reasons. |
+| TikTok, Facebook, X/Twitter, Instagram, Dailymotion | Native yt-dlp handlers are installed. Representative live downloads still need to be checked with specific public URLs. |
+| Threads | Experimental: the pinned downloader has no dedicated Threads handler; generic page extraction is not a guarantee. |
+
+The URL allowlist currently covers the named platform families above; this app does not accept every website worldwide. Adding a platform requires an actual extractor/integration, public sample URLs and download/conversion checks, as well as updating the allowed domains. Private access, age verification, DRM, regional restrictions, removed videos, rate limits and media-server HTTP 403 errors can prevent extraction or transfer even when another video on the same platform works. Browser choice does not change the backend's source access.
+
+Modern Chrome and Edge use Chromium, Firefox uses Gecko, and Safari uses WebKit. Chromium desktop/mobile dashboard checks have passed. Native Edge, Firefox, Safari and phone-browser testing remains separate; the cloud network blocked download of the Firefox/WebKit test engines. Theme persistence now tolerates browsers that disable localStorage, so unavailable storage does not stop the dashboard from starting. Internet Explorer and obsolete browser versions are not supported.
+
+For each platform/browser combination, analyze a public video, download MP4 at 720p, save the file, and play both picture and sound. Test search, Retry, and retained history after restart. Record the URL, browser/version, result and terminal warnings for any failure. An accepted domain or a platform tile alone is not evidence of a successful download.
