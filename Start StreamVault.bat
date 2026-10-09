@@ -18,7 +18,7 @@ if not exist "%SV_PY%" (
     exit /b 1
   )
 )
-"%SV_PY%" -c "import fastapi, uvicorn, yt_dlp, yt_dlp_ejs" >nul 2>&1
+"%SV_PY%" -c "import fastapi, uvicorn, yt_dlp, yt_dlp_ejs, curl_cffi" >nul 2>&1
 if errorlevel 1 (
   echo Installing dependencies. An Internet connection is required on first launch...
   "%SV_PY%" -m pip install -r requirements.lock --timeout 120 --retries 10

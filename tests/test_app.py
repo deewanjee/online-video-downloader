@@ -88,6 +88,7 @@ def test_real_download_and_conversion(tmp_path, monkeypatch, output):
         req = main.DownloadRequest(url=f'http://127.0.0.1:{server.server_port}/fixture.mp4', format=output, quality='720')
         main.run_download(job_id, req)
         assert main.jobs[job_id]['status'] == 'completed', main.jobs[job_id]
+        assert main.jobs[job_id]['has_audio'] is True
         response = client.get(f'/api/jobs/{job_id}/file')
         assert response.status_code == 200
         assert len(response.content) > 1000
@@ -106,6 +107,7 @@ def isolate_history(tmp_path, monkeypatch):
     monkeypatch.delenv('STREAMVAULT_PASSWORD', raising=False)
     monkeypatch.delenv('STREAMVAULT_PUBLIC', raising=False)
     monkeypatch.delenv('STREAMVAULT_USERNAME', raising=False)
+    monkeypatch.delenv('STREAMVAULT_SYSTEM_CERTS', raising=False)
 
 
 def test_history_survives_restart_and_interrupted_jobs_can_retry(tmp_path, monkeypatch):
@@ -196,3 +198,40 @@ def test_login_failures_are_throttled(monkeypatch):
 ])
 def test_source_restrictions_are_explained(message, expected):
     assert expected in main.download_error(RuntimeError(message))
+
+
+def test_video_only_with_unknown_resolution_downloads_and_respects_cap(tmp_path, monkeypatch):
+    source = tmp_path / 'silent.mp4'
+    subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=purple:s=320x480:d=1', '-c:v', 'libx264', str(source)], check=True)
+    class QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, *args): pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), partial(QuietHandler, directory=str(tmp_path)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f'http://127.0.0.1:{server.server_port}/silent.mp4'
+    def extract(self, *args, **kwargs):
+        return self.process_ie_result({'id': 'silent', 'title': 'Silent source', 'formats': [{'format_id': 'video-only', 'url': url, 'ext': 'mp4', 'vcodec': 'h264', 'acodec': 'none'}]}, download=True)
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', extract)
+    main.jobs['silent'] = {'id': 'silent', 'status': 'queued', 'created': 0}
+    try:
+        main.run_download('silent', main.DownloadRequest(url=url, quality='360'))
+        job = main.jobs['silent']
+        assert job['status'] == 'completed', job
+        assert job['actual_height'] == 360
+        assert job['has_audio'] is False
+        assert client.get('/api/jobs/silent/file').status_code == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_system_trust_does_not_disable_certificate_validation(monkeypatch):
+    import ssl
+    monkeypatch.setenv('STREAMVAULT_SYSTEM_CERTS', '1')
+    settings = main.options()
+    with main.yt_dlp.YoutubeDL(settings) as downloader:
+        handlers = list(downloader._request_director.handlers.values())
+        assert handlers
+        assert all(handler.verify for handler in handlers)
+        native_handlers = [handler for handler in handlers if hasattr(handler, '_make_sslcontext')]
+        assert native_handlers
+        assert all(handler._make_sslcontext().verify_mode == ssl.CERT_REQUIRED for handler in native_handlers)

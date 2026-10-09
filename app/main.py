@@ -1,6 +1,9 @@
 import os
 import importlib.util
+import json
 import shutil
+import ssl
+import subprocess
 import threading
 import time
 import uuid
@@ -49,12 +52,42 @@ def validate_url(url):
 
 def options():
     runtimes = {name: {'path': path} for name in ('deno', 'node') if (path := shutil.which(name))}
-    return {'quiet': True, 'no_warnings': False, 'noplaylist': True, 'socket_timeout': 25, 'retries': 2, 'cachedir': False, 'ignoreconfig': True, 'js_runtimes': runtimes}
+    settings = {'quiet': True, 'no_warnings': False, 'noplaylist': True, 'socket_timeout': 25, 'retries': 2, 'cachedir': False, 'ignoreconfig': True, 'js_runtimes': runtimes}
+    if os.environ.get('STREAMVAULT_SYSTEM_CERTS', '').lower() in ('1', 'true', 'yes'):
+        # yt-dlp's supported option uses the OS trust store; TLS verification stays enabled.
+        settings['compat_opts'] = {'no-certifi'}
+        ca_file = ssl.get_default_verify_paths().cafile
+        if ca_file and not any(os.environ.get(name) for name in ('SSL_CERT_FILE', 'CURL_CA_BUNDLE', 'REQUESTS_CA_BUNDLE')):
+            os.environ.setdefault('CURL_CA_BUNDLE', ca_file)
+    return settings
+
+
+def describe_media(file):
+    if not shutil.which('ffprobe'):
+        return {}
+    try:
+        result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,height', '-of', 'json', str(file)], capture_output=True, text=True, timeout=20, check=True)
+        streams = json.loads(result.stdout).get('streams', [])
+        return {'has_audio': any(s.get('codec_type') == 'audio' for s in streams), 'actual_height': max((s.get('height', 0) for s in streams if s.get('codec_type') == 'video'), default=None)}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+
+
+def cap_resolution(file, height, media):
+    # Some sources omit resolution metadata; enforce the requested cap after probing.
+    if media.get('actual_height', 0) is not None and media.get('actual_height', 0) > height:
+        scaled = file.with_name(file.stem + '.scaled' + file.suffix)
+        subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(file), '-vf', f'scale=-2:{height}', '-c:a', 'copy', str(scaled)], capture_output=True, timeout=300, check=True)
+        scaled.replace(file)
+        return describe_media(file)
+    return media
 
 
 def download_error(exc):
     # Classify errors without sending source URLs, credentials, or local paths to the browser.
     message = str(exc).lower()
+    if 'certificate_verify_failed' in message or 'certificate verify failed' in message:
+        return 'The source certificate could not be verified. Check the trusted certificate setup for your network or managed proxy; TLS verification must remain enabled.'
     if 'drm' in message:
         return 'This video is DRM-protected and cannot be downloaded by StreamVault.'
     if any(text in message for text in ('not available in your country', 'geo restricted', 'geographic restriction', 'geo-restricted')):
@@ -124,7 +157,7 @@ def run_download(job_id, req):
     if req.format in ('mp3', 'm4a', 'wav'):
         opts |= {'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': req.format, 'preferredquality': '192'}]}
     else:
-        opts |= {'format': f'bv*[height<=?{req.quality}]+ba/b[height<=?{req.quality}]', 'merge_output_format': req.format, 'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': req.format}]}
+        opts |= {'format': f'bv*[height<=?{req.quality}]+ba/b[height<=?{req.quality}]/bv*[height<=?{req.quality}]', 'merge_output_format': req.format, 'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': req.format}]}
     try:
         folder.mkdir(parents=True, exist_ok=True)
         if shutil.disk_usage(DATA).free < 256 * 1024**2:
@@ -136,7 +169,10 @@ def run_download(job_id, req):
         if not files:
             raise RuntimeError('No output file')
         file = max(files, key=lambda p: p.stat().st_size)
-        update(job_id, status='completed', progress=100, title=info.get('title', file.stem), filename=file.name, size=file.stat().st_size)
+        media = describe_media(file)
+        if req.format in ('mp4', 'mkv', 'webm'):
+            media = cap_resolution(file, int(req.quality), media)
+        update(job_id, status='completed', progress=100, title=info.get('title', file.stem), filename=file.name, size=file.stat().st_size, **media)
     except Exception as exc:
         message = 'Not enough free disk space. Free space and retry.' if 'disk space' in str(exc).lower() else download_error(exc)
         update(job_id, status='failed', error=message)

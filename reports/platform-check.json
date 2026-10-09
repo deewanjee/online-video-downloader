@@ -1,0 +1,61 @@
+{
+  "scope": "cloud instance; public examples from installed yt-dlp extractor tests; media discarded after test",
+  "results": [
+    {
+      "platform": "YouTube",
+      "url": "https://www.youtube.com/watch?v=YE7VzlLtp-4",
+      "result": "blocked_by_cloud_proxy_403",
+      "downloaded": false,
+      "diagnostic": "ERROR: [youtube] YE7VzlLtp-4: Unable to download API page: ('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')) (caused by ProxyError(\"('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden'))\")); please report this issue on  <source URL> , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U"
+    },
+    {
+      "platform": "TikTok",
+      "url": "https://www.tiktok.com/@patroxofficial/video/6742501081818877190",
+      "result": "downloaded",
+      "bytes": 2027898,
+      "streams": [
+        {
+          "codec_name": "h264",
+          "codec_type": "video"
+        },
+        {
+          "codec_name": "aac",
+          "codec_type": "audio"
+        }
+      ]
+    },
+    {
+      "platform": "Facebook",
+      "url": "https://www.facebook.com/radiokicksfm/videos/3676516585958356/",
+      "result": "extraction_or_network_failure",
+      "downloaded": false,
+      "diagnostic": "ERROR: [facebook] 3676516585958356: Cannot parse data; please report this issue on  <source URL> , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U"
+    },
+    {
+      "platform": "X/Twitter",
+      "url": "https://twitter.com/starwars/status/665052190608723968",
+      "result": "extraction_or_network_failure",
+      "downloaded": false,
+      "diagnostic": "ERROR: [twitter:amplify] 93ad3568-03d2-47b9-a57b-624b88693acd: Unable to download webpage: HTTP Error 500: Internal Server Error (caused by <HTTPError 500: Internal Server Error>)"
+    },
+    {
+      "platform": "Instagram",
+      "url": "https://www.instagram.com/reel/Chunk8-jurw/",
+      "result": "downloaded",
+      "bytes": 918120,
+      "streams": [
+        {
+          "codec_name": "h264",
+          "codec_type": "video"
+        }
+      ]
+    },
+    {
+      "platform": "Dailymotion",
+      "url": "https://www.dailymotion.com/video/x89eyek",
+      "result": "extraction_or_network_failure",
+      "downloaded": false,
+      "diagnostic": "ERROR: [dailymotion] x89eyek: No video formats found!; please report this issue on  <source URL> , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U"
+    }
+  ]
+}

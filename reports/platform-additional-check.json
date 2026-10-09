@@ -1,0 +1,56 @@
+{
+  "scope": "cloud instance; public examples from installed yt-dlp extractor tests; media discarded after test",
+  "results": [
+    {
+      "platform": "Facebook alternate",
+      "url": "https://www.facebook.com/watch/?v=647537299265662",
+      "result": "downloaded",
+      "bytes": 23526592,
+      "streams": [
+        {
+          "codec_name": "h264",
+          "codec_type": "video"
+        },
+        {
+          "codec_name": "aac",
+          "codec_type": "audio"
+        }
+      ]
+    },
+    {
+      "platform": "X alternate",
+      "url": "https://twitter.com/SouthamptonFC/status/1347577658079641604",
+      "result": "downloaded",
+      "bytes": 9740490,
+      "streams": [
+        {
+          "codec_name": "h264",
+          "codec_type": "video"
+        },
+        {
+          "codec_name": "aac",
+          "codec_type": "audio"
+        }
+      ]
+    },
+    {
+      "platform": "Dailymotion alternate",
+      "url": "https://www.dailymotion.com/video/x5kesuj",
+      "result": "extraction_or_network_failure",
+      "downloaded": false,
+      "diagnostic": "ERROR: [dailymotion] x5kesuj: No video formats found!; please report this issue on  <source URL> , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U"
+    },
+    {
+      "platform": "Instagram alternate",
+      "url": "https://www.instagram.com/p/aye83DjauH/",
+      "result": "downloaded",
+      "bytes": 1017829,
+      "streams": [
+        {
+          "codec_name": "h264",
+          "codec_type": "video"
+        }
+      ]
+    }
+  ]
+}
