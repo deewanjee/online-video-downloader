@@ -13,14 +13,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from app import storage
+from app.auth import AccessControl
 
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get('DOWNLOAD_DIR', ROOT.parent / 'data')).resolve()
 DATA.mkdir(parents=True, exist_ok=True)
-app = FastAPI(title='StreamVault', version='1.0.0')
+app = FastAPI(title='StreamVault', version='1.1.0')
+app.add_middleware(AccessControl)
 app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 HOSTS = ('youtube.com', 'youtu.be', 'dailymotion.com', 'dai.ly', 'facebook.com', 'fb.watch', 'tiktok.com', 'instagram.com', 'threads.net', 'threads.com', 'twitter.com', 'x.com')
-jobs = {}
+jobs = storage.restore(DATA)
 lock = threading.Lock()
 pool = ThreadPoolExecutor(max_workers=2)
 
@@ -70,7 +73,7 @@ def index():
 
 @app.get('/api/health')
 def health():
-    return {'status': 'ok', 'ffmpeg': bool(shutil.which('ffmpeg')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'active': sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())}
+    return {'application': 'StreamVault', 'status': 'ok', 'ffmpeg': bool(shutil.which('ffmpeg')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'active': sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())}
 
 
 @app.post('/api/analyze')
@@ -91,12 +94,14 @@ def analyze(req: VideoRequest):
 
 def update(job_id, **values):
     with lock:
+        previous_status = jobs[job_id]['status']
         jobs[job_id].update(values)
+        if jobs[job_id]['status'] != previous_status or jobs[job_id]['status'] in ('completed', 'failed'):
+            storage.save(DATA, jobs[job_id])
 
 
 def run_download(job_id, req):
     folder = DATA / job_id
-    folder.mkdir()
     def progress(event):
         if event['status'] == 'downloading':
             total = event.get('total_bytes') or event.get('total_bytes_estimate') or 0
@@ -109,6 +114,9 @@ def run_download(job_id, req):
     else:
         opts |= {'format': f'bv*[height<=?{req.quality}]+ba/b[height<=?{req.quality}]', 'merge_output_format': req.format, 'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': req.format}]}
     try:
+        folder.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(DATA).free < 256 * 1024**2:
+            raise RuntimeError('Insufficient free disk space')
         update(job_id, status='downloading')
         with yt_dlp.YoutubeDL(opts) as dl:
             info = dl.extract_info(req.url, download=True)
@@ -118,7 +126,8 @@ def run_download(job_id, req):
         file = max(files, key=lambda p: p.stat().st_size)
         update(job_id, status='completed', progress=100, title=info.get('title', file.stem), filename=file.name, size=file.stat().st_size)
     except Exception as exc:
-        update(job_id, status='failed', error=download_error(exc))
+        message = 'Not enough free disk space. Free space and retry.' if 'disk space' in str(exc).lower() else download_error(exc)
+        update(job_id, status='failed', error=message)
         shutil.rmtree(folder, ignore_errors=True)
 
 
@@ -136,8 +145,32 @@ def download(req: DownloadRequest):
             raise HTTPException(429, 'History is full. Remove older downloads first.')
         job_id = uuid.uuid4().hex
         jobs[job_id] = {'id': job_id, 'url': req.url, 'title': 'Preparing download', 'format': req.format, 'quality': req.quality, 'status': 'queued', 'progress': 0, 'created': time.time()}
+        storage.save(DATA, jobs[job_id])
+        result = jobs[job_id].copy()
     pool.submit(run_download, job_id, req)
-    return jobs[job_id].copy()
+    return result
+
+
+@app.post('/api/jobs/{job_id}/retry', status_code=202)
+def retry_job(job_id: str):
+    with lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, 'Download not found.')
+        if job['status'] != 'failed':
+            raise HTTPException(409, 'Only failed downloads can be retried.')
+        if sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values()) >= 10:
+            raise HTTPException(429, 'Queue is full. Wait for a download to finish.')
+        req = DownloadRequest(url=job['url'], format=job['format'], quality=job['quality'])
+        validate_url(req.url)
+        if not shutil.which('ffmpeg'):
+            raise HTTPException(503, 'Install FFmpeg to enable downloads and conversion.')
+        job.update(status='queued', progress=0, speed=None, eta=None)
+        job.pop('error', None)
+        storage.save(DATA, job)
+        result = job.copy()
+    pool.submit(run_download, job_id, req)
+    return result
 
 
 @app.get('/api/jobs')
@@ -165,6 +198,7 @@ def remove_job(job_id: str):
             raise HTTPException(404, 'Download not found.')
         if job['status'] not in ('completed', 'failed'):
             raise HTTPException(409, 'Wait for the download to finish before removing it.')
+        storage.delete(DATA, job_id)
         del jobs[job_id]
     shutil.rmtree(DATA / job_id, ignore_errors=True)
     return {'removed': True}

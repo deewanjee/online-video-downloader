@@ -1,0 +1,3 @@
+{$STREAMVAULT_DOMAIN} {
+    reverse_proxy streamvault:8000
+}

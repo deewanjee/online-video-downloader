@@ -91,3 +91,89 @@ def test_real_download_and_conversion(tmp_path, monkeypatch, output):
         main.jobs.pop(job_id, None)
         server.shutdown()
         server.server_close()
+
+
+@pytest.fixture(autouse=True)
+def isolate_history(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, 'DATA', tmp_path)
+    monkeypatch.setattr(main, 'jobs', {})
+    monkeypatch.delenv('STREAMVAULT_PASSWORD', raising=False)
+    monkeypatch.delenv('STREAMVAULT_PUBLIC', raising=False)
+    monkeypatch.delenv('STREAMVAULT_USERNAME', raising=False)
+
+
+def test_history_survives_restart_and_interrupted_jobs_can_retry(tmp_path, monkeypatch):
+    completed = {'id': 'completed', 'url': 'https://youtu.be/test', 'title': 'Saved video', 'format': 'mp4', 'quality': '720', 'status': 'completed', 'created': 0, 'filename': 'video.mp4', 'progress': 100}
+    folder = tmp_path / completed['id']
+    folder.mkdir()
+    (folder / completed['filename']).write_bytes(b'saved-media')
+    interrupted = completed | {'id': 'interrupted', 'status': 'downloading', 'progress': 45}
+    main.storage.save(tmp_path, completed)
+    main.storage.save(tmp_path, interrupted)
+    restored = main.storage.restore(tmp_path)
+    monkeypatch.setattr(main, 'jobs', restored)
+    assert client.get('/api/jobs/completed/file').content == b'saved-media'
+    assert restored['interrupted']['status'] == 'failed'
+    assert 'restart' in restored['interrupted']['error']
+    submitted = []
+    monkeypatch.setattr(main.pool, 'submit', lambda *args: submitted.append(args))
+    response = client.post('/api/jobs/interrupted/retry')
+    assert response.status_code == 202
+    assert response.json()['status'] == 'queued'
+    assert 'error' not in response.json()
+    assert submitted[0][1] == 'interrupted'
+    assert client.post('/api/jobs/interrupted/retry').status_code == 409
+    assert client.delete('/api/jobs/completed').status_code == 200
+    assert 'completed' not in main.storage.restore(tmp_path)
+    assert not folder.exists()
+
+
+def test_protected_routes_and_static_files(monkeypatch):
+    monkeypatch.setenv('STREAMVAULT_PASSWORD', 'test-password')
+    monkeypatch.setenv('STREAMVAULT_USERNAME', 'owner')
+    for path in ['/', '/api/jobs', '/static/app.js', '/docs']:
+        assert client.get(path).status_code == 401
+        assert client.get(path, auth=('owner', 'test-password')).status_code == 200
+    assert client.get('/api/jobs', auth=('owner', 'wrong')).status_code == 401
+    assert client.post('/api/jobs/missing/retry').status_code == 401
+
+
+def test_public_mode_fails_closed_without_password(monkeypatch):
+    monkeypatch.setenv('STREAMVAULT_PUBLIC', 'true')
+    assert client.get('/').status_code == 503
+    assert client.get('/api/jobs').status_code == 503
+
+
+def test_cross_site_mutations_are_rejected():
+    assert client.post('/api/jobs/missing/retry', headers={'Origin': 'https://evil.example'}).status_code == 403
+    assert client.post('/api/jobs/missing/retry', headers={'Origin': 'http://testserver'}).status_code == 404
+
+
+def test_low_disk_space_returns_retriable_failure(tmp_path, monkeypatch):
+    from collections import namedtuple
+    usage = namedtuple('Usage', 'total used free')
+    monkeypatch.setattr(main.shutil, 'disk_usage', lambda path: usage(1024, 1000, 24))
+    main.jobs['low-disk'] = {'id': 'low-disk', 'status': 'queued', 'created': 0}
+    main.run_download('low-disk', main.DownloadRequest(url='https://youtu.be/test'))
+    assert main.jobs['low-disk']['status'] == 'failed'
+    assert 'disk space' in main.jobs['low-disk']['error']
+    assert main.storage.restore(tmp_path)['low-disk']['status'] == 'failed'
+
+
+def test_login_failures_are_throttled(monkeypatch):
+    from app.auth import AccessControl
+    from fastapi import FastAPI
+    protected = FastAPI()
+    protected.add_middleware(AccessControl)
+    @protected.get('/')
+    def index():
+        return {'ok': True}
+    monkeypatch.setenv('STREAMVAULT_PASSWORD', 'test-password')
+    session = TestClient(protected)
+    for _ in range(12):
+        assert session.get('/').status_code == 401  # Browser challenges should not lock out the owner.
+    for _ in range(10):
+        assert session.get('/', auth=('admin', 'wrong')).status_code == 401
+    response = session.get('/', auth=('admin', 'wrong'))
+    assert response.status_code == 429
+    assert response.headers['Retry-After'] == '60'
