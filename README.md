@@ -1,6 +1,8 @@
 # StreamVault
 
-A self-hosted online video downloader with a responsive dashboard, live download queue, quality selection, audio extraction, search, and dark mode. Built with FastAPI, yt-dlp, FFmpeg, and a lightweight browser interface.
+A self-hosted online video downloader with a responsive dashboard, live download queue, quality selection, audio extraction, search, dark mode, local video thumbnails, and an in-app media player. Built with FastAPI, yt-dlp, FFmpeg, and a lightweight browser interface.
+
+![Media studio dashboard with generated test videos](reports/studio-preview.png)
 
 ## Windows quick start
 
@@ -23,7 +25,7 @@ pip install -r requirements.lock
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Open `http://127.0.0.1:8000` on your computer. Paste a public video URL, analyze it, choose an output format and maximum resolution, and add it to the queue. After conversion, click **Save file** to download to your device.
+Open `http://127.0.0.1:8000` on your computer. Paste a public video URL, analyze it, choose an output format and maximum resolution, and add it to the queue. After processing, click **Play** to watch or listen inside the dashboard, or **Save original** to download to your device. The library displays local thumbnails for completed videos. The player supports native controls, seeking, volume and fullscreen where the browser provides them; Escape or the close button stops playback.
 
 Supported URL families: YouTube, Dailymotion, Facebook, TikTok, Instagram, Threads, and X/Twitter. Actual extraction depends on yt-dlp and the source. Login-required, private, DRM-protected, geographic, age-restricted, and live content are not guaranteed. There is no DRM or authentication bypass. Use content you own or have permission to download.
 
@@ -33,7 +35,7 @@ Output formats: **MP4, WebM, MKV, MP3, M4A, WAV**. The video quality setting is 
 
 Run the same app on a server with Python, FFmpeg, and a supported JavaScript runtime. A single-owner HTTP Basic login protects all routes when **STREAMVAULT_PASSWORD** is set; **STREAMVAULT_USERNAME** defaults to `admin`. Public mode (`STREAMVAULT_PUBLIC=true`) rejects requests until a password is configured. Always put online instances behind **HTTPS**, because Basic authentication depends on transport encryption. The app is a shared owner workspace, not a multi-tenant service. Add proxy request limits and enforce outbound network filtering (block private/link-local addresses), CPU/time limits, and disk quotas before Internet deployment. URL validation allows supported HTTPS site names, but extractor-generated redirects and media requests also need network-level filtering. Browser mutations are restricted to the current origin, and repeated failed logins are throttled.
 
-`DOWNLOAD_DIR` optionally changes storage (default `data/`). Two downloads run concurrently, with up to ten active/queued jobs and one hundred history entries. A 2 GiB source-file limit is applied when yt-dlp can determine the size; enforce a filesystem quota for a hard limit. New downloads are refused by the worker when less than 256 MiB is free. Completed files remain until removed. Removing a history entry deletes its file. Metadata is saved in **data/history.sqlite3** and survives restarts. Interrupted jobs become failed and can be restarted with **Retry**. Back up the whole data directory while the app is stopped to retain both history and media. Use a **single Uvicorn worker**; workers share disk metadata but do not share the active queue. Active downloads cannot currently be cancelled.
+`DOWNLOAD_DIR` optionally changes storage (default `data/`). Two downloads run concurrently, with up to ten active/queued jobs and one hundred history entries. A 2 GiB source-file limit is applied when yt-dlp can determine the size; enforce a filesystem quota for a hard limit. New downloads are refused by the worker when less than 256 MiB is free. Completed files remain until removed. Removing a history entry deletes its file. Video posters and compatible browser previews are stored in each job's **_preview/** directory. MKV, WebM and MP4 files with incompatible codecs receive an H.264/AAC MP4 preview; the original download remains unchanged. Preview preparation can add processing time and disk usage. A preview failure does not discard a successful original download; the dashboard offers Save original instead. Older completed jobs can prepare posters/previews on first access. A source thumbnail is shown during analysis when available, with a visual fallback when unavailable. Metadata is saved in **data/history.sqlite3** and survives restarts. Interrupted jobs become failed and can be restarted with **Retry**. Back up the whole data directory while the app is stopped to retain both history and media. Use a **single Uvicorn worker**; workers share disk metadata but do not share the active queue. Active downloads cannot currently be cancelled.
 
 The `curl-cffi` dependency enables source handlers that require browser-style HTTP requests. It is not a UI browser test. On a managed network whose trusted proxy CA is already installed in the operating system, `STREAMVAULT_SYSTEM_CERTS=1` selects that trust store for yt-dlp. Supply the approved CA bundle using `CURL_CA_BUNDLE` when needed. Certificate verification remains enabled; do not use this setting to trust an unknown certificate. Ordinary laptop networks normally need no override.
 
@@ -50,7 +52,7 @@ node --check app/static/app.js
 
 Tests cover URL rejection, API responses, format normalization, actual yt-dlp downloads of a generated local video, FFmpeg audio conversion, file delivery, deletion, history restoration, retry, low-disk errors, login protection, and cross-site request rejection. Local fixtures do not prove current access to every external platform. A user-confirmed Windows YouTube download played correctly with both picture and audio; that confirms that video on that computer, not every platform or source.
 
-API docs are available at `/docs`. Main routes: `/api/analyze`, `/api/download`, `/api/jobs`, `/api/jobs/{id}/file`, `/api/jobs/{id}/retry`, and `/api/health`. Error messages deliberately avoid exposing extractor details or credentials.
+API docs are available at `/docs`. Main routes: `/api/analyze`, `/api/download`, `/api/jobs`, `/api/jobs/{id}/file`, `/api/jobs/{id}/retry`, `/api/jobs/{id}/thumbnail`, `/api/jobs/{id}/stream`, and `/api/health`. Streaming supports HTTP byte ranges for seeking and remains protected by the same owner login. Error messages deliberately avoid exposing extractor details or credentials.
 
 ## Docker alternative
 
@@ -58,7 +60,7 @@ API docs are available at `/docs`. Main routes: `/api/analyze`, `/api/download`,
 docker compose up --build -d
 ```
 
-The compose file binds to localhost and retains media in a named volume. FFmpeg and Node.js are bundled in the image. `docker compose down` stops the app; add `-v` only if you intend to delete saved media. Both Compose templates pass configuration validation, the image builds successfully, all 46 tests pass inside the image as the unprivileged app user, and container startup/dashboard readiness checks pass. The managed cloud build used the configured proxy route and a trusted CA bundle; TLS and package-signature verification stayed enabled. On ordinary networks, no custom CA configuration is needed. Managed TLS proxies can supply a trusted CA bundle with `docker build --secret id=build_ca,src=/path/to/trusted-ca-bundle.pem .`; the bundle is mounted only for build-time package downloads, not copied into the image. Online domain, HTTPS certificate issuance, and hosted source access still require validation on the actual server.
+The compose file binds to localhost and retains media in a named volume. FFmpeg and Node.js are bundled in the image. `docker compose down` stops the app; add `-v` only if you intend to delete saved media. Both Compose templates pass configuration validation, the image builds successfully, all 47 tests pass inside the image as the unprivileged app user, and container startup/dashboard readiness checks pass. The managed cloud build used the configured proxy route and a trusted CA bundle; TLS and package-signature verification stayed enabled. On ordinary networks, no custom CA configuration is needed. Managed TLS proxies can supply a trusted CA bundle with `docker build --secret id=build_ca,src=/path/to/trusted-ca-bundle.pem .`; the bundle is mounted only for build-time package downloads, not copied into the image. Online domain, HTTPS certificate issuance, and hosted source access still require validation on the actual server.
 
 ## Future online hosting
 

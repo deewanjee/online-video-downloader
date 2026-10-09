@@ -28,7 +28,9 @@ app.add_middleware(AccessControl)
 app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 HOSTS = ('youtube.com', 'youtu.be', 'dailymotion.com', 'dai.ly', 'facebook.com', 'fb.watch', 'tiktok.com', 'instagram.com', 'threads.net', 'threads.com', 'twitter.com', 'x.com')
 jobs = storage.restore(DATA)
+analysis_cache = {}
 lock = threading.Lock()
+preview_lock = threading.Lock()
 pool = ThreadPoolExecutor(max_workers=2)
 
 class VideoRequest(BaseModel):
@@ -75,9 +77,11 @@ def describe_media(file):
         return {}
 
     try:
-        result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,height', '-of', 'json', str(file)], capture_output=True, text=True, timeout=20, check=True)
+        result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name,height', '-of', 'json', str(file)], capture_output=True, text=True, timeout=20, check=True)
         streams = json.loads(result.stdout).get('streams', [])
-        return {'has_audio': any(s.get('codec_type') == 'audio' for s in streams), 'actual_height': max((s.get('height', 0) for s in streams if s.get('codec_type') == 'video'), default=None)}
+        return {'has_audio': any(s.get('codec_type') == 'audio' for s in streams), 'actual_height': max((s.get('height', 0) for s in streams if s.get('codec_type') == 'video'), default=None),
+                'video_codec': next((s.get('codec_name') for s in streams if s.get('codec_type') == 'video'), None),
+                'audio_codec': next((s.get('codec_name') for s in streams if s.get('codec_type') == 'audio'), None)}
     except (OSError, ValueError, subprocess.SubprocessError):
         return {}
 
@@ -90,6 +94,38 @@ def cap_resolution(file, height, media):
         scaled.replace(file)
         return describe_media(file)
     return media
+
+
+def make_thumbnail(file):
+    directory = file.parent / '_preview'
+    directory.mkdir(exist_ok=True)
+    target = directory / 'cover.jpg'
+    if not target.is_file():
+        temporary = directory / 'cover.tmp.jpg'
+        try:
+            subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(file), '-frames:v', '1', '-vf', 'scale=640:-2', '-q:v', '3', str(temporary)], capture_output=True, timeout=30, check=True)
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return target
+
+
+def playable_file(file, media):
+    if file.suffix == '.mp4' and media.get('video_codec') == 'h264' and media.get('audio_codec') in (None, 'aac', 'mp3'):
+        return file
+    if file.suffix in ('.mp3', '.m4a', '.wav'):
+        return file
+    directory = file.parent / '_preview'
+    directory.mkdir(exist_ok=True)
+    target = directory / 'browser.mp4'
+    if not target.is_file():
+        temporary = directory / 'browser.tmp.mp4'
+        try:
+            subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(file), '-map', '0:v:0', '-map', '0:a:0?', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-movflags', '+faststart', str(temporary)], capture_output=True, timeout=300, check=True)
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return target
 
 
 def download_error(exc):
@@ -148,7 +184,12 @@ def analyze(req: VideoRequest):
         if not info or info.get('_type') in ('playlist', 'multi_video') or info.get('is_live'):
             raise HTTPException(400, 'Please choose a single, non-live video.')
         heights = sorted({f['height'] for f in info.get('formats', []) if f.get('height') and f.get('vcodec') != 'none'}, reverse=True)
-        return {'title': info.get('title', 'Untitled video'), 'author': info.get('uploader', 'Unknown creator'), 'duration': info.get('duration'), 'thumbnail': info.get('thumbnail'), 'platform': info.get('extractor_key'), 'qualities': heights, 'url': req.url}
+        result = {'title': info.get('title', 'Untitled video'), 'author': info.get('uploader', 'Unknown creator'), 'duration': info.get('duration'), 'thumbnail': info.get('thumbnail'), 'platform': info.get('extractor_key'), 'qualities': heights, 'url': req.url}
+        with lock:
+            if len(analysis_cache) >= 100:
+                analysis_cache.pop(next(iter(analysis_cache)))
+            analysis_cache[req.url] = (time.monotonic(), {key: result[key] for key in ('title', 'thumbnail', 'duration', 'platform')})
+        return result
     except HTTPException:
         raise
     except Exception as exc:
@@ -190,7 +231,19 @@ def run_download(job_id, req):
         media = describe_media(file)
         if req.format in ('mp4', 'mkv', 'webm'):
             media = cap_resolution(file, int(req.quality), media)
-        update(job_id, status='completed', progress=100, title=info.get('title', file.stem), filename=file.name, size=file.stat().st_size, **media)
+        preview_available = False
+        if req.format in ('mp4', 'mkv', 'webm'):
+            try:
+                make_thumbnail(file)
+            except (OSError, subprocess.SubprocessError):
+                pass  # A missing poster must never turn a successful download into a failure.
+        try:
+            playable_file(file, media)
+            preview_available = True
+        except (OSError, subprocess.SubprocessError):
+            pass
+        update(job_id, status='completed', progress=100, title=info.get('title', file.stem), filename=file.name, size=file.stat().st_size,
+               thumbnail=info.get('thumbnail'), duration=info.get('duration'), platform=info.get('extractor_key'), preview_available=preview_available, **media)
     except Exception as exc:
         message = 'Not enough free disk space. Free space and retry.' if 'disk space' in str(exc).lower() else download_error(exc)
         update(job_id, status='failed', error=message)
@@ -211,6 +264,9 @@ def download(req: DownloadRequest):
             raise HTTPException(429, 'History is full. Remove older downloads first.')
         job_id = uuid.uuid4().hex
         jobs[job_id] = {'id': job_id, 'url': req.url, 'title': 'Preparing download', 'format': req.format, 'quality': req.quality, 'status': 'queued', 'progress': 0, 'created': time.time()}
+        cached = analysis_cache.get(req.url)
+        if cached and time.monotonic() - cached[0] < 900:
+            jobs[job_id].update(cached[1])
         storage.save(DATA, jobs[job_id])
         result = jobs[job_id].copy()
     pool.submit(run_download, job_id, req)
@@ -247,13 +303,43 @@ def list_jobs():
 
 @app.get('/api/jobs/{job_id}/file')
 def get_file(job_id: str):
+    file, job = completed_file(job_id)
+    return FileResponse(file, filename=job['filename'])
+
+
+def completed_file(job_id):
     job = jobs.get(job_id)
     if not job or job['status'] != 'completed':
         raise HTTPException(404, 'Download is not available.')
     file = DATA / job_id / job['filename']
     if not file.is_file():
         raise HTTPException(404, 'File no longer exists.')
-    return FileResponse(file, filename=job['filename'])
+    return file, job
+
+
+@app.get('/api/jobs/{job_id}/thumbnail')
+def get_thumbnail(job_id: str):
+    file, job = completed_file(job_id)
+    if job.get('format') not in ('mp4', 'mkv', 'webm'):
+        raise HTTPException(404, 'No video thumbnail is available.')
+    try:
+        with preview_lock:
+            thumbnail = make_thumbnail(file)
+        return FileResponse(thumbnail, media_type='image/jpeg', headers={'Cache-Control': 'private, max-age=86400'})
+    except (OSError, subprocess.SubprocessError):
+        raise HTTPException(404, 'Thumbnail is unavailable.')
+
+
+@app.get('/api/jobs/{job_id}/stream')
+def stream_file(job_id: str):
+    file, job = completed_file(job_id)
+    try:
+        with preview_lock:
+            preview = playable_file(file, job if 'video_codec' in job else describe_media(file))
+        media_type = {'.mp4': 'video/mp4', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.wav': 'audio/wav'}[preview.suffix]
+        return FileResponse(preview, media_type=media_type, headers={'Cache-Control': 'private, no-cache'})
+    except (OSError, KeyError, subprocess.SubprocessError):
+        raise HTTPException(422, 'A browser preview could not be prepared. Save the original file to play it on your device.')
 
 
 @app.delete('/api/jobs/{job_id}')

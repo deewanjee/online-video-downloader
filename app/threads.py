@@ -109,9 +109,13 @@ class ThreadsIE(InfoExtractor):
             raise ExtractorError('Threads public video files are unavailable.', expected=True)
         caption = (post.get('caption') or {}).get('text') or (media.get('caption') or {}).get('text')
         user = post.get('user') or {}
+        images = (media.get('image_versions2') or {}).get('candidates') or []
+        thumbnails = [item for item in images if isinstance(item, dict) and public_media_url(item.get('url'))]
+        thumbnail = max(thumbnails, key=lambda item: int_or_none(item.get('width')) or 0)['url'] if thumbnails else None
         return {
             'id': video_id, 'title': (caption or f'Threads video {video_id}')[:240],
             'description': caption, 'uploader': user.get('username'),
             'timestamp': int_or_none(post.get('taken_at')),
+            'thumbnail': thumbnail,
             'webpage_url': response.url.split('?')[0], 'formats': formats,
         }

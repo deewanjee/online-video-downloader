@@ -83,7 +83,7 @@ def test_real_download_and_conversion(tmp_path, monkeypatch, output):
     storage.mkdir()
     monkeypatch.setattr(main, 'DATA', storage)
     job_id = 'test_' + output
-    main.jobs[job_id] = {'id': job_id, 'status': 'queued', 'created': 0}
+    main.jobs[job_id] = {'id': job_id, 'status': 'queued', 'created': 0, 'format': output}
     try:
         req = main.DownloadRequest(url=f'http://127.0.0.1:{server.server_port}/fixture.mp4', format=output, quality='720')
         main.run_download(job_id, req)
@@ -92,7 +92,32 @@ def test_real_download_and_conversion(tmp_path, monkeypatch, output):
         response = client.get(f'/api/jobs/{job_id}/file')
         assert response.status_code == 200
         assert len(response.content) > 1000
+        stream = client.get(f'/api/jobs/{job_id}/stream', headers={'Range': 'bytes=0-99'})
+        assert stream.status_code == 206
+        assert len(stream.content) == 100
+        assert stream.headers['content-range'].startswith('bytes 0-99/')
+        assert 'attachment' not in stream.headers.get('content-disposition', '')
+        assert main.jobs[job_id]['preview_available'] is True
+        if output in ('mp4', 'webm', 'mkv'):
+            assert stream.headers['content-type'] == 'video/mp4'
+            preview = main.playable_file(storage / job_id / main.jobs[job_id]['filename'], main.jobs[job_id])
+            assert main.describe_media(preview)['video_codec'] == 'h264'
+            poster = client.get(f'/api/jobs/{job_id}/thumbnail')
+            assert poster.status_code == 200
+            assert poster.headers['content-type'] == 'image/jpeg'
+            assert poster.content.startswith(b'\xff\xd8')
+            # Pre-update downloads gain a local thumbnail without re-downloading the source.
+            (storage / job_id / '_preview' / 'cover.jpg').unlink()
+            assert client.get(f'/api/jobs/{job_id}/thumbnail').status_code == 200
+        else:
+            assert stream.headers['content-type'].startswith('audio/')
+            assert client.get(f'/api/jobs/{job_id}/thumbnail').status_code == 404
+        monkeypatch.setenv('STREAMVAULT_PASSWORD', 'test-owner-password')
+        assert client.get(f'/api/jobs/{job_id}/stream').status_code == 401
+        assert client.get(f'/api/jobs/{job_id}/thumbnail').status_code == 401
+        monkeypatch.delenv('STREAMVAULT_PASSWORD')
         assert client.delete(f'/api/jobs/{job_id}').status_code == 200
+        assert client.get(f'/api/jobs/{job_id}/stream').status_code == 404
         assert not (storage / job_id).exists()
     finally:
         main.jobs.pop(job_id, None)
@@ -104,6 +129,7 @@ def test_real_download_and_conversion(tmp_path, monkeypatch, output):
 def isolate_history(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'DATA', tmp_path)
     monkeypatch.setattr(main, 'jobs', {})
+    monkeypatch.setattr(main, 'analysis_cache', {})
     monkeypatch.delenv('STREAMVAULT_PASSWORD', raising=False)
     monkeypatch.delenv('STREAMVAULT_PUBLIC', raising=False)
     monkeypatch.delenv('STREAMVAULT_USERNAME', raising=False)
@@ -304,3 +330,16 @@ def test_threads_rejects_unavailable_ambiguous_or_untrusted_sources(monkeypatch,
 def test_threads_media_urls_must_use_trusted_https_cdn(url):
     from app.threads import public_media_url
     assert public_media_url(url) is False
+
+
+def test_analyzed_thumbnail_is_retained_in_queued_history(monkeypatch):
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', lambda *a, **k: {'title': 'A saved moment', 'thumbnail': 'https://i.ytimg.com/fixture.jpg', 'duration': 42, 'extractor_key': 'Youtube', 'formats': []})
+    monkeypatch.setattr(main.pool, 'submit', lambda *a, **k: None)
+    url = 'https://youtu.be/fixture'
+    assert client.post('/api/analyze', json={'url': url}).status_code == 200
+    response = client.post('/api/download', json={'url': url})
+    assert response.status_code == 202
+    job = response.json()
+    assert job['thumbnail'] == 'https://i.ytimg.com/fixture.jpg'
+    assert job['title'] == 'A saved moment'
+    assert main.storage.restore(main.DATA)[job['id']]['thumbnail'] == job['thumbnail']
