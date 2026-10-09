@@ -235,3 +235,72 @@ def test_system_trust_does_not_disable_certificate_validation(monkeypatch):
         native_handlers = [handler for handler in handlers if hasattr(handler, '_make_sslcontext')]
         assert native_handlers
         assert all(handler._make_sslcontext().verify_mode == ssl.CERT_REQUIRED for handler in native_handlers)
+
+
+def threads_page(post, recommendation=None):
+    import json
+    data = {'require': [{'data': {'media': post}}], 'recommendation': recommendation}
+    return '<script data-test="fixture" type="application/json">' + json.dumps(data) + '</script>'
+
+
+def test_threads_share_extracts_only_target_quoted_video(monkeypatch):
+    from types import SimpleNamespace
+    from app.threads import ThreadsIE
+    post = {'code': 'Target123', 'video_versions': [], 'caption': {'text': '<Public post>'}, 'user': {'username': 'owner'},
+            'text_post_app_info': {'share_info': {'quoted_attachment_post': {
+                'code': 'Original123', 'has_audio': True,
+                'video_versions': [{'url': 'https://video.cdninstagram.com/quoted.mp4'}]}}}}
+    recommendation = {'code': 'Other123', 'video_versions': [{'url': 'https://video.cdninstagram.com/wrong.mp4'}]}
+    page = threads_page(post, recommendation)
+    monkeypatch.setattr(ThreadsIE, '_download_webpage_handle', lambda *a, **k: (page, SimpleNamespace(url='https://www.threads.com/@owner/post/Target123?share=1')))
+    result = main.analyze(main.VideoRequest(url='https://www.threads.com/share/Share123/'))
+    assert result['platform'] == 'Threads'
+    assert result['title'] == '<Public post>'
+    with main.video_downloader(main.options()) as downloader:
+        info = downloader.extract_info('https://www.threads.com/share/Share123/', download=False)
+    assert info['id'] == 'Target123'
+    assert info['formats'][0]['url'] == 'https://video.cdninstagram.com/quoted.mp4'
+    assert info['uploader'] == 'owner'
+
+
+@pytest.mark.parametrize('host', ['threads.com', 'threads.net'])
+def test_threads_direct_post_is_registered(monkeypatch, host):
+    from types import SimpleNamespace
+    from app.threads import ThreadsIE
+    url = f'https://www.{host}/@owner/post/Direct123'
+    post = {'code': 'Direct123', 'video_versions': [{'url': 'https://video.fbcdn.net/direct.mp4'}], 'caption': {'text': 'Direct video'}}
+    monkeypatch.setattr(ThreadsIE, '_download_webpage_handle', lambda *a, **k: (threads_page(post), SimpleNamespace(url=url)))
+    result = main.analyze(main.VideoRequest(url=url))
+    assert result['platform'] == 'Threads'
+    assert result['title'] == 'Direct video'
+
+
+@pytest.mark.parametrize('case,expected', [
+    ('missing', 'sign-in'), ('text', 'no publicly available video'),
+    ('multiple', 'single video'), ('bad_media', 'video files are unavailable'),
+    ('bad_redirect', 'public post'),
+])
+def test_threads_rejects_unavailable_ambiguous_or_untrusted_sources(monkeypatch, case, expected):
+    from types import SimpleNamespace
+    from app.threads import ThreadsIE
+    post = {'code': 'Target123', 'video_versions': []}
+    url = 'https://www.threads.com/@owner/post/Target123'
+    if case == 'missing':
+        post['code'] = 'Recommendation123'
+        post['video_versions'] = [{'url': 'https://video.fbcdn.net/unrelated.mp4'}]
+    if case == 'multiple':
+        post['carousel_media'] = [{'video_versions': [{'url': 'https://video.fbcdn.net/video.mp4'}]} for _ in range(2)]
+    if case == 'bad_media':
+        post['video_versions'] = [{'url': 'https://127.0.0.1/private.mp4'}]
+    if case == 'bad_redirect':
+        url = 'https://example.org/@owner/post/Target123'
+    monkeypatch.setattr(ThreadsIE, '_download_webpage_handle', lambda *a, **k: (threads_page(post), SimpleNamespace(url=url)))
+    result = client.post('/api/analyze', json={'url': 'https://www.threads.com/share/Share123/'})
+    assert result.status_code == 422
+    assert expected in result.json()['detail']
+
+
+@pytest.mark.parametrize('url', ['http://video.fbcdn.net/a.mp4', 'https://fbcdn.net.evil.com/a.mp4', 'https://user:pass@video.fbcdn.net/a.mp4', 'https://video.fbcdn.net:444/a.mp4', 'https://127.0.0.1/a.mp4'])
+def test_threads_media_urls_must_use_trusted_https_cdn(url):
+    from app.threads import public_media_url
+    assert public_media_url(url) is False

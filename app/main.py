@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from app import storage
 from app.auth import AccessControl
+from app.threads import ThreadsIE
 
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get('DOWNLOAD_DIR', ROOT.parent / 'data')).resolve()
@@ -62,9 +63,17 @@ def options():
     return settings
 
 
+def video_downloader(settings):
+    downloader = yt_dlp.YoutubeDL(settings, auto_init=False)
+    downloader.add_info_extractor(ThreadsIE())
+    downloader.add_default_info_extractors()
+    return downloader
+
+
 def describe_media(file):
     if not shutil.which('ffprobe'):
         return {}
+
     try:
         result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,height', '-of', 'json', str(file)], capture_output=True, text=True, timeout=20, check=True)
         streams = json.loads(result.stdout).get('streams', [])
@@ -86,6 +95,15 @@ def cap_resolution(file, height, media):
 def download_error(exc):
     # Classify errors without sending source URLs, credentials, or local paths to the browser.
     message = str(exc).lower()
+    if 'threads' in message:
+        if 'contains multiple videos' in message:
+            return 'This Threads post contains multiple videos. Choose a post containing a single video.'
+        if 'no publicly available video' in message:
+            return 'This Threads post has no publicly available video.'
+        if 'public video files are unavailable' in message:
+            return 'Threads public video files are unavailable. Check the post on Threads and retry later.'
+        if 'share link did not resolve' in message:
+            return 'This Threads share link did not resolve to a public post. Copy the direct post link from Threads.'
     if 'certificate_verify_failed' in message or 'certificate verify failed' in message:
         return 'The source certificate could not be verified. Check the trusted certificate setup for your network or managed proxy; TLS verification must remain enabled.'
     if 'drm' in message:
@@ -125,7 +143,7 @@ def health():
 def analyze(req: VideoRequest):
     validate_url(req.url)
     try:
-        with yt_dlp.YoutubeDL(options()) as dl:
+        with video_downloader(options()) as dl:
             info = dl.extract_info(req.url, download=False)
         if not info or info.get('_type') in ('playlist', 'multi_video') or info.get('is_live'):
             raise HTTPException(400, 'Please choose a single, non-live video.')
@@ -163,7 +181,7 @@ def run_download(job_id, req):
         if shutil.disk_usage(DATA).free < 256 * 1024**2:
             raise RuntimeError('Insufficient free disk space')
         update(job_id, status='downloading')
-        with yt_dlp.YoutubeDL(opts) as dl:
+        with video_downloader(opts) as dl:
             info = dl.extract_info(req.url, download=True)
         files = [p for p in folder.iterdir() if p.suffix == '.' + req.format]
         if not files:
