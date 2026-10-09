@@ -1,11 +1,17 @@
 import threading
 import subprocess
+import os
+import tempfile
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
-from app import main
+# Import-time recovery must never touch the developer's real history database.
+with tempfile.TemporaryDirectory(prefix='streamvault-test-init-') as initial_data:
+    with patch.dict(os.environ, {'DOWNLOAD_DIR': initial_data}):
+        from app import main
 
 client = TestClient(main.app)
 
