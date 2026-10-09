@@ -4,7 +4,9 @@ A self-hosted online video downloader with a responsive dashboard, live download
 
 ## Run on your computer
 
-Requires **Python 3.12+** and **FFmpeg on PATH**. Install FFmpeg with your OS package manager (for example `brew install ffmpeg` on macOS or `winget install Gyan.FFmpeg` on Windows).
+Requires **Python 3.12+**, **FFmpeg on PATH**, and **Node.js 22+ or Deno 2.3+** for full YouTube support. Install FFmpeg with your OS package manager (for example `brew install ffmpeg` on macOS or `winget install Gyan.FFmpeg` on Windows). The app enables detected Node and Deno runtimes; its dependency lock includes yt-dlp's companion EJS scripts.
+
+On Windows, install the JavaScript runtime with `winget install --id DenoLand.Deno -e --source winget`. Close and reopen PowerShell afterward, then verify `deno --version`. Node.js LTS is also supported. Official runtime/dependency guidance: https://github.com/yt-dlp/yt-dlp/wiki/EJS.
 
 ```bash
 python -m venv .venv
@@ -27,7 +29,9 @@ Run the same app on a server with Python and FFmpeg. For a private online instan
 
 `DOWNLOAD_DIR` optionally changes storage (default `data/`). Two downloads run concurrently, with up to ten active/queued jobs and one hundred history entries. A 2 GiB source-file limit is applied when yt-dlp can determine the size; enforce a filesystem quota for a hard limit. Completed files remain until removed. Removing a history entry deletes its file. The queue/history is in memory and resets on server restart; retained files in `data/` can be cleaned manually while the server is stopped. Use a **single Uvicorn worker**; multi-process workers do not share job state. Active downloads cannot currently be cancelled.
 
-No external API keys are required. Source websites and media CDN destinations must be reachable. Website changes can require updating yt-dlp (`pip install --upgrade yt-dlp`); run the tests after updates. Fonts load from Google Fonts with a local sans-serif fallback.
+No external API keys are required. Source websites and media CDN destinations must be reachable. Website changes can require updating yt-dlp (`pip install --upgrade "yt-dlp[default]"`); run the tests after updates. Fonts load from Google Fonts with a local sans-serif fallback.
+
+If analysis succeeds but download returns HTTP 403, the media server rejected access. Check terminal warnings, ensure a supported JavaScript runtime and EJS package are installed, update `yt-dlp[default]`, restart the app, and retry a public video. A 403 alone does not establish which dependency or access restriction caused it, and these steps do not guarantee access to a restricted source. `/api/health` reports detected JavaScript runtimes and EJS package presence. Extractor warnings are visible in the server terminal.
 
 ## Development and validation
 
@@ -46,4 +50,4 @@ API docs are available at `/docs`. Main routes: `/api/analyze`, `/api/download`,
 docker compose up --build -d
 ```
 
-The compose file binds to localhost and retains media in a named volume. FFmpeg is bundled in the image. `docker compose down` stops the app; add `-v` only if you intend to delete saved media. Docker configuration is provided but requires Docker and has not been validated in this cloud machine.
+The compose file binds to localhost and retains media in a named volume. FFmpeg and Node.js are bundled in the image. `docker compose down` stops the app; add `-v` only if you intend to delete saved media. Docker configuration is provided but requires Docker and has not been validated in this cloud machine.

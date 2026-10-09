@@ -1,4 +1,5 @@
 import os
+import importlib.util
 import shutil
 import threading
 import time
@@ -44,7 +45,22 @@ def validate_url(url):
 
 
 def options():
-    return {'quiet': True, 'no_warnings': True, 'noplaylist': True, 'socket_timeout': 25, 'retries': 2, 'cachedir': False, 'ignoreconfig': True}
+    runtimes = {name: {'path': path} for name in ('deno', 'node') if (path := shutil.which(name))}
+    return {'quiet': True, 'no_warnings': False, 'noplaylist': True, 'socket_timeout': 25, 'retries': 2, 'cachedir': False, 'ignoreconfig': True, 'js_runtimes': runtimes}
+
+
+def download_error(exc):
+    # Classify errors without sending source URLs, credentials, or local paths to the browser.
+    message = str(exc).lower()
+    if '403' in message or 'forbidden' in message:
+        return 'The video server rejected the download (HTTP 403). Update yt-dlp with its default dependencies, check the JavaScript runtime, and retry. If it persists, check source access and the terminal warnings.'
+    if 'requested format' in message:
+        return 'The selected quality is unavailable. Analyze the video again or try a lower resolution.'
+    if 'sign in' in message or 'login' in message or 'private video' in message:
+        return 'This video requires access or sign-in. Try a publicly accessible video.'
+    if 'timed out' in message or 'timeout' in message:
+        return 'The source connection timed out. Check your connection and retry.'
+    return 'Download failed. Check the terminal output for source access, format, or conversion errors.'
 
 
 @app.get('/')
@@ -54,7 +70,7 @@ def index():
 
 @app.get('/api/health')
 def health():
-    return {'status': 'ok', 'ffmpeg': bool(shutil.which('ffmpeg')), 'active': sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())}
+    return {'status': 'ok', 'ffmpeg': bool(shutil.which('ffmpeg')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'active': sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())}
 
 
 @app.post('/api/analyze')
@@ -69,8 +85,8 @@ def analyze(req: VideoRequest):
         return {'title': info.get('title', 'Untitled video'), 'author': info.get('uploader', 'Unknown creator'), 'duration': info.get('duration'), 'thumbnail': info.get('thumbnail'), 'platform': info.get('extractor_key'), 'qualities': heights, 'url': req.url}
     except HTTPException:
         raise
-    except Exception:
-        raise HTTPException(422, 'Video could not be accessed. Check the link; private, restricted, or login-required videos may be unavailable.')
+    except Exception as exc:
+        raise HTTPException(422, download_error(exc))
 
 
 def update(job_id, **values):
@@ -101,8 +117,8 @@ def run_download(job_id, req):
             raise RuntimeError('No output file')
         file = max(files, key=lambda p: p.stat().st_size)
         update(job_id, status='completed', progress=100, title=info.get('title', file.stem), filename=file.name, size=file.stat().st_size)
-    except Exception:
-        update(job_id, status='failed', error='Download failed. The source may restrict access, the format may be unavailable, or conversion may have failed.')
+    except Exception as exc:
+        update(job_id, status='failed', error=download_error(exc))
         shutil.rmtree(folder, ignore_errors=True)
 
 

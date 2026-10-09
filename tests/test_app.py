@@ -33,6 +33,35 @@ def test_invalid_format_and_missing_file():
     assert client.get('/api/jobs/missing/file').status_code == 404
 
 
+def test_missing_runtime_is_reported(monkeypatch):
+    monkeypatch.setattr(main.shutil, 'which', lambda name: '/usr/bin/ffmpeg' if name == 'ffmpeg' else None)
+    result = client.get('/api/health').json()
+    assert result['ffmpeg'] is True
+    assert result['js_runtimes'] == []
+
+
+def test_source_403_is_actionable_and_does_not_expose_urls(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, 'DATA', tmp_path)
+    def rejected(*args, **kwargs):
+        raise main.yt_dlp.utils.DownloadError('HTTP Error 403: Forbidden https://media.example/video?token=private')
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', rejected)
+    job_id = 'test_rejected'
+    main.jobs[job_id] = {'id': job_id, 'status': 'queued', 'created': 0}
+    try:
+        main.run_download(job_id, main.DownloadRequest(url='https://youtu.be/test'))
+        job = main.jobs[job_id]
+        assert job['status'] == 'failed'
+        assert 'HTTP 403' in job['error']
+        assert 'JavaScript runtime' in job['error']
+        assert 'private' not in job['error']
+        assert not (tmp_path / job_id).exists()
+        response = client.post('/api/analyze', json={'url': 'https://youtu.be/test'})
+        assert response.status_code == 422
+        assert 'HTTP 403' in response.json()['detail']
+    finally:
+        main.jobs.pop(job_id, None)
+
+
 @pytest.mark.parametrize('output', ['mp4', 'webm', 'mkv', 'mp3', 'm4a', 'wav'])
 def test_real_download_and_conversion(tmp_path, monkeypatch, output):
     # A tiny local fixture tests actual yt-dlp transfer and FFmpeg conversion without relying on platform access.
