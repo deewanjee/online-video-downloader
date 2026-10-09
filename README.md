@@ -43,6 +43,23 @@ No external API keys are required. Source websites and media CDN destinations mu
 
 If analysis succeeds but download returns HTTP 403, the media server rejected access. Check terminal warnings, ensure a supported JavaScript runtime and EJS package are installed, update `yt-dlp[default,curl-cffi]`, restart the app, and retry a public video. A 403 alone does not establish which dependency or access restriction caused it, and these steps do not guarantee access to a restricted source. `/api/health` reports detected JavaScript runtimes and EJS package presence. Extractor warnings are visible in the server terminal.
 
+## YouTube HTTP 429 and bot verification
+
+A YouTube `HTTP 429` warning means the source is limiting requests. StreamVault serializes YouTube extractions, spaces extractor requests by one second, and stops new YouTube source requests for ten minutes after an observed HTTP 429. Analysis and queued/retried downloads check the cooldown; blocked attempts return a clear message and `Retry-After` rather than contacting YouTube again. Other platforms remain available. The cooldown applies to the running process; it does not establish when YouTube will lift its own restriction. Browser verification and authenticated sessions may still be required afterwards. Repeated retries can prolong source restrictions.
+
+`Sign in to confirm you're not a bot` is reported separately from private/age-restricted access. A missing Visitor Data / PO-token warning following HTTP 429 does not mean an arbitrary Visitor Data value will fix the problem. Do not invent tokens or assume an extractor update bypasses verification. Use the official yt-dlp documentation for current source requirements.
+
+For an authorized YouTube session on your **own laptop**, the optional `STREAMVAULT_COOKIE_FILE` environment variable points to a locally exported Netscape-format cookie file. It is off by default, applies only to YouTube, and is rejected in `STREAMVAULT_PUBLIC=true` mode. The application has no cookie-upload endpoint and does not include cookie contents or paths in its health response. Cookie files represent access to your account: keep them local, do not upload them to chat/GitHub, and do not enable this option on a shared server. yt-dlp may update that local cookie file during use.
+
+Official export guidance: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies and https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp. Once a valid cookie file exists locally, stop the app and launch from PowerShell:
+
+```powershell
+$env:STREAMVAULT_COOKIE_FILE = "$env:LOCALAPPDATA\StreamVault\youtube-cookies.txt"
+& ".\Start StreamVault.bat"
+```
+
+Use your actual local file location. To disable session access, stop the app, run `Remove-Item Env:STREAMVAULT_COOKIE_FILE -ErrorAction SilentlyContinue`, and restart. Cookies do not guarantee downloads, bypass DRM, restore deleted media, or grant access your account does not have. No private/login session has been tested in the cloud.
+
 ## Development and validation
 
 ```bash
@@ -60,7 +77,7 @@ API docs are available at `/docs`. Main routes: `/api/analyze`, `/api/download`,
 docker compose up --build -d
 ```
 
-The compose file binds to localhost and retains media in a named volume. FFmpeg and Node.js are bundled in the image. `docker compose down` stops the app; add `-v` only if you intend to delete saved media. Both Compose templates pass configuration validation, the image builds successfully, all 47 tests pass inside the image as the unprivileged app user, and container startup/dashboard readiness checks pass. The managed cloud build used the configured proxy route and a trusted CA bundle; TLS and package-signature verification stayed enabled. On ordinary networks, no custom CA configuration is needed. Managed TLS proxies can supply a trusted CA bundle with `docker build --secret id=build_ca,src=/path/to/trusted-ca-bundle.pem .`; the bundle is mounted only for build-time package downloads, not copied into the image. Online domain, HTTPS certificate issuance, and hosted source access still require validation on the actual server.
+The compose file binds to localhost and retains media in a named volume. FFmpeg and Node.js are bundled in the image. `docker compose down` stops the app; add `-v` only if you intend to delete saved media. Both Compose templates pass configuration validation, the image builds successfully, all 53 tests pass inside the image as the unprivileged app user, and container startup/dashboard readiness checks pass. The managed cloud build used the configured proxy route and a trusted CA bundle; TLS and package-signature verification stayed enabled. On ordinary networks, no custom CA configuration is needed. Managed TLS proxies can supply a trusted CA bundle with `docker build --secret id=build_ca,src=/path/to/trusted-ca-bundle.pem .`; the bundle is mounted only for build-time package downloads, not copied into the image. Online domain, HTTPS certificate issuance, and hosted source access still require validation on the actual server.
 
 ## Future online hosting
 

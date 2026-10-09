@@ -130,10 +130,12 @@ def isolate_history(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'DATA', tmp_path)
     monkeypatch.setattr(main, 'jobs', {})
     monkeypatch.setattr(main, 'analysis_cache', {})
+    monkeypatch.setattr(main.source_access, 'youtube', main.source_access.YoutubeAccess())
     monkeypatch.delenv('STREAMVAULT_PASSWORD', raising=False)
     monkeypatch.delenv('STREAMVAULT_PUBLIC', raising=False)
     monkeypatch.delenv('STREAMVAULT_USERNAME', raising=False)
     monkeypatch.delenv('STREAMVAULT_SYSTEM_CERTS', raising=False)
+    monkeypatch.delenv('STREAMVAULT_COOKIE_FILE', raising=False)
 
 
 def test_history_survives_restart_and_interrupted_jobs_can_retry(tmp_path, monkeypatch):
@@ -343,3 +345,74 @@ def test_analyzed_thumbnail_is_retained_in_queued_history(monkeypatch):
     assert job['thumbnail'] == 'https://i.ytimg.com/fixture.jpg'
     assert job['title'] == 'A saved moment'
     assert main.storage.restore(main.DATA)[job['id']]['thumbnail'] == job['thumbnail']
+
+
+def test_youtube_bot_verification_is_distinct_from_private_access():
+    message = main.download_error(RuntimeError("Sign in to confirm you're not a bot. Use --cookies"))
+    assert 'bot verification' in message
+    assert 'private access' not in message
+    assert 'HTTP 429' in main.download_error(RuntimeError("HTTP Error 429: Sign in to confirm you're not a bot"))
+
+
+def test_youtube_429_warning_cools_analysis_download_and_retry(monkeypatch):
+    calls = []
+    def rejected(downloader, *args, **kwargs):
+        calls.append(args)
+        downloader.params['logger'].warning('[youtube] Unable to download webpage: HTTP Error 429: Too Many Requests')
+        raise RuntimeError("Sign in to confirm you're not a bot")
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', rejected)
+    url = 'https://youtu.be/blocked'
+    response = client.post('/api/analyze', json={'url': url})
+    assert response.status_code == 429
+    assert 1 <= int(response.headers['retry-after']) <= 600
+    assert 'HTTP 429' in response.json()['detail']
+    assert client.post('/api/analyze', json={'url': url}).status_code == 429
+    assert client.post('/api/download', json={'url': url}).status_code == 429
+    main.jobs['blocked'] = {'id': 'blocked', 'status': 'failed', 'created': 0, 'url': url, 'format': 'mp4', 'quality': '720'}
+    assert client.post('/api/jobs/blocked/retry').status_code == 429
+    assert main.jobs['blocked']['status'] == 'failed'
+    assert len(calls) == 1  # Blocked retries never contact the source again.
+    assert client.get('/api/health').json()['youtube_cooldown_seconds'] > 0
+
+
+def test_youtube_cooldown_expires_without_affecting_other_sources(monkeypatch):
+    access = main.source_access.youtube
+    with access.state:
+        access.until = main.time.monotonic() - 1
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', lambda *a, **k: {'title': 'Available', 'formats': []})
+    assert client.post('/api/analyze', json={'url': 'https://youtu.be/available'}).status_code == 200
+    access.limited()
+    assert client.post('/api/analyze', json={'url': 'https://www.tiktok.com/@public/video/123'}).status_code == 200
+
+
+def test_youtube_parallel_analysis_reports_busy_without_blocking(monkeypatch):
+    access = main.source_access.youtube
+    access.slot.acquire()
+    try:
+        response = client.post('/api/analyze', json={'url': 'https://youtu.be/available'})
+        assert response.status_code == 429
+        assert 'already running' in response.json()['detail']
+        assert response.headers['retry-after'] == '5'
+    finally:
+        access.slot.release()
+
+
+def test_cookie_file_is_opt_in_local_and_never_returned_in_health(tmp_path, monkeypatch):
+    cookie = tmp_path / 'private-cookies.txt'
+    cookie.write_text('# Netscape HTTP Cookie File\n')
+    assert 'cookiefile' not in main.source_access.authenticated_settings(main.options())
+    monkeypatch.setenv('STREAMVAULT_COOKIE_FILE', str(cookie))
+    assert main.source_access.authenticated_settings(main.options())['cookiefile'] == str(cookie)
+    assert str(cookie) not in client.get('/api/health').text
+    monkeypatch.setenv('STREAMVAULT_PUBLIC', 'true')
+    with pytest.raises(RuntimeError, match='local desktop mode'):
+        main.source_access.authenticated_settings(main.options())
+    monkeypatch.delenv('STREAMVAULT_PUBLIC')
+    cookie.unlink()
+    with pytest.raises(RuntimeError, match='file is missing'):
+        main.source_access.authenticated_settings(main.options())
+
+
+def test_video_id_containing_429_does_not_trigger_source_cooldown():
+    main.source_access.SourceLogger().warning('[youtube] Video 429abcd: Unable to fetch GVS PO Token')
+    assert main.source_access.youtube.remaining() == 0

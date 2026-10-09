@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from app import storage
 from app.auth import AccessControl
 from app.threads import ThreadsIE
+from app import source_access
 
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get('DOWNLOAD_DIR', ROOT.parent / 'data')).resolve()
@@ -70,6 +71,21 @@ def video_downloader(settings):
     downloader.add_info_extractor(ThreadsIE())
     downloader.add_default_info_extractors()
     return downloader
+
+
+def extract_video(url, download, settings):
+    if not source_access.youtube_url(url):
+        with video_downloader(settings) as dl:
+            return dl.extract_info(url, download=download)
+    with source_access.youtube.request(download):
+        settings = source_access.authenticated_settings(settings) | {'logger': source_access.SourceLogger(), 'sleep_interval_requests': 1, 'extractor_retries': 1}
+        try:
+            with video_downloader(settings) as dl:
+                return dl.extract_info(url, download=download)
+        except Exception:
+            if source_access.youtube.remaining():
+                raise source_access.SourceRateLimited(source_access.youtube.remaining()) from None
+            raise
 
 
 def describe_media(file):
@@ -131,6 +147,14 @@ def playable_file(file, media):
 def download_error(exc):
     # Classify errors without sending source URLs, credentials, or local paths to the browser.
     message = str(exc).lower()
+    if isinstance(exc, (source_access.SourceRateLimited, source_access.SourceBusy)):
+        return str(exc)
+    if 'session cookie file is missing' in message or 'session cookies are available only' in message:
+        return str(exc)
+    if source_access.is_rate_limit(message):
+        return 'The source is limiting download requests (HTTP 429). Wait before retrying; repeated retries can prolong the limit.'
+    if 'confirm you\u2019re not a bot' in message or "confirm you're not a bot" in message:
+        return 'YouTube requires bot verification. Open the video in your browser and complete verification. The desktop app can use your own local session cookie file; this does not guarantee download access.'
     if 'threads' in message:
         if 'contains multiple videos' in message:
             return 'This Threads post contains multiple videos. Choose a post containing a single video.'
@@ -150,8 +174,6 @@ def download_error(exc):
         return 'This video requires sign-in, age verification, or private access. Try a publicly accessible video.'
     if any(text in message for text in ('video unavailable', 'has been removed', 'has been deleted', 'not found', 'http error 404')):
         return 'The video is unavailable or has been removed. Check the link and its availability on the source website.'
-    if '429' in message or 'too many requests' in message:
-        return 'The source is limiting download requests (HTTP 429). Wait before retrying.'
     if 'unsupported url' in message:
         return 'This video link is not supported by the current downloader. Try the direct video link; this platform may need a future update.'
     if '403' in message or 'forbidden' in message:
@@ -172,15 +194,20 @@ def index():
 
 @app.get('/api/health')
 def health():
-    return {'application': 'StreamVault', 'status': 'ok', 'ffmpeg': bool(shutil.which('ffmpeg')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'active': sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())}
+    return {'application': 'StreamVault', 'status': 'ok', 'ffmpeg': bool(shutil.which('ffmpeg')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'youtube_cooldown_seconds': int(source_access.youtube.remaining()), 'active': sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())}
+
+
+def check_source_cooldown(url):
+    if source_access.youtube_url(url) and source_access.youtube.remaining():
+        exc = source_access.SourceRateLimited(source_access.youtube.remaining())
+        raise HTTPException(429, str(exc), headers={'Retry-After': str(exc.retry_after)})
 
 
 @app.post('/api/analyze')
 def analyze(req: VideoRequest):
     validate_url(req.url)
     try:
-        with video_downloader(options()) as dl:
-            info = dl.extract_info(req.url, download=False)
+        info = extract_video(req.url, False, options())
         if not info or info.get('_type') in ('playlist', 'multi_video') or info.get('is_live'):
             raise HTTPException(400, 'Please choose a single, non-live video.')
         heights = sorted({f['height'] for f in info.get('formats', []) if f.get('height') and f.get('vcodec') != 'none'}, reverse=True)
@@ -192,6 +219,8 @@ def analyze(req: VideoRequest):
         return result
     except HTTPException:
         raise
+    except (source_access.SourceRateLimited, source_access.SourceBusy) as exc:
+        raise HTTPException(429, str(exc), headers={'Retry-After': str(exc.retry_after)})
     except Exception as exc:
         raise HTTPException(422, download_error(exc))
 
@@ -222,8 +251,7 @@ def run_download(job_id, req):
         if shutil.disk_usage(DATA).free < 256 * 1024**2:
             raise RuntimeError('Insufficient free disk space')
         update(job_id, status='downloading')
-        with video_downloader(opts) as dl:
-            info = dl.extract_info(req.url, download=True)
+        info = extract_video(req.url, True, opts)
         files = [p for p in folder.iterdir() if p.suffix == '.' + req.format]
         if not files:
             raise RuntimeError('No output file')
@@ -253,6 +281,7 @@ def run_download(job_id, req):
 @app.post('/api/download', status_code=202)
 def download(req: DownloadRequest):
     validate_url(req.url)
+    check_source_cooldown(req.url)
     if req.format not in ('mp4', 'webm', 'mkv', 'mp3', 'm4a', 'wav') or req.quality not in ('2160', '1440', '1080', '720', '480', '360'):
         raise HTTPException(400, 'Unsupported format or quality.')
     if not shutil.which('ffmpeg'):
@@ -285,6 +314,7 @@ def retry_job(job_id: str):
             raise HTTPException(429, 'Queue is full. Wait for a download to finish.')
         req = DownloadRequest(url=job['url'], format=job['format'], quality=job['quality'])
         validate_url(req.url)
+        check_source_cooldown(req.url)
         if not shutil.which('ffmpeg'):
             raise HTTPException(503, 'Install FFmpeg to enable downloads and conversion.')
         job.update(status='queued', progress=0, speed=None, eta=None)

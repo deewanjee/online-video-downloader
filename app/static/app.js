@@ -123,7 +123,7 @@ function renderAll() {
   $('ready-count').textContent = jobs.filter(j => j.status === 'completed').length; $('active-count').textContent = jobs.filter(j => ['queued','downloading','processing'].includes(j.status)).length;
 }
 async function refresh() {
-  try { jobs = await api('/api/jobs'); renderAll(); const h = await api('/api/health'); $('health').textContent = !h.ffmpeg ? '● FFmpeg missing' : !h.youtube_ejs ? '● YouTube dependency missing' : !h.js_runtimes?.length ? '● JavaScript runtime missing' : '● Engine online'; }
+  try { jobs = await api('/api/jobs'); renderAll(); const h = await api('/api/health'); $('health').textContent = !h.ffmpeg ? '● FFmpeg missing' : !h.youtube_ejs ? '● YouTube dependency missing' : !h.js_runtimes?.length ? '● JavaScript runtime missing' : h.youtube_cooldown_seconds > 0 ? '● YouTube wait '+Math.ceil(h.youtube_cooldown_seconds/60)+'m' : '● Engine online'; }
   catch(e) { $('health').textContent = '● Engine offline'; }
 }
 $('search').oninput = renderAll; $('status-filter').onchange = renderAll;
