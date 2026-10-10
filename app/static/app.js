@@ -93,7 +93,7 @@ function render(target,list) {
   const container = $(target); container.replaceChildren();
   if (!list.length) { container.innerHTML = '<div class="empty"><span class="empty-icon">✳</span><h3>Your collection starts with a link.</h3><p>Find something worth keeping, then drop its link above.</p></div>'; return; }
   for (const j of list) {
-    const row = document.createElement('article'); row.className = 'job';
+    const row = document.createElement('article'); row.className = 'job '+j.status;
     const cover = document.createElement('div'); cover.className = 'cover'; placeholder(cover,sourceName(j));
     image(cover,j.status === 'completed' && !audioFormats.includes(j.format) ? endpoint(j,'thumbnail') : j.thumbnail,'Thumbnail for '+j.title);
     const badge = document.createElement('span'); badge.className = 'status-badge'+(j.status === 'failed' ? ' failed' : ''); badge.textContent = {completed:'In your vault',failed:'Needs attention',queued:'Queued',processing:'Preparing preview',downloading:'Downloading · '+j.progress+'%'}[j.status] || j.status; cover.append(badge);
@@ -116,7 +116,7 @@ function render(target,list) {
   }
 }
 function renderAll() {
-  render('recent-jobs',jobs.slice(0,6));
+  render('recent-jobs',jobs.slice(0,12));
   const term = $('search').value.toLowerCase(), filter = $('status-filter').value;
   render('all-jobs',jobs.filter(j => (j.title+' '+j.url).toLowerCase().includes(term) && (filter === 'all' || filter === 'downloading' && ['queued','downloading','processing'].includes(j.status) || j.status === filter)));
   for (const id of ['total-count','recent-count','nav-count']) $(id).textContent = jobs.length;
