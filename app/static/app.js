@@ -17,6 +17,7 @@ for (const id of ['platform-grid','all-platforms']) {
   }
 }
 let analyzed = null, jobs = [], busy = false, playingId = null;
+let analysisVersion = 0, analysisController = null, refreshing = null, refreshAgain = false;
 const rendered = new Map();
 function view(name) {
   for (const n of ['home','downloads','platforms']) $(n).hidden = n !== name;
@@ -26,10 +27,23 @@ function view(name) {
 document.querySelectorAll('.nav').forEach(el => el.onclick = () => view(el.dataset.view));
 $('view-all').onclick = () => view('downloads'); $('see-platforms').onclick = () => view('platforms');
 function notice(message) { $('notice').hidden = !message; $('notice').textContent = message; }
-async function api(path,options) {
-  const response = await fetch(path,options); const data = await response.json();
-  if (!response.ok) throw Error(typeof data.detail === 'string' ? data.detail : 'Request could not be completed.');
-  return data;
+async function api(path,options = {}) {
+  const controller = new AbortController(), callerSignal = options.signal;
+  const cancel = () => controller.abort();
+  callerSignal?.addEventListener('abort',cancel,{once:true});
+  if (callerSignal?.aborted) cancel();
+  const timer = setTimeout(cancel,options.timeout || 60000);
+  try {
+    const response = await fetch(path,{...options,signal:controller.signal});
+    const body = await response.text(); let data;
+    try { data = JSON.parse(body); } catch { throw Error('The server returned an unreadable response (HTTP '+response.status+'). Check the server connection and retry.'); }
+    if (!response.ok) throw Error(typeof data.detail === 'string' ? data.detail : 'Request could not be completed (HTTP '+response.status+').');
+    return data;
+  } catch(e) {
+    if (e.name === 'AbortError' && !callerSignal?.aborted) throw Error('The request timed out. Check the server window before retrying; a download may still be running.');
+    if (e instanceof TypeError) throw Error('Cannot reach StreamVault. Check that the server window is open.');
+    throw e;
+  } finally { clearTimeout(timer); callerSignal?.removeEventListener('abort',cancel); }
 }
 function duration(s) { return Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0'); }
 function sourceName(j) {
@@ -48,9 +62,13 @@ function placeholder(parent,label) {
 }
 $('analyze-form').onsubmit = async event => {
   event.preventDefault(); if (busy) return; busy = true; analyzed = null;
+  const version = ++analysisVersion, url = $('url').value.trim();
+  analysisController = new AbortController();
   $('video-result').hidden = true; notice(''); $('analyze-button').disabled = true; $('analyze-button').textContent = 'Finding…';
   try {
-    analyzed = await api('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:$('url').value.trim()})});
+    const result = await api('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url}),signal:analysisController.signal});
+    if (version !== analysisVersion || $('url').value.trim() !== url) return;
+    analyzed = result;
     $('video-title').textContent = analyzed.title; $('video-platform').textContent = analyzed.platform;
     $('video-meta').textContent = analyzed.author+(analyzed.duration ? ' · '+duration(analyzed.duration) : '');
     $('analysis-cover').replaceChildren(); placeholder($('analysis-cover'), 'Your next good find'); image($('analysis-cover'),analyzed.thumbnail,'Thumbnail for '+analyzed.title);
@@ -58,10 +76,10 @@ $('analyze-form').onsubmit = async event => {
     const qualities = [2160,1440,1080,720,480,360].filter(h => !analyzed.qualities.length || h <= Math.max(...analyzed.qualities));
     for (const q of qualities.length ? qualities : [360]) $('quality').add(new Option(q+'p'+(q === 2160 ? ' · 4K' : q === 1080 ? ' · Full HD' : ''),q));
     $('quality').value = qualities.includes(1080) ? '1080' : String(qualities[0] || 360); $('video-result').hidden = false;
-  } catch(e) { notice(e.message); }
-  finally { busy = false; $('analyze-button').disabled = false; analyzeLabel(); }
+  } catch(e) { if (version === analysisVersion && e.name !== 'AbortError') notice(e.message); }
+  finally { if (version === analysisVersion) { busy = false; analysisController = null; $('analyze-button').disabled = false; analyzeLabel(); } }
 };
-$('url').oninput = () => { analyzed = null; $('video-result').hidden = true; };
+$('url').oninput = () => { analysisVersion++; analysisController?.abort(); analysisController = null; busy = false; analyzed = null; $('video-result').hidden = true; $('analyze-button').disabled = false; analyzeLabel(); notice(''); };
 $('format').onchange = () => { $('quality-label').hidden = audioFormats.includes($('format').value); };
 $('download-button').onclick = async () => {
   if (!analyzed) return; $('download-button').disabled = true;
@@ -104,7 +122,7 @@ function render(target,list) {
     const platform = document.createElement('div'); platform.className = 'job-platform'; platform.textContent = sourceName(j);
     const title = document.createElement('div'); title.className = 'job-title'; title.textContent = j.title; title.title = j.title;
     const meta = document.createElement('div'); meta.className = 'job-meta'; meta.textContent = j.format.toUpperCase()+' · '+(audioFormats.includes(j.format) ? 'Audio' : (j.actual_height || j.quality)+'p')+(j.size ? ' · '+(j.size/1024/1024).toFixed(1)+' MB' : '')+(j.has_audio === false ? ' · No audio track' : '');
-    const status = document.createElement('div'); status.className = 'status'+(j.status === 'failed' ? ' failed' : ''); status.textContent = j.error || (j.status === 'completed' ? j.preview_available === false ? 'Preview unavailable · Save the original' : 'Ready for a replay' : j.status === 'processing' ? 'Finishing your file and browser preview…' : 'We’re bringing this one home.');
+    const status = document.createElement('div'); status.className = 'status'+(j.status === 'failed' ? ' failed' : '')+(j.preview_available === false ? ' needs-attention' : ''); status.textContent = j.error || (j.status === 'completed' ? j.preview_available === false ? 'Preview unavailable · Save the original' : 'Ready for a replay' : j.status === 'processing' ? 'Finishing your file and browser preview…' : 'We’re bringing this one home.');
     detail.append(platform,title,meta,status);
     if (['queued','downloading','processing'].includes(j.status)) { const progress = document.createElement('progress'); progress.max = 100; progress.value = j.progress; progress.setAttribute('aria-label','Download progress'); detail.append(progress); }
     const actions = document.createElement('div'); actions.className = 'job-actions';
@@ -122,9 +140,17 @@ function renderAll() {
   for (const id of ['total-count','recent-count','nav-count']) $(id).textContent = jobs.length;
   $('ready-count').textContent = jobs.filter(j => j.status === 'completed').length; $('active-count').textContent = jobs.filter(j => ['queued','downloading','processing'].includes(j.status)).length;
 }
-async function refresh() {
-  try { jobs = await api('/api/jobs'); renderAll(); const h = await api('/api/health'); $('health').textContent = !h.ffmpeg ? '● FFmpeg missing' : !h.youtube_ejs ? '● YouTube dependency missing' : !h.js_runtimes?.length ? '● JavaScript runtime missing' : h.youtube_cooldown_seconds > 0 ? '● YouTube wait '+Math.ceil(h.youtube_cooldown_seconds/60)+'m' : '● Engine online'; }
-  catch(e) { $('health').textContent = '● Engine offline'; }
+function refresh() {
+  refreshAgain = true;
+  if (refreshing) return refreshing;
+  refreshing = (async () => {
+    do {
+      refreshAgain = false;
+      try { jobs = await api('/api/jobs',{timeout:10000}); renderAll(); const h = await api('/api/health',{timeout:10000}); $('health').textContent = !h.ffmpeg ? '● FFmpeg missing' : h.ffprobe === false ? '● FFprobe missing' : !h.youtube_ejs ? '● YouTube dependency missing' : !h.js_runtimes?.length ? '● JavaScript runtime missing' : h.youtube_cooldown_seconds > 0 ? '● YouTube wait '+Math.ceil(h.youtube_cooldown_seconds/60)+'m' : '● Engine online'; }
+      catch(e) { $('health').textContent = '● Connection problem'; $('health').title = e.message; }
+    } while (refreshAgain);
+  })().finally(() => { refreshing = null; });
+  return refreshing;
 }
 $('search').oninput = renderAll; $('status-filter').onchange = renderAll;
 $('theme').onclick = () => { document.body.classList.toggle('dark'); try { localStorage.setItem('sv-theme',document.body.classList.contains('dark') ? 'dark' : 'light'); } catch {} };

@@ -1,0 +1,27 @@
+{
+  "scope": "Actual app analysis, MP4 worker, thumbnail and byte-range stream; public samples; media discarded afterwards; no account cookies",
+  "results": [
+    {
+      "platform": "Threads",
+      "url": "https://www.threads.com/share/BAThUApelo/",
+      "status": "completed",
+      "size": 6612855,
+      "actual_height": 720,
+      "has_audio": true,
+      "preview_available": true,
+      "stream_status": 206,
+      "poster_status": 200
+    },
+    {
+      "platform": "TikTok",
+      "url": "https://www.tiktok.com/@patroxofficial/video/6742501081818877190",
+      "status": "completed",
+      "size": 1849357,
+      "actual_height": 720,
+      "has_audio": true,
+      "preview_available": true,
+      "stream_status": 206,
+      "poster_status": 200
+    }
+  ]
+}

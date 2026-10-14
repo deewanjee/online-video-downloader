@@ -31,7 +31,7 @@ HOSTS = ('youtube.com', 'youtu.be', 'dailymotion.com', 'dai.ly', 'facebook.com',
 jobs = storage.restore(DATA)
 analysis_cache = {}
 lock = threading.Lock()
-preview_lock = threading.Lock()
+preview_locks = {}
 pool = ThreadPoolExecutor(max_workers=2)
 
 class VideoRequest(BaseModel):
@@ -93,10 +93,11 @@ def describe_media(file):
         return {}
 
     try:
-        result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name,height', '-of', 'json', str(file)], capture_output=True, text=True, timeout=20, check=True)
+        result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name,pix_fmt,height', '-of', 'json', str(file)], capture_output=True, text=True, timeout=20, check=True)
         streams = json.loads(result.stdout).get('streams', [])
         return {'has_audio': any(s.get('codec_type') == 'audio' for s in streams), 'actual_height': max((s.get('height', 0) for s in streams if s.get('codec_type') == 'video'), default=None),
                 'video_codec': next((s.get('codec_name') for s in streams if s.get('codec_type') == 'video'), None),
+                'video_pixel_format': next((s.get('pix_fmt') for s in streams if s.get('codec_type') == 'video'), None),
                 'audio_codec': next((s.get('codec_name') for s in streams if s.get('codec_type') == 'audio'), None)}
     except (OSError, ValueError, subprocess.SubprocessError):
         return {}
@@ -127,7 +128,7 @@ def make_thumbnail(file):
 
 
 def playable_file(file, media):
-    if file.suffix == '.mp4' and media.get('video_codec') == 'h264' and media.get('audio_codec') in (None, 'aac', 'mp3'):
+    if file.suffix == '.mp4' and media.get('video_codec') == 'h264' and media.get('video_pixel_format') == 'yuv420p' and media.get('audio_codec') in (None, 'aac', 'mp3'):
         return file
     if file.suffix in ('.mp3', '.m4a', '.wav'):
         return file
@@ -149,8 +150,13 @@ def download_error(exc):
     message = str(exc).lower()
     if isinstance(exc, (source_access.SourceRateLimited, source_access.SourceBusy)):
         return str(exc)
-    if 'session cookie file is missing' in message or 'session cookies are available only' in message:
-        return str(exc)
+    known_errors = ('The downloaded file is not valid media.', 'The source has no video track. Choose an audio format instead.', 'The source has no audio track. Choose a video format instead.',
+                    'The configured session cookie file is missing. Check STREAMVAULT_COOKIE_FILE locally.', 'Session cookies are available only in local desktop mode.')
+    for error in known_errors:
+        if message == error.lower():
+            return error
+    if 'netscape format cookies file' in message or 'failed to load cookies' in message:
+        return 'The local session cookie file could not be read. Export a valid Netscape-format cookie file and check its permissions.'
     if source_access.is_rate_limit(message):
         return 'The source is limiting download requests (HTTP 429). Wait before retrying; repeated retries can prolong the limit.'
     if 'confirm you\u2019re not a bot' in message or "confirm you're not a bot" in message:
@@ -194,7 +200,9 @@ def index():
 
 @app.get('/api/health')
 def health():
-    return {'application': 'StreamVault', 'status': 'ok', 'ffmpeg': bool(shutil.which('ffmpeg')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'youtube_cooldown_seconds': int(source_access.youtube.remaining()), 'active': sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())}
+    with lock:
+        active = sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())
+    return {'application': 'StreamVault', 'status': 'ok', 'ffmpeg': bool(shutil.which('ffmpeg')), 'ffprobe': bool(shutil.which('ffprobe')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'youtube_cooldown_seconds': int(source_access.youtube.remaining()), 'active': active}
 
 
 def check_source_cooldown(url):
@@ -241,12 +249,15 @@ def run_download(job_id, req):
             update(job_id, status='downloading', progress=min(99, round(event.get('downloaded_bytes', 0) / total * 100)) if total else 0, speed=event.get('speed'), eta=event.get('eta'))
         elif event['status'] == 'finished':
             update(job_id, status='processing', progress=99)
-    opts = options() | {'outtmpl': str(folder / '%(title).120B.%(ext)s'), 'progress_hooks': [progress], 'max_filesize': 2 * 1024**3}
-    if req.format in ('mp3', 'm4a', 'wav'):
-        opts |= {'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': req.format, 'preferredquality': '192'}]}
-    else:
-        opts |= {'format': f'bv*[height<=?{req.quality}]+ba/b[height<=?{req.quality}]/bv*[height<=?{req.quality}]', 'merge_output_format': req.format, 'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': req.format}]}
     try:
+        opts = options() | {'outtmpl': str(folder / '%(title).120B.%(ext)s'), 'progress_hooks': [progress], 'max_filesize': 2 * 1024**3}
+        if req.format in ('mp3', 'm4a', 'wav'):
+            opts |= {'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': req.format, 'preferredquality': '192'}]}
+        else:
+            opts |= {'format': f'bv*[height<=?{req.quality}]+ba/b[height<=?{req.quality}]/bv*[height<=?{req.quality}]/bv*+ba/b/bv*', 'merge_output_format': req.format, 'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': req.format}]}
+        # Interrupted attempts can leave stale originals and browser previews behind.
+        if folder.exists():
+            shutil.rmtree(folder)
         folder.mkdir(parents=True, exist_ok=True)
         if shutil.disk_usage(DATA).free < 256 * 1024**2:
             raise RuntimeError('Insufficient free disk space')
@@ -257,6 +268,12 @@ def run_download(job_id, req):
             raise RuntimeError('No output file')
         file = max(files, key=lambda p: p.stat().st_size)
         media = describe_media(file)
+        if not media or not file.stat().st_size:
+            raise RuntimeError('The downloaded file is not valid media.')
+        if req.format in ('mp4', 'mkv', 'webm') and not media.get('video_codec'):
+            raise RuntimeError('The source has no video track. Choose an audio format instead.')
+        if req.format in ('mp3', 'm4a', 'wav') and not media.get('has_audio'):
+            raise RuntimeError('The source has no audio track. Choose a video format instead.')
         if req.format in ('mp4', 'mkv', 'webm'):
             media = cap_resolution(file, int(req.quality), media)
         preview_available = False
@@ -274,8 +291,26 @@ def run_download(job_id, req):
                thumbnail=info.get('thumbnail'), duration=info.get('duration'), platform=info.get('extractor_key'), preview_available=preview_available, **media)
     except Exception as exc:
         message = 'Not enough free disk space. Free space and retry.' if 'disk space' in str(exc).lower() else download_error(exc)
-        update(job_id, status='failed', error=message)
+        if req.format in ('mp3', 'm4a', 'wav') and 'requested format' in str(exc).lower():
+            message = 'No compatible audio stream is available. The source may contain video only; try MP4.'
+        # Finish cleanup before Retry can see a failed job and start a new attempt.
         shutil.rmtree(folder, ignore_errors=True)
+        update(job_id, status='failed', error=message)
+
+
+def submit_job(job_id, req):
+    try:
+        pool.submit(run_download, job_id, req)
+    except RuntimeError:
+        update(job_id, status='failed', error='The download worker could not start. Restart StreamVault and retry.')
+        raise HTTPException(503, 'The download worker is unavailable. Restart StreamVault and retry.')
+
+
+def save_queued(job):
+    try:
+        storage.save(DATA, job)
+    except (OSError, storage.sqlite3.Error):
+        raise HTTPException(503, 'Download history could not be saved. Check free disk space and folder permissions.')
 
 
 @app.post('/api/download', status_code=202)
@@ -284,21 +319,22 @@ def download(req: DownloadRequest):
     check_source_cooldown(req.url)
     if req.format not in ('mp4', 'webm', 'mkv', 'mp3', 'm4a', 'wav') or req.quality not in ('2160', '1440', '1080', '720', '480', '360'):
         raise HTTPException(400, 'Unsupported format or quality.')
-    if not shutil.which('ffmpeg'):
-        raise HTTPException(503, 'Install FFmpeg to enable downloads and conversion.')
+    if not all(shutil.which(tool) for tool in ('ffmpeg', 'ffprobe')):
+        raise HTTPException(503, 'Install FFmpeg and FFprobe to enable verified downloads and conversion.')
     with lock:
         if sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values()) >= 10:
             raise HTTPException(429, 'Queue is full. Wait for a download to finish.')
         if len(jobs) >= 100:
             raise HTTPException(429, 'History is full. Remove older downloads first.')
         job_id = uuid.uuid4().hex
-        jobs[job_id] = {'id': job_id, 'url': req.url, 'title': 'Preparing download', 'format': req.format, 'quality': req.quality, 'status': 'queued', 'progress': 0, 'created': time.time()}
+        job = {'id': job_id, 'url': req.url, 'title': 'Preparing download', 'format': req.format, 'quality': req.quality, 'status': 'queued', 'progress': 0, 'created': time.time()}
         cached = analysis_cache.get(req.url)
         if cached and time.monotonic() - cached[0] < 900:
-            jobs[job_id].update(cached[1])
-        storage.save(DATA, jobs[job_id])
-        result = jobs[job_id].copy()
-    pool.submit(run_download, job_id, req)
+            job.update(cached[1])
+        save_queued(job)
+        jobs[job_id] = job
+        result = job.copy()
+    submit_job(job_id, req)
     return result
 
 
@@ -315,19 +351,25 @@ def retry_job(job_id: str):
         req = DownloadRequest(url=job['url'], format=job['format'], quality=job['quality'])
         validate_url(req.url)
         check_source_cooldown(req.url)
-        if not shutil.which('ffmpeg'):
-            raise HTTPException(503, 'Install FFmpeg to enable downloads and conversion.')
-        job.update(status='queued', progress=0, speed=None, eta=None)
-        job.pop('error', None)
-        storage.save(DATA, job)
-        result = job.copy()
-    pool.submit(run_download, job_id, req)
+        if not all(shutil.which(tool) for tool in ('ffmpeg', 'ffprobe')):
+            raise HTTPException(503, 'Install FFmpeg and FFprobe to enable verified downloads and conversion.')
+        pending = {key: value for key, value in job.items() if key not in ('error', 'filename', 'size', 'preview_available', 'video_codec', 'video_pixel_format', 'audio_codec', 'actual_height', 'has_audio')}
+        pending.update(status='queued', progress=0, speed=None, eta=None)
+        save_queued(pending)
+        jobs[job_id] = pending
+        result = pending.copy()
+    submit_job(job_id, req)
     return result
 
 
 @app.get('/api/jobs')
 def list_jobs():
     with lock:
+        for job in jobs.values():
+            if job['status'] == 'completed' and not saved_path(job):
+                changed = job | {'status': 'failed', 'error': 'The saved file is missing. Use Retry to download it again.', 'preview_available': False}
+                save_queued(changed)
+                job.update(changed)
         return [j.copy() for j in sorted(jobs.values(), key=lambda j: j['created'], reverse=True)]
 
 
@@ -341,46 +383,63 @@ def completed_file(job_id):
     job = jobs.get(job_id)
     if not job or job['status'] != 'completed':
         raise HTTPException(404, 'Download is not available.')
-    file = DATA / job_id / job['filename']
-    if not file.is_file():
+    file = saved_path(job)
+    if not file:
         raise HTTPException(404, 'File no longer exists.')
     return file, job
 
 
+def saved_path(job):
+    if not job.get('filename'):
+        return None
+    folder = (DATA / job['id']).resolve()
+    file = (folder / job['filename']).resolve()
+    return file if file.is_relative_to(folder) and file.is_file() else None
+
+
+def media_lock(job_id):
+    with lock:
+        if job_id not in jobs:
+            raise HTTPException(404, 'Download not found.')
+        return preview_locks.setdefault(job_id, threading.Lock())
+
+
 @app.get('/api/jobs/{job_id}/thumbnail')
 def get_thumbnail(job_id: str):
-    file, job = completed_file(job_id)
-    if job.get('format') not in ('mp4', 'mkv', 'webm'):
-        raise HTTPException(404, 'No video thumbnail is available.')
-    try:
-        with preview_lock:
+    with media_lock(job_id):
+        file, job = completed_file(job_id)
+        if job.get('format') not in ('mp4', 'mkv', 'webm'):
+            raise HTTPException(404, 'No video thumbnail is available.')
+        try:
             thumbnail = make_thumbnail(file)
-        return FileResponse(thumbnail, media_type='image/jpeg', headers={'Cache-Control': 'private, max-age=86400'})
-    except (OSError, subprocess.SubprocessError):
-        raise HTTPException(404, 'Thumbnail is unavailable.')
+            return FileResponse(thumbnail, media_type='image/jpeg', headers={'Cache-Control': 'private, max-age=86400'})
+        except (OSError, subprocess.SubprocessError):
+            raise HTTPException(404, 'Thumbnail is unavailable.')
 
 
 @app.get('/api/jobs/{job_id}/stream')
 def stream_file(job_id: str):
-    file, job = completed_file(job_id)
-    try:
-        with preview_lock:
-            preview = playable_file(file, job if 'video_codec' in job else describe_media(file))
-        media_type = {'.mp4': 'video/mp4', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.wav': 'audio/wav'}[preview.suffix]
-        return FileResponse(preview, media_type=media_type, headers={'Cache-Control': 'private, no-cache'})
-    except (OSError, KeyError, subprocess.SubprocessError):
-        raise HTTPException(422, 'A browser preview could not be prepared. Save the original file to play it on your device.')
+    with media_lock(job_id):
+        file, job = completed_file(job_id)
+        try:
+            preview = playable_file(file, job if 'video_pixel_format' in job else describe_media(file))
+            media_type = {'.mp4': 'video/mp4', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.wav': 'audio/wav'}[preview.suffix]
+            return FileResponse(preview, media_type=media_type, headers={'Cache-Control': 'private, no-cache'})
+        except (OSError, KeyError, subprocess.SubprocessError):
+            raise HTTPException(422, 'A browser preview could not be prepared. Save the original file to play it on your device.')
 
 
 @app.delete('/api/jobs/{job_id}')
 def remove_job(job_id: str):
-    with lock:
-        job = jobs.get(job_id)
-        if not job:
-            raise HTTPException(404, 'Download not found.')
-        if job['status'] not in ('completed', 'failed'):
-            raise HTTPException(409, 'Wait for the download to finish before removing it.')
-        storage.delete(DATA, job_id)
-        del jobs[job_id]
-    shutil.rmtree(DATA / job_id, ignore_errors=True)
+    with media_lock(job_id):
+        with lock:
+            job = jobs.get(job_id)
+            if not job:
+                raise HTTPException(404, 'Download not found.')
+            if job['status'] not in ('completed', 'failed'):
+                raise HTTPException(409, 'Wait for the download to finish before removing it.')
+            storage.delete(DATA, job_id)
+            del jobs[job_id]
+            preview_locks.pop(job_id, None)
+        shutil.rmtree(DATA / job_id, ignore_errors=True)
     return {'removed': True}

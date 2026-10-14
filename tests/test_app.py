@@ -130,6 +130,7 @@ def isolate_history(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'DATA', tmp_path)
     monkeypatch.setattr(main, 'jobs', {})
     monkeypatch.setattr(main, 'analysis_cache', {})
+    monkeypatch.setattr(main, 'preview_locks', {})
     monkeypatch.setattr(main.source_access, 'youtube', main.source_access.YoutubeAccess())
     monkeypatch.delenv('STREAMVAULT_PASSWORD', raising=False)
     monkeypatch.delenv('STREAMVAULT_PUBLIC', raising=False)
@@ -228,7 +229,8 @@ def test_source_restrictions_are_explained(message, expected):
     assert expected in main.download_error(RuntimeError(message))
 
 
-def test_video_only_with_unknown_resolution_downloads_and_respects_cap(tmp_path, monkeypatch):
+@pytest.mark.parametrize('known_height', [None, 480])
+def test_video_only_with_unknown_resolution_downloads_and_respects_cap(tmp_path, monkeypatch, known_height):
     source = tmp_path / 'silent.mp4'
     subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=purple:s=320x480:d=1', '-c:v', 'libx264', str(source)], check=True)
     class QuietHandler(SimpleHTTPRequestHandler):
@@ -237,7 +239,7 @@ def test_video_only_with_unknown_resolution_downloads_and_respects_cap(tmp_path,
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f'http://127.0.0.1:{server.server_port}/silent.mp4'
     def extract(self, *args, **kwargs):
-        return self.process_ie_result({'id': 'silent', 'title': 'Silent source', 'formats': [{'format_id': 'video-only', 'url': url, 'ext': 'mp4', 'vcodec': 'h264', 'acodec': 'none'}]}, download=True)
+        return self.process_ie_result({'id': 'silent', 'title': 'Silent source', 'formats': [{'format_id': 'video-only', 'url': url, 'ext': 'mp4', 'vcodec': 'h264', 'acodec': 'none', 'height': known_height}]}, download=True)
     monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', extract)
     main.jobs['silent'] = {'id': 'silent', 'status': 'queued', 'created': 0}
     try:
@@ -416,3 +418,153 @@ def test_cookie_file_is_opt_in_local_and_never_returned_in_health(tmp_path, monk
 def test_video_id_containing_429_does_not_trigger_source_cooldown():
     main.source_access.SourceLogger().warning('[youtube] Video 429abcd: Unable to fetch GVS PO Token')
     assert main.source_access.youtube.remaining() == 0
+
+
+def failed_job(job_id='retry'):
+    return {'id': job_id, 'url': 'https://youtu.be/fixture', 'title': 'A saved moment', 'format': 'mp4', 'quality': '720', 'created': 0, 'status': 'failed', 'error': 'Previous failure', 'filename': 'stale.mp4', 'size': 100, 'preview_available': True}
+
+
+def test_executor_failure_does_not_leave_queued_job(monkeypatch):
+    def rejected(*args): raise RuntimeError('executor unavailable')
+    monkeypatch.setattr(main.pool, 'submit', rejected)
+    response = client.post('/api/download', json={'url': 'https://youtu.be/fixture'})
+    assert response.status_code == 503
+    job = next(iter(main.jobs.values()))
+    assert job['status'] == 'failed'
+    assert main.storage.restore(main.DATA)[job['id']]['status'] == 'failed'
+
+
+@pytest.mark.parametrize('retry', [False, True])
+def test_failed_history_write_does_not_publish_pending_job(monkeypatch, retry):
+    if retry: main.jobs['retry'] = failed_job()
+    def rejected(*args): raise OSError('disk full private-path')
+    monkeypatch.setattr(main.storage, 'save', rejected)
+    response = client.post('/api/jobs/retry/retry') if retry else client.post('/api/download', json={'url': 'https://youtu.be/fixture'})
+    assert response.status_code == 503
+    assert 'private-path' not in response.text
+    assert main.jobs['retry']['status'] == 'failed' if retry else not main.jobs
+
+
+def test_retry_resets_stale_completion_metadata(monkeypatch):
+    main.jobs['retry'] = failed_job()
+    monkeypatch.setattr(main.pool, 'submit', lambda *args: None)
+    response = client.post('/api/jobs/retry/retry')
+    assert response.status_code == 202
+    for key in ('error', 'filename', 'size', 'preview_available'):
+        assert key not in response.json()
+
+
+def test_worker_options_failure_becomes_failed_job(monkeypatch):
+    main.jobs['retry'] = failed_job() | {'status': 'queued'}
+    def rejected(): raise RuntimeError('setup failed')
+    monkeypatch.setattr(main, 'options', rejected)
+    main.run_download('retry', main.DownloadRequest(url='https://youtu.be/fixture'))
+    assert main.jobs['retry']['status'] == 'failed'
+
+
+def test_restart_leftovers_are_removed_and_failure_cleanup_precedes_retry(tmp_path, monkeypatch):
+    main.jobs['retry'] = failed_job() | {'status': 'queued'}
+    folder = tmp_path / 'retry'
+    (folder / '_preview').mkdir(parents=True)
+    (folder / 'stale.mp4').write_bytes(b'stale')
+    def rejected(*args):
+        assert not (folder / 'stale.mp4').exists()
+        assert not (folder / '_preview').exists()
+        (folder / 'partial.part').write_bytes(b'partial')
+        raise RuntimeError('network failure')
+    update = main.update
+    def observe(job_id, **values):
+        if values.get('status') == 'failed': assert not folder.exists()
+        return update(job_id, **values)
+    monkeypatch.setattr(main, 'extract_video', rejected)
+    monkeypatch.setattr(main, 'update', observe)
+    main.run_download('retry', main.DownloadRequest(url='https://youtu.be/fixture'))
+    assert main.jobs['retry']['status'] == 'failed'
+
+
+def test_corrupt_download_is_not_marked_completed(tmp_path, monkeypatch):
+    main.jobs['retry'] = failed_job() | {'status': 'queued'}
+    def corrupt(*args):
+        (tmp_path / 'retry' / 'broken.mp4').write_bytes(b'not a media file')
+        return {'title': 'Broken file'}
+    monkeypatch.setattr(main, 'extract_video', corrupt)
+    main.run_download('retry', main.DownloadRequest(url='https://youtu.be/fixture'))
+    assert main.jobs['retry']['status'] == 'failed'
+    assert 'not valid media' in main.jobs['retry']['error']
+    assert not (tmp_path / 'retry').exists()
+
+
+def test_missing_original_is_shown_as_retriable_history(monkeypatch):
+    main.jobs['retry'] = failed_job() | {'status': 'completed'}
+    response = client.get('/api/jobs')
+    assert response.status_code == 200
+    assert response.json()[0]['status'] == 'failed'
+    assert 'saved file is missing' in response.json()[0]['error']
+    monkeypatch.setattr(main.pool, 'submit', lambda *args: None)
+    assert client.post('/api/jobs/retry/retry').status_code == 202
+
+
+def test_history_file_cannot_escape_job_folder(tmp_path):
+    (tmp_path / 'outside.txt').write_text('private-data')
+    main.jobs['retry'] = failed_job() | {'status': 'completed', 'filename': '../outside.txt'}
+    assert client.get('/api/jobs/retry/file').status_code == 404
+
+
+def test_ffprobe_is_required_for_download_validation(monkeypatch):
+    which = main.shutil.which
+    monkeypatch.setattr(main.shutil, 'which', lambda tool: None if tool == 'ffprobe' else which(tool))
+    assert client.get('/api/health').json()['ffprobe'] is False
+    assert client.post('/api/download', json={'url': 'https://youtu.be/fixture'}).status_code == 503
+
+
+def test_h264_444_receives_browser_compatible_preview(tmp_path):
+    original = tmp_path / 'original.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=s=160x120:d=1', '-c:v', 'libx264', '-pix_fmt', 'yuv444p', str(original)], check=True)
+    before = original.read_bytes()
+    media = main.describe_media(original)
+    assert media['video_pixel_format'] == 'yuv444p'
+    preview = main.playable_file(original, media)
+    assert preview != original
+    assert main.describe_media(preview)['video_pixel_format'] == 'yuv420p'
+    assert original.read_bytes() == before
+
+
+def test_unrelated_thumbnail_requests_are_not_serialized(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    started, release = threading.Event(), threading.Event()
+    for job_id in ('slow', 'fast'):
+        folder = tmp_path / job_id; folder.mkdir()
+        (folder / 'stale.mp4').write_bytes(b'fixture')
+        main.jobs[job_id] = failed_job(job_id) | {'status': 'completed'}
+    def poster(file):
+        if file.parent.name == 'slow':
+            started.set()
+            assert release.wait(5)
+        return file.parent / 'poster.jpg'
+    monkeypatch.setattr(main, 'make_thumbnail', poster)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        slow = workers.submit(main.get_thumbnail, 'slow')
+        try:
+            assert started.wait(2)
+            fast = workers.submit(main.get_thumbnail, 'fast')
+            assert fast.result(timeout=2).media_type == 'image/jpeg'
+        finally:
+            release.set()
+        assert slow.result(timeout=2).media_type == 'image/jpeg'
+
+
+def test_preview_timeout_keeps_original_available(tmp_path, monkeypatch):
+    import shutil
+    original = tmp_path / 'source.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=s=160x120:d=1', '-c:v', 'libx264', str(original)], check=True)
+    main.jobs['retry'] = failed_job() | {'status': 'queued'}
+    def extracted(*args):
+        shutil.copyfile(original, tmp_path / 'retry' / 'download.mp4')
+        return {'title': 'Saved original'}
+    def failed_preview(*args): raise subprocess.TimeoutExpired('ffmpeg', 300)
+    monkeypatch.setattr(main, 'extract_video', extracted)
+    monkeypatch.setattr(main, 'playable_file', failed_preview)
+    main.run_download('retry', main.DownloadRequest(url='https://youtu.be/fixture'))
+    assert main.jobs['retry']['status'] == 'completed'
+    assert main.jobs['retry']['preview_available'] is False
+    assert client.get('/api/jobs/retry/file').content == original.read_bytes()
