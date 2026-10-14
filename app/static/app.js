@@ -18,6 +18,7 @@ for (const id of ['platform-grid','all-platforms']) {
 }
 let analyzed = null, jobs = [], busy = false, playingId = null;
 let analysisVersion = 0, analysisController = null, refreshing = null, refreshAgain = false;
+let noticeTimer = null;
 const rendered = new Map();
 function view(name) {
   for (const n of ['home','downloads','platforms']) $(n).hidden = n !== name;
@@ -26,7 +27,23 @@ function view(name) {
 }
 document.querySelectorAll('.nav').forEach(el => el.onclick = () => view(el.dataset.view));
 $('view-all').onclick = () => view('downloads'); $('see-platforms').onclick = () => view('platforms');
-function notice(message) { $('notice').hidden = !message; $('notice').textContent = message; }
+function notice(message,retryAfter = 0) {
+  clearInterval(noticeTimer); noticeTimer = null;
+  const box = $('notice'); box.hidden = !message; box.setAttribute('aria-live','polite'); box.textContent = message;
+  if (!(retryAfter > 0) || !message.includes('YouTube is limiting requests')) return;
+  const until = Date.now()+retryAfter*1000;
+  const update = () => {
+    const seconds = Math.max(0,Math.ceil((until-Date.now())/1000));
+    if (seconds) {
+      box.setAttribute('aria-live','off');
+      box.textContent = 'YouTube request limit: local wait '+duration(seconds)+'. Source verification may still be required afterwards.';
+    } else {
+      clearInterval(noticeTimer); noticeTimer = null; box.setAttribute('aria-live','polite');
+      box.textContent = 'The local wait has ended. You may try once; YouTube can still require verification or continue limiting requests.';
+    }
+  };
+  update(); noticeTimer = setInterval(update,1000);
+}
 async function api(path,options = {}) {
   const controller = new AbortController(), callerSignal = options.signal;
   const cancel = () => controller.abort();
@@ -37,7 +54,12 @@ async function api(path,options = {}) {
     const response = await fetch(path,{...options,signal:controller.signal});
     const body = await response.text(); let data;
     try { data = JSON.parse(body); } catch { throw Error('The server returned an unreadable response (HTTP '+response.status+'). Check the server connection and retry.'); }
-    if (!response.ok) throw Error(typeof data.detail === 'string' ? data.detail : 'Request could not be completed (HTTP '+response.status+').');
+    if (!response.ok) {
+      const error = Error(typeof data.detail === 'string' ? data.detail : 'Request could not be completed (HTTP '+response.status+').');
+      const seconds = Number(response.headers.get('Retry-After'));
+      if (Number.isFinite(seconds) && seconds > 0) error.retryAfter = seconds;
+      throw error;
+    }
     return data;
   } catch(e) {
     if (e.name === 'AbortError' && !callerSignal?.aborted) throw Error('The request timed out. Check the server window before retrying; a download may still be running.');
@@ -76,7 +98,7 @@ $('analyze-form').onsubmit = async event => {
     const qualities = [2160,1440,1080,720,480,360].filter(h => !analyzed.qualities.length || h <= Math.max(...analyzed.qualities));
     for (const q of qualities.length ? qualities : [360]) $('quality').add(new Option(q+'p'+(q === 2160 ? ' · 4K' : q === 1080 ? ' · Full HD' : ''),q));
     $('quality').value = qualities.includes(1080) ? '1080' : String(qualities[0] || 360); $('video-result').hidden = false;
-  } catch(e) { if (version === analysisVersion && e.name !== 'AbortError') notice(e.message); }
+  } catch(e) { if (version === analysisVersion && e.name !== 'AbortError') notice(e.message,e.retryAfter); }
   finally { if (version === analysisVersion) { busy = false; analysisController = null; $('analyze-button').disabled = false; analyzeLabel(); } }
 };
 $('url').oninput = () => { analysisVersion++; analysisController?.abort(); analysisController = null; busy = false; analyzed = null; $('video-result').hidden = true; $('analyze-button').disabled = false; analyzeLabel(); notice(''); };
@@ -86,7 +108,7 @@ $('download-button').onclick = async () => {
   try {
     await api('/api/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:analyzed.url,format:$('format').value,quality:$('quality').value})});
     notice('Added to your collection. Play or save it when processing is complete.'); await refresh();
-  } catch(e) { notice(e.message); } finally { $('download-button').disabled = false; }
+  } catch(e) { notice(e.message,e.retryAfter); } finally { $('download-button').disabled = false; }
 };
 function stopPlayer() {
   for (const id of ['video-player','audio-player']) { const media = $(id); media.pause(); media.removeAttribute('src'); media.load(); }
@@ -128,7 +150,7 @@ function render(target,list) {
     const actions = document.createElement('div'); actions.className = 'job-actions';
     if (playable) { const p = document.createElement('button'); p.className = 'play-button'; p.append(icon('play'),document.createTextNode(' Play')); p.onclick = () => playJob(j); actions.append(p); }
     if (j.status === 'completed') { const a = document.createElement('a'); a.href = endpoint(j,'file'); a.textContent = '↓ Save original'; actions.append(a); }
-    if (j.status === 'failed') { const retry = document.createElement('button'); retry.className = 'retry-button'; retry.textContent = '↻ Try again'; retry.onclick = async () => { retry.disabled = true; try { await api('/api/jobs/'+encodeURIComponent(j.id)+'/retry',{method:'POST'}); await refresh(); } catch(e) { notice(e.message); view('home'); } finally { retry.disabled = false; } }; actions.append(retry); }
+    if (j.status === 'failed') { const retry = document.createElement('button'); retry.className = 'retry-button'; retry.textContent = '↻ Try again'; retry.onclick = async () => { retry.disabled = true; try { await api('/api/jobs/'+encodeURIComponent(j.id)+'/retry',{method:'POST'}); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { retry.disabled = false; } }; actions.append(retry); }
     if (['failed','completed'].includes(j.status)) { const remove = document.createElement('button'); remove.className = 'remove-button'; remove.textContent = '×'; remove.setAttribute('aria-label','Remove '+j.title); remove.onclick = async () => { try { await api('/api/jobs/'+encodeURIComponent(j.id),{method:'DELETE'}); if (playingId === j.id) $('player-dialog').close(); await refresh(); } catch(e) { notice(e.message); view('home'); } }; actions.append(remove); }
     row.append(cover,detail,actions); container.append(row);
   }

@@ -55,7 +55,16 @@ def is_rate_limit(message):
     return bool(re.search(r'(?:http(?:\s+error)?|status(?:\s+code)?)[\s:=]+429\b|too many requests', str(message), re.I))
 
 
+def is_bot_verification(message):
+    message = str(message).lower().replace('\u2019', "'")
+    return "confirm you're not a bot" in message or 'confirm you are not a bot' in message
+
+
 class SourceLogger:
+    def __init__(self):
+        self.saw_rate_limit = False
+        self.terminal_rate_limit = False
+
     def debug(self, message):
         if not message.startswith('[debug] '):
             print(message, file=sys.stderr)
@@ -63,14 +72,15 @@ class SourceLogger:
     def warning(self, message):
         print('WARNING: ' + message, file=sys.stderr)
         if is_rate_limit(message):
-            youtube.limited()
-            raise SourceRateLimited(youtube.remaining())
+            # A webpage warning can be recovered by the extractor's native fallback.
+            # Never raise from a logging callback or mark a successful request blocked.
+            self.saw_rate_limit = True
 
     def error(self, message):
         print('ERROR: ' + message, file=sys.stderr)
         if is_rate_limit(message):
-            youtube.limited()
-            raise SourceRateLimited(youtube.remaining())
+            self.saw_rate_limit = True
+            self.terminal_rate_limit = True
 
 
 def youtube_url(url):

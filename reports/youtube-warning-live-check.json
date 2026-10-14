@@ -1,0 +1,7 @@
+{
+  "url": "https://www.youtube.com/shorts/CB5OlofqJ38",
+  "scope": "One unauthenticated cloud analysis request; no source retry loop or account cookies",
+  "status": "analysis_failed",
+  "message": "The video server rejected the download (HTTP 403). Update yt-dlp with its default dependencies, check the JavaScript runtime, and retry. If it persists, check source access and the terminal warnings.",
+  "network_evidence": "The cloud proxy rejected the HTTPS CONNECT tunnel with HTTP 403; no source download was verified."
+}

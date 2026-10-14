@@ -568,3 +568,65 @@ def test_preview_timeout_keeps_original_available(tmp_path, monkeypatch):
     assert main.jobs['retry']['status'] == 'completed'
     assert main.jobs['retry']['preview_available'] is False
     assert client.get('/api/jobs/retry/file').content == original.read_bytes()
+
+
+def test_recoverable_youtube_429_warning_allows_native_fallback(monkeypatch):
+    def recovered(downloader, *args, **kwargs):
+        downloader.params['logger'].warning('[youtube] Unable to download webpage: HTTP Error 429: Too Many Requests')
+        return {'title': 'Recovered by native extractor', 'formats': [{'height': 720, 'vcodec': 'h264'}]}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', recovered)
+    response = client.post('/api/analyze', json={'url': 'https://youtu.be/recovered'})
+    assert response.status_code == 200
+    assert main.source_access.youtube.remaining() == 0
+    monkeypatch.setattr(main.pool, 'submit', lambda *args: None)
+    assert client.post('/api/download', json={'url': 'https://youtu.be/recovered'}).status_code == 202
+
+
+def test_terminal_youtube_429_without_logger_starts_cooldown(monkeypatch):
+    def failed(*args, **kwargs):
+        raise main.yt_dlp.utils.DownloadError('HTTP Error 429: Too Many Requests')
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', failed)
+    response = client.post('/api/analyze', json={'url': 'https://youtu.be/limited'})
+    assert response.status_code == 429
+    assert main.source_access.youtube.remaining() > 0
+
+
+def test_incidental_youtube_429_does_not_hide_private_video_error(monkeypatch):
+    def failed(downloader, *args, **kwargs):
+        downloader.params['logger'].warning('[youtube] Unable to download webpage: HTTP Error 429')
+        raise main.yt_dlp.utils.DownloadError('Private video')
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', failed)
+    response = client.post('/api/analyze', json={'url': 'https://youtu.be/private'})
+    assert response.status_code == 422
+    assert 'private access' in response.json()['detail']
+    assert main.source_access.youtube.remaining() == 0
+
+
+def test_recovered_youtube_error_log_does_not_enable_cooldown(monkeypatch):
+    def recovered(downloader, *args, **kwargs):
+        downloader.params['logger'].error('[youtube] HTTP Error 429')
+        return {'title': 'Recovered', 'formats': []}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', recovered)
+    assert client.post('/api/analyze', json={'url': 'https://youtu.be/recovered'}).status_code == 200
+    assert main.source_access.youtube.remaining() == 0
+
+
+def test_youtube_warning_then_real_transfer_can_complete(tmp_path, monkeypatch):
+    source = tmp_path / 'fixture.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=s=160x120:d=1', '-c:v', 'libx264', str(source)], check=True)
+    class QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, *args): pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), partial(QuietHandler, directory=str(tmp_path)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    def recovered(downloader, *args, **kwargs):
+        downloader.params['logger'].warning('[youtube] Unable to download webpage: HTTP Error 429')
+        return downloader.process_ie_result({'id': 'recovered', 'title': 'Recovered transfer', 'formats': [{'format_id': 'video', 'url': f'http://127.0.0.1:{server.server_port}/fixture.mp4', 'ext': 'mp4', 'vcodec': 'h264', 'acodec': 'none', 'height': 120}]}, download=True)
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', recovered)
+    main.jobs['recovered'] = {'id': 'recovered', 'status': 'queued', 'created': 0, 'format': 'mp4'}
+    try:
+        main.run_download('recovered', main.DownloadRequest(url='https://youtu.be/recovered', quality='360'))
+        assert main.jobs['recovered']['status'] == 'completed', main.jobs['recovered']
+        assert client.get('/api/jobs/recovered/file').status_code == 200
+        assert main.source_access.youtube.remaining() == 0
+    finally:
+        server.shutdown();server.server_close()

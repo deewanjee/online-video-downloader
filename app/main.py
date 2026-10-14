@@ -78,12 +78,14 @@ def extract_video(url, download, settings):
         with video_downloader(settings) as dl:
             return dl.extract_info(url, download=download)
     with source_access.youtube.request(download):
-        settings = source_access.authenticated_settings(settings) | {'logger': source_access.SourceLogger(), 'sleep_interval_requests': 1, 'extractor_retries': 1}
+        logger = source_access.SourceLogger()
+        settings = source_access.authenticated_settings(settings) | {'logger': logger, 'sleep_interval_requests': 1, 'extractor_retries': 1}
         try:
             with video_downloader(settings) as dl:
                 return dl.extract_info(url, download=download)
-        except Exception:
-            if source_access.youtube.remaining():
+        except Exception as exc:
+            if source_access.is_rate_limit(exc) or logger.terminal_rate_limit or (logger.saw_rate_limit and source_access.is_bot_verification(exc)):
+                source_access.youtube.limited()
                 raise source_access.SourceRateLimited(source_access.youtube.remaining()) from None
             raise
 
@@ -159,7 +161,7 @@ def download_error(exc):
         return 'The local session cookie file could not be read. Export a valid Netscape-format cookie file and check its permissions.'
     if source_access.is_rate_limit(message):
         return 'The source is limiting download requests (HTTP 429). Wait before retrying; repeated retries can prolong the limit.'
-    if 'confirm you\u2019re not a bot' in message or "confirm you're not a bot" in message:
+    if source_access.is_bot_verification(message):
         return 'YouTube requires bot verification. Open the video in your browser and complete verification. The desktop app can use your own local session cookie file; this does not guarantee download access.'
     if 'threads' in message:
         if 'contains multiple videos' in message:
