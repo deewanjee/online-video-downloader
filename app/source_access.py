@@ -90,6 +90,7 @@ class SourceLogger:
     def __init__(self):
         self.saw_rate_limit = False
         self.terminal_rate_limit = False
+        self.saw_error = False
 
     def debug(self, message):
         if not message.startswith('[debug] '):
@@ -104,6 +105,7 @@ class SourceLogger:
 
     def error(self, message):
         print('ERROR: ' + message, file=sys.stderr)
+        self.saw_error = True
         if is_rate_limit(message):
             self.saw_rate_limit = True
             self.terminal_rate_limit = True

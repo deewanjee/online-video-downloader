@@ -85,7 +85,15 @@ function placeholder(parent,label) {
   const text = document.createElement('span'); text.textContent = label; box.append(text); parent.append(box);
 }
 $('analyze-form').onsubmit = async event => {
-  event.preventDefault(); if (busy) return; busy = true; analyzed = null;
+  event.preventDefault(); if (busy) return;
+  try {
+    const url = new URL($('url').value.trim());
+    if (/(^|\.)(youtube\.com|youtu\.be)$/.test(url.hostname) && url.searchParams.has('list')) {
+      $('playlist-panel').open = true; $('playlist-url').value = url.href;
+      $('playlist-panel').scrollIntoView({behavior:'smooth',block:'start'}); $('playlist-form').requestSubmit(); return;
+    }
+  } catch {}
+  busy = true; analyzed = null;
   const version = ++analysisVersion, url = $('url').value.trim();
   analysisController = new AbortController();
   $('video-result').hidden = true; notice(''); $('analyze-button').disabled = true; $('analyze-button').textContent = 'Finding…';
@@ -125,6 +133,63 @@ $('bulk-form').onsubmit = async event => {
     $('bulk-urls').value = ''; await refresh();
   } catch(e) { box.textContent = e.message; }
   finally { $('bulk-button').disabled = false; }
+};
+let playlist = null, playlistVersion = 0, playlistController = null, playlistQueuing = false;
+function playlistSelection() {
+  const boxes = [...$('playlist-videos').querySelectorAll('input[type=checkbox]')];
+  const selected = boxes.filter(box => box.checked);
+  $('playlist-selected').textContent = selected.length+' / '+boxes.length+' selected';
+  $('playlist-select-all').checked = boxes.length > 0 && selected.length === boxes.length;
+  $('playlist-select-all').indeterminate = selected.length > 0 && selected.length < boxes.length;
+  $('playlist-queue').textContent = selected.length === boxes.length ? '↓ Queue entire playlist' : '↓ Queue '+selected.length+' selected videos';
+  $('playlist-queue').disabled = !selected.length || playlistQueuing;
+  return selected.map(box => box.value);
+}
+$('playlist-select-all').onchange = () => {
+  $('playlist-videos').querySelectorAll('input[type=checkbox]').forEach(box => { box.checked = $('playlist-select-all').checked; });
+  playlistSelection();
+};
+$('playlist-format').onchange = () => { $('playlist-quality-label').hidden = audioFormats.includes($('playlist-format').value); };
+$('playlist-url').oninput = () => {
+  if (playlistQueuing) return;
+  playlistVersion++; playlistController?.abort(); playlistController = null; playlist = null;
+  $('playlist-result').hidden = true; $('playlist-message').hidden = true; $('playlist-load').disabled = false;
+};
+$('playlist-form').onsubmit = async event => {
+  event.preventDefault(); if (playlistQueuing) return;
+  const version = ++playlistVersion, box = $('playlist-message');
+  playlistController?.abort(); playlistController = new AbortController(); playlist = null;
+  $('playlist-result').hidden = true; $('playlist-load').disabled = true; box.hidden = false;
+  box.textContent = 'Loading the playlist video list…';
+  try {
+    const result = await api('/api/playlist/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:$('playlist-url').value.trim()}),signal:playlistController.signal,timeout:180000});
+    if (version !== playlistVersion) return;
+    playlist = result; $('playlist-title').textContent = result.title;
+    $('playlist-summary').textContent = result.videos.length+' available videos'+(result.unavailable?' · '+result.unavailable+' unavailable/live entries skipped':'')+(result.unlisted?' · '+result.unlisted+' entries not listed by YouTube (may be hidden or unavailable)':'')+(result.duplicates_removed?' · '+result.duplicates_removed+' duplicates skipped':'')+'.';
+    const fragment = document.createDocumentFragment();
+    for (const video of result.videos) {
+      const row = document.createElement('label'); row.className = 'playlist-video';
+      const check = document.createElement('input'); check.type = 'checkbox'; check.value = video.id; check.checked = true; check.onchange = playlistSelection;
+      const title = document.createElement('span'); title.textContent = video.position+'. '+video.title;
+      const meta = document.createElement('small'); meta.textContent = video.duration ? duration(video.duration) : '';
+      row.append(check,title,meta); fragment.append(row);
+    }
+    $('playlist-videos').replaceChildren(fragment); $('playlist-result').hidden = false;
+    playlistSelection(); box.textContent = 'Choose your format and queue the whole playlist, or select individual videos.';
+  } catch(e) { if (version === playlistVersion && e.name !== 'AbortError') box.textContent = e.message; }
+  finally { if (version === playlistVersion) { $('playlist-load').disabled = false; playlistController = null; } }
+};
+$('playlist-queue').onclick = async () => {
+  if (!playlist || playlistQueuing) return;
+  const video_ids = playlistSelection(); if (!video_ids.length) return;
+  playlistQueuing = true; $('playlist-queue').disabled = true; $('playlist-load').disabled = true; $('playlist-url').disabled = true;
+  $('playlist-message').hidden = false; $('playlist-message').textContent = 'Adding selected playlist videos…';
+  try {
+    const result = await api('/api/playlist/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:playlist.token,video_ids,format:$('playlist-format').value,quality:$('playlist-quality').value,youtube_concurrency:Number($('playlist-concurrency').value)})});
+    $('playlist-message').textContent = result.added+' playlist videos added. Track each video in My library.'+(result.submission_failures?' '+result.submission_failures+' jobs need Retry after restarting the app.':'');
+    playlist = null; $('playlist-result').hidden = true; await refresh();
+  } catch(e) { $('playlist-message').textContent = e.message; }
+  finally { playlistQueuing = false; $('playlist-load').disabled = false; $('playlist-url').disabled = false; playlistSelection(); }
 };
 function stopPlayer() {
   playerVersion++; clearTimeout(previewTimer); previewController?.abort(); previewController = null;
@@ -200,7 +265,7 @@ function render(target,list) {
     const detail = document.createElement('div'); detail.className = 'job-details';
     const platform = document.createElement('div'); platform.className = 'job-platform'; platform.textContent = sourceName(j);
     const title = document.createElement('div'); title.className = 'job-title'; title.textContent = j.title; title.title = j.title;
-    const meta = document.createElement('div'); meta.className = 'job-meta'; meta.textContent = j.format.toUpperCase()+' · '+(audioFormats.includes(j.format) ? 'Audio' : (j.actual_height || j.quality)+'p')+(j.size ? ' · '+(j.size/1024/1024).toFixed(1)+' MB' : '')+(j.has_audio === false ? ' · No audio track' : '');
+    const meta = document.createElement('div'); meta.className = 'job-meta'; meta.textContent = j.format.toUpperCase()+' · '+(audioFormats.includes(j.format) ? 'Audio' : (j.actual_height || j.quality)+'p')+(j.size ? ' · '+(j.size/1024/1024).toFixed(1)+' MB' : '')+(j.has_audio === false ? ' · No audio track' : '')+(j.playlist_title ? ' · '+j.playlist_title+' #'+j.playlist_position : '');
     const previewPending = j.status === 'completed' && j.preview_status !== 'ready';
     const status = document.createElement('div'); status.className = 'status'+(j.status === 'failed' ? ' failed' : '')+(previewPending?' preview-note':'');
     status.textContent = j.error || (j.status === 'completed' ? j.preview_status === 'processing' ? 'Original ready · Preview encoding '+(j.preview_progress || 0)+'%' : j.preview_status === 'queued' ? 'Original ready · Preview queued separately' : j.preview_status === 'failed' ? 'Original ready · Preview failed; press Play to retry' : j.preview_available ? 'Ready for a replay' : 'Original ready · Play prepares a browser preview' : j.status === 'queued' ? 'Waiting for a download slot' : (stages[j.stage] || 'Downloading your video')+(j.stage_started?' · '+duration(Math.max(0,Date.now()/1000-j.stage_started))+' elapsed':''));

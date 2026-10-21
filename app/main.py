@@ -12,7 +12,8 @@ from typing import Annotated
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
+from itertools import islice
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException
@@ -35,7 +36,7 @@ async def lifespan(application):
         stop_previews()
 
 
-app = FastAPI(title='StreamVault', version='1.2.0', lifespan=lifespan)
+app = FastAPI(title='StreamVault', version='1.3.0', lifespan=lifespan)
 app.add_middleware(AccessControl)
 app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 HOSTS = ('youtube.com', 'youtu.be', 'dailymotion.com', 'dai.ly', 'facebook.com', 'fb.watch', 'tiktok.com', 'instagram.com', 'threads.net', 'threads.com', 'twitter.com', 'x.com')
@@ -49,6 +50,10 @@ preview_processes = set()
 preview_process_lock = threading.Lock()
 previews_stopping = threading.Event()
 MAX_ACTIVE = 50
+MAX_PLAYLIST = 1000
+MAX_HISTORY = 1100
+playlist_cache = {}
+playlist_lock = threading.Lock()
 
 class VideoRequest(BaseModel):
     url: str = Field(max_length=2048)
@@ -62,6 +67,14 @@ class BulkDownloadRequest(BaseModel):
     urls: list[Annotated[str, Field(max_length=2048)]] = Field(min_length=1, max_length=50)
     format: str = 'mp4'
     quality: str = '1080'
+    youtube_concurrency: int = Field(default=1, ge=1, le=2)
+
+
+class PlaylistDownloadRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=64)
+    video_ids: list[Annotated[str, Field(max_length=11)]] | None = Field(default=None, max_length=1000)
+    format: str = 'mp4'
+    quality: str = '720'
     youtube_concurrency: int = Field(default=1, ge=1, le=2)
 
 
@@ -105,7 +118,15 @@ def extract_video(url, download, settings):
         settings = source_access.authenticated_settings(settings) | {'logger': logger, 'sleep_interval_requests': 1, 'extractor_retries': 1}
         try:
             with video_downloader(settings) as dl:
-                return dl.extract_info(url, download=download)
+                result = dl.extract_info(url, download=download)
+                if settings.get('lazy_playlist') and result and result.get('_type') == 'playlist':
+                    # Playlist pages are lazy network requests: keep the downloader and source gate open.
+                    result['entries'] = list(islice(result.get('entries') or [], MAX_PLAYLIST + 1))
+                if settings.get('lazy_playlist') and logger.terminal_rate_limit:
+                    raise source_access.SourceRateLimited(600)
+                if settings.get('lazy_playlist') and result and logger.saw_error:
+                    raise HTTPException(422, 'The playlist list could not be fully loaded. Check source access and load it again; no videos were queued.')
+                return result
         except Exception as exc:
             if source_access.is_rate_limit(exc) or logger.terminal_rate_limit or (logger.saw_rate_limit and source_access.is_bot_verification(exc)):
                 source_access.youtube.limited()
@@ -322,6 +343,83 @@ def update(job_id, **values):
             storage.save(DATA, jobs[job_id])
 
 
+@app.post('/api/playlist/analyze')
+def analyze_playlist(req: VideoRequest):
+    validate_url(req.url)
+    parsed = urlparse(req.url)
+    ids = parse_qs(parsed.query).get('list', [])
+    if not source_access.youtube_url(req.url) or len(ids) != 1 or not re.fullmatch(r'[A-Za-z0-9_-]{2,200}', ids[0]):
+        raise HTTPException(400, 'Paste a YouTube playlist URL containing list=PLAYLIST_ID.')
+    if ids[0].startswith('RD'):
+        raise HTTPException(400, 'YouTube Mix/radio lists change continuously. Use a saved playlist instead.')
+    url = 'https://www.youtube.com/playlist?list=' + ids[0]
+    try:
+        info = extract_video(url, False, options() | {'noplaylist': False, 'extract_flat': 'in_playlist', 'lazy_playlist': True,
+                                                    'playlistend': MAX_PLAYLIST + 1, 'ignoreerrors': True})
+        if not info or info.get('_type') != 'playlist':
+            raise HTTPException(422, 'This playlist is unavailable. Check its visibility and source access.')
+        entries = list(islice(info.get('entries') or [], MAX_PLAYLIST + 1))
+        reported = info.get('playlist_count')
+        reported = reported if isinstance(reported, int) and reported >= 0 else len(entries)
+        if max(len(entries), reported) > MAX_PLAYLIST:
+            raise HTTPException(400, f'This playlist exceeds {MAX_PLAYLIST} entries. Split it into smaller playlists; no partial playlist was queued.')
+        videos, seen, unavailable, duplicates = [], set(), 0, 0
+        for position, entry in enumerate(entries, 1):
+            video_id = entry.get('id', '') if isinstance(entry, dict) else ''
+            if not isinstance(video_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id) or entry.get('availability') in ('private', 'premium_only', 'subscriber_only', 'needs_auth') or entry.get('title') in ('[Private video]', '[Deleted video]') or entry.get('is_live') or entry.get('live_status') in ('is_live', 'is_upcoming', 'post_live'):
+                unavailable += 1
+                continue
+            if video_id in seen:
+                duplicates += 1
+                continue
+            seen.add(video_id)
+            videos.append({'id': video_id, 'url': 'https://www.youtube.com/watch?v=' + video_id,
+                           'title': str(entry.get('title') or 'YouTube video')[:500], 'duration': entry.get('duration'),
+                           'position': position, 'platform': 'YouTube', 'thumbnail': entry.get('thumbnail')})
+        if not videos:
+            raise HTTPException(422, 'No available videos were found in this playlist. Check its visibility and source access.')
+        token = uuid.uuid4().hex
+        result = {'token': token, 'title': str(info.get('title') or 'YouTube playlist')[:500], 'url': url, 'videos': videos,
+                  'unavailable': unavailable, 'duplicates_removed': duplicates, 'entries_found': len(entries),
+                  'unlisted': max(0, reported - len(entries))}
+        with playlist_lock:
+            now = time.monotonic()
+            for old in list(playlist_cache):
+                if now - playlist_cache[old]['created'] > 1800:
+                    playlist_cache.pop(old)
+            if len(playlist_cache) >= 10:
+                playlist_cache.pop(next(iter(playlist_cache)))
+            playlist_cache[token] = {'created': now, 'data': result, 'queued': None}
+        return result
+    except HTTPException:
+        raise
+    except (source_access.SourceRateLimited, source_access.SourceBusy) as exc:
+        raise HTTPException(429, str(exc), headers={'Retry-After': str(exc.retry_after)})
+    except Exception as exc:
+        raise HTTPException(422, download_error(exc))
+
+
+@app.post('/api/playlist/download', status_code=202)
+def download_playlist(req: PlaylistDownloadRequest):
+    # Serialize consumption of one preview token, including duplicate HTTP submissions.
+    with playlist_lock:
+        cached = playlist_cache.get(req.token)
+        if not cached or time.monotonic() - cached['created'] > 1800:
+            raise HTTPException(410, 'Playlist preview expired. Load the playlist again.')
+        if cached['queued'] is not None:
+            return cached['queued']
+        data = cached['data']
+        selected = set(req.video_ids) if req.video_ids is not None else {v['id'] for v in data['videos']}
+        if not selected or not selected.issubset({v['id'] for v in data['videos']}):
+            raise HTTPException(400, 'Select at least one video from the loaded playlist.')
+        videos = [v for v in data['videos'] if v['id'] in selected]
+        result = queue_batch([v['url'] for v in videos], req, MAX_PLAYLIST,
+                             {v['url']: {k: v[k] for k in ('title', 'duration', 'thumbnail', 'platform')} |
+                              {'playlist_title': data['title'], 'playlist_position': v['position']} for v in videos})
+        cached['queued'] = result
+        return result
+
+
 def run_download(job_id, req):
     folder = DATA / job_id
     recovered = None
@@ -430,7 +528,7 @@ def download(req: DownloadRequest):
     with lock:
         if sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values()) >= MAX_ACTIVE:
             raise HTTPException(429, 'Queue is full. Wait for a download to finish.')
-        if len(jobs) >= 100:
+        if len(jobs) >= MAX_HISTORY:
             raise HTTPException(429, 'History is full. Remove older downloads first.')
         job_id = uuid.uuid4().hex
         job = {'id': job_id, 'url': req.url, 'title': 'Preparing download', 'format': req.format, 'quality': req.quality, 'status': 'queued', 'progress': 0, 'created': time.time()}
@@ -446,12 +544,16 @@ def download(req: DownloadRequest):
 
 @app.post('/api/download/bulk', status_code=202)
 def bulk_download(req: BulkDownloadRequest):
-    urls = list(dict.fromkeys(url.strip() for url in req.urls))
+    return queue_batch(req.urls, req)
+
+
+def queue_batch(input_urls, req, active_limit=MAX_ACTIVE, metadata=None):
+    urls = list(dict.fromkeys(url.strip() for url in input_urls))
     requests = [DownloadRequest(url=url, format=req.format, quality=req.quality) for url in urls]
     for item in requests:
         validate_url(item.url)
         if source_access.youtube_url(item.url) and (urlparse(item.url).path == '/playlist' or urlparse(item.url).path.startswith(('/@', '/channel/', '/user/', '/c/'))):
-            raise HTTPException(400, 'Paste individual video links, not a playlist or channel URL.')
+            raise HTTPException(400, 'Use the YouTube playlist panel for playlists. Bulk download accepts individual video links, not channels.')
         check_source_cooldown(item.url)
     if req.format not in ('mp4', 'webm', 'mkv', 'mp3', 'm4a', 'wav') or req.quality not in ('2160', '1440', '1080', '720', '480', '360'):
         raise HTTPException(400, 'Unsupported format or quality.')
@@ -459,7 +561,7 @@ def bulk_download(req: BulkDownloadRequest):
         raise HTTPException(503, 'Install FFmpeg and FFprobe to enable downloads.')
     pending = []
     with lock:
-        available = min(MAX_ACTIVE - sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values()), 100 - len(jobs))
+        available = min(active_limit - sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values()), MAX_HISTORY - len(jobs))
         if len(requests) > available:
             raise HTTPException(429, f'Only {max(0, available)} queue/history slots are available. Submit fewer links or remove old history.')
         for item in requests:
@@ -467,6 +569,8 @@ def bulk_download(req: BulkDownloadRequest):
             cached = analysis_cache.get(item.url)
             if cached and time.monotonic() - cached[0] < 900:
                 job.update(cached[1])
+            if metadata:
+                job.update(metadata.get(item.url, {}))
             pending.append(job)
         try:
             storage.save_many(DATA, pending)
@@ -480,7 +584,7 @@ def bulk_download(req: BulkDownloadRequest):
             submit_job(job['id'], item)
         except HTTPException:
             failures += 1
-    return {'jobs': [job.copy() for job in pending], 'added': len(pending), 'duplicates_removed': len(req.urls) - len(urls), 'submission_failures': failures}
+    return {'jobs': [job.copy() for job in pending], 'added': len(pending), 'duplicates_removed': len(input_urls) - len(urls), 'submission_failures': failures}
 
 
 @app.post('/api/jobs/{job_id}/retry', status_code=202)

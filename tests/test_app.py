@@ -135,6 +135,7 @@ def isolate_history(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'DATA', tmp_path)
     monkeypatch.setattr(main, 'jobs', {})
     monkeypatch.setattr(main, 'analysis_cache', {})
+    monkeypatch.setattr(main, 'playlist_cache', {})
     monkeypatch.setattr(main, 'preview_locks', {})
     monkeypatch.setattr(main.source_access, 'youtube', main.source_access.YoutubeAccess())
     monkeypatch.delenv('STREAMVAULT_PASSWORD', raising=False)
@@ -836,3 +837,185 @@ def test_removed_queued_preview_does_not_recreate_files(tmp_path,monkeypatch):
     function,*args=tasks[0];function(*args)
     assert not folder.exists()
     assert 'finished' not in main.jobs
+
+
+def playlist_entry(number, **extra):
+    return {'id': f'clip{number:07d}', 'title': f'Playlist video {number}', 'duration': 60, **extra}
+
+
+def load_test_playlist(monkeypatch, entries=None):
+    monkeypatch.setattr(main, 'extract_video', lambda *args: {'_type': 'playlist', 'title': '<My playlist>', 'entries': entries if entries is not None else [playlist_entry(1), playlist_entry(2)]})
+    response = client.post('/api/playlist/analyze', json={'url': 'https://www.youtube.com/playlist?list=PLfixture'})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_playlist_normalizes_skips_unavailable_and_deduplicates(monkeypatch):
+    entries = [playlist_entry(1), None, playlist_entry(2, title='[Private video]'), playlist_entry(1),
+               playlist_entry(3, availability='needs_auth'), playlist_entry(4, is_live=True), playlist_entry(5)]
+    result = load_test_playlist(monkeypatch, entries)
+    assert result['title'] == '<My playlist>'
+    assert result['unavailable'] == 4
+    assert result['duplicates_removed'] == 1
+    assert [v['position'] for v in result['videos']] == [1, 7]
+    assert result['videos'][0]['url'] == 'https://www.youtube.com/watch?v=clip0000001'
+    assert not main.jobs  # Loading the preview never starts a transfer.
+
+
+@pytest.mark.parametrize('url', ['https://www.facebook.com/playlist?list=PLx', 'https://youtube.com/watch?v=clip0000001',
+    'https://youtube.com/playlist?list=RDmix', 'https://youtube.com/playlist?list=../../bad',
+    'https://youtube.com/playlist?list=PLone&list=PLtwo', 'http://youtube.com/playlist?list=PLx'])
+def test_playlist_rejects_invalid_or_unbounded_inputs(monkeypatch, url):
+    monkeypatch.setattr(main, 'extract_video', lambda *a: pytest.fail('Invalid URL contacted source'))
+    assert client.post('/api/playlist/analyze', json={'url': url}).status_code == 400
+
+
+def test_playlist_canonicalizes_watch_link_and_keeps_lazy_pages_inside_source_gate(monkeypatch):
+    def extracted(downloader, url, download):
+        assert url == 'https://www.youtube.com/playlist?list=PLfixture'
+        assert download is False
+        assert downloader.params['noplaylist'] is False
+        assert downloader.params['extract_flat'] == 'in_playlist'
+        assert downloader.params['playlistend'] == 1001
+        def pages():
+            assert main.source_access.youtube.slot.active == 1
+            yield playlist_entry(1)
+            assert main.source_access.youtube.slot.active == 1
+            yield playlist_entry(2)
+        return {'_type': 'playlist', 'entries': pages()}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', extracted)
+    result = client.post('/api/playlist/analyze', json={'url': 'https://youtube.com/watch?v=clip0000001&list=PLfixture&index=3'})
+    assert result.status_code == 200, result.text
+    assert len(result.json()['videos']) == 2
+    assert main.source_access.youtube.slot.active == 0
+
+
+def test_playlist_queues_all_over_bulk_limit_with_metadata_and_idempotent_retry(monkeypatch):
+    data = load_test_playlist(monkeypatch, [playlist_entry(i) for i in range(60)])
+    submitted = []
+    monkeypatch.setattr(main.pool, 'submit', lambda *args: submitted.append(args))
+    payload = {'token': data['token'], 'format': 'mp3', 'youtube_concurrency': 2}
+    response = client.post('/api/playlist/download', json=payload)
+    assert response.status_code == 202, response.text
+    assert response.json()['added'] == 60
+    assert len(submitted) == 60
+    assert [j['playlist_position'] for j in main.jobs.values()] == list(range(1, 61))
+    assert all(j['playlist_title'] == '<My playlist>' and j['format'] == 'mp3' for j in main.jobs.values())
+    assert len(main.storage.restore(main.DATA)) == 60
+    assert main.source_access.youtube.slot.limit == 2
+    repeated = client.post('/api/playlist/download', json=payload)
+    assert repeated.json() == response.json()
+    assert len(submitted) == 60  # A timeout/repeated click cannot duplicate this import.
+
+
+def test_playlist_selection_preserves_source_order_and_failed_video_does_not_block_rest(monkeypatch):
+    data = load_test_playlist(monkeypatch, [playlist_entry(i) for i in range(4)])
+    submitted = []
+    def submit(fn, job_id, req):
+        submitted.append(req.url)
+        main.update(job_id, status='failed' if req.url.endswith('1') else 'completed')
+    monkeypatch.setattr(main.pool, 'submit', submit)
+    response = client.post('/api/playlist/download', json={'token': data['token'], 'video_ids': ['clip0000003', 'clip0000001']})
+    assert response.status_code == 202
+    assert submitted == ['https://www.youtube.com/watch?v=clip0000001', 'https://www.youtube.com/watch?v=clip0000003']
+    assert [j['status'] for j in main.jobs.values()] == ['failed', 'completed']
+
+
+@pytest.mark.parametrize('selection', [[], ['not_in_list'], ['clip0000001', 'not_in_list']])
+def test_playlist_selection_must_come_from_preview(monkeypatch, selection):
+    data = load_test_playlist(monkeypatch)
+    assert client.post('/api/playlist/download', json={'token': data['token'], 'video_ids': selection}).status_code == 400
+    assert not main.jobs
+
+
+def test_playlist_expiry_and_restart_require_reload(monkeypatch):
+    assert client.post('/api/playlist/download', json={'token': 'missing'}).status_code == 410
+    data = load_test_playlist(monkeypatch)
+    main.playlist_cache[data['token']]['created'] -= 1801
+    assert client.post('/api/playlist/download', json={'token': data['token']}).status_code == 410
+    assert not main.jobs
+
+
+def test_playlist_oversize_is_not_silently_truncated(monkeypatch):
+    def entries():
+        for i in range(2000):
+            if i > 1000:
+                pytest.fail('Unbounded playlist extraction')
+            yield playlist_entry(i)
+    monkeypatch.setattr(main, 'extract_video', lambda *a: {'_type': 'playlist', 'entries': entries()})
+    response = client.post('/api/playlist/analyze', json={'url': 'https://youtube.com/playlist?list=PLlarge'})
+    assert response.status_code == 400
+    assert 'exceeds 1000' in response.json()['detail']
+    assert not main.jobs
+
+
+def test_playlist_capacity_failure_keeps_preview_reusable(monkeypatch):
+    data = load_test_playlist(monkeypatch)
+    monkeypatch.setattr(main, 'MAX_PLAYLIST', 1)
+    assert client.post('/api/playlist/download', json={'token': data['token']}).status_code == 429
+    assert not main.jobs
+    assert main.playlist_cache[data['token']]['queued'] is None
+    monkeypatch.setattr(main.pool, 'submit', lambda *a: None)
+    response = client.post('/api/playlist/download', json={'token': data['token'], 'video_ids': ['clip0000001']})
+    assert response.status_code == 202
+
+
+def test_playlist_transaction_failure_is_atomic_and_retriable(monkeypatch):
+    data = load_test_playlist(monkeypatch)
+    def rejected(*args): raise main.storage.sqlite3.OperationalError('disk full')
+    monkeypatch.setattr(main.storage, 'save_many', rejected)
+    assert client.post('/api/playlist/download', json={'token': data['token']}).status_code == 503
+    assert not main.jobs
+    assert main.playlist_cache[data['token']]['queued'] is None
+
+
+def test_playlist_cooldown_stops_import_without_new_source_requests(monkeypatch):
+    data = load_test_playlist(monkeypatch)
+    main.source_access.youtube.limited()
+    assert client.post('/api/playlist/download', json={'token': data['token']}).status_code == 429
+    assert not main.jobs
+
+
+def test_playlist_page_rate_limit_starts_cooldown_even_when_extractor_ignores_errors(monkeypatch):
+    def limited(downloader, *args, **kwargs):
+        downloader.params['logger'].error('HTTP Error 429: Too Many Requests')
+        return {'_type': 'playlist', 'entries': []}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', limited)
+    response = client.post('/api/playlist/analyze', json={'url': 'https://youtube.com/playlist?list=PLtest'})
+    assert response.status_code == 429
+    assert main.source_access.youtube.remaining() > 0
+    assert response.headers['retry-after']
+
+
+def test_playlist_preview_cache_is_bounded(monkeypatch):
+    for i in range(12):
+        load_test_playlist(monkeypatch)
+    assert len(main.playlist_cache) == 10
+
+
+def test_playlist_reports_hidden_entries_without_claiming_complete_listing(monkeypatch):
+    monkeypatch.setattr(main, 'extract_video', lambda *a: {'_type': 'playlist', 'playlist_count': 5, 'entries': [playlist_entry(1), playlist_entry(2)]})
+    response = client.post('/api/playlist/analyze', json={'url': 'https://youtube.com/playlist?list=PLhidden'})
+    assert response.status_code == 200
+    assert response.json()['unlisted'] == 3
+
+
+def test_playlist_page_failure_does_not_offer_partial_import(monkeypatch):
+    def partial_page(downloader, *args, **kwargs):
+        def entries():
+            yield playlist_entry(1)
+            downloader.params['logger'].error('Unable to download next playlist page')
+        return {'_type': 'playlist', 'entries': entries()}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', partial_page)
+    response = client.post('/api/playlist/analyze', json={'url': 'https://youtube.com/playlist?list=PLpartial'})
+    assert response.status_code == 422
+    assert 'fully loaded' in response.json()['detail']
+    assert not main.playlist_cache
+
+
+@pytest.mark.parametrize('entries', [[], [None], [playlist_entry(1, availability='private')]])
+def test_empty_or_unavailable_playlist_cannot_be_queued(monkeypatch, entries):
+    monkeypatch.setattr(main, 'extract_video', lambda *a: {'_type': 'playlist', 'entries': entries})
+    response = client.post('/api/playlist/analyze', json={'url': 'https://youtube.com/playlist?list=PLempty'})
+    assert response.status_code == 422
+    assert not main.playlist_cache
