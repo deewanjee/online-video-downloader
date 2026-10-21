@@ -1,8 +1,10 @@
-# StreamVault
+# AAASoft Video Studio
 
-A self-hosted online video downloader with a responsive dashboard, live download queue, quality selection, audio extraction, search, dark mode, local video thumbnails, and an in-app media player. Built with FastAPI, yt-dlp, FFmpeg, and a lightweight browser interface.
+AAASoft-branded browser video downloader with a professional indigo/navy dashboard, generated company logo, thumbnail gallery, pagination, permanent platform counters, repeat downloads, bulk/playlist queues, audio extraction and an in-app player. Built with FastAPI, yt-dlp, FFmpeg, and a lightweight browser interface.
 
-![Media studio dashboard with generated test videos](reports/studio-preview.png)
+![AAASoft dashboard with local demonstration thumbnails](reports/aaasoft-studio.png)
+
+The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
 ## Windows quick start
 
@@ -53,6 +55,18 @@ Validation: [reports/playlist-verification.md](reports/playlist-verification.md)
 
 If the playlist panel shows plain **Not Found**, the running server may still have the old Python routes while serving newly copied UI files. Stop the original server console with **Ctrl+C**, launch **Start StreamVault.bat** from the updated folder, and refresh with **Ctrl+F5**. The launcher now refuses to silently reuse a running server whose version differs from the installed files. A password-protected server cannot expose its version before login; the launcher prints restart guidance instead. The dashboard also flags a UI/server version mismatch, and a missing playlist API gives actionable restart/update instructions. Check the running version in PowerShell with `(Invoke-RestMethod http://127.0.0.1:8000/api/health).version` (owner authentication is required when enabled). See [reports/playlist-not-found.md](reports/playlist-not-found.md).
 
+## AAASoft workspace (2.0.0)
+
+The new dashboard uses navy, indigo and sky-blue branding, **Plus Jakarta Sans / Inter** fonts with system fallbacks, light/dark themes and the generated AAASoft mark in `app/static/brand/aaasoft-mark.png`. Source thumbnails are preferred; unavailable source images fall back to the existing local video poster. Normal video cards show the thumbnail, duration and a **Downloaded** badge. Hover or keyboard focus reveals title, source, format, resolution, file size, status and **Play / Save / Again / Remove** actions. Touch users can open details with the information control. Opening another workspace view returns to its top.
+
+Overview and Video library have independent numbered pagination and **12 / 24 / 48** page sizes. Search/status filters reset the library to page one; polling preserves page selection and clamps it when a list shrinks. Only the current page is rendered, and focused cards are retained during ordinary polling updates. **Again** queues a new job using the video's original format/quality without deleting its existing file. A previously completed normalized source link is marked during analysis even after its library entry was removed. Common YouTube watch/short/share, X/Twitter and other tracking URL variants are normalized; arbitrary short-link redirects are not resolved by the fingerprint alone.
+
+**Platform insights** shows lifetime successful source-download counts for every supported platform. Counts live in `data/history.sqlite3` in an independent completion ledger, not the removable history rows. A verified completion and its history update commit atomically. Preview updates/restarts do not double-count; a successful fresh download/retry adds another event. Failed/unfinished jobs and repeated **Save original** browser copies do not add events. Existing completed history is backfilled once; entries already deleted before this feature cannot be reconstructed. Keep the entire data folder/database when updating or backing up.
+
+AdSense banner slots and a Google video-ad placement in the player are **labelled placeholders only**. No publisher IDs, AdSense scripts, Google IMA SDK, real ads or ad requests are configured. They do not block or replace video/download controls. Fonts can load from Google Fonts; the portal remains usable when those fonts are unavailable.
+
+Verification and migration notes: [reports/aaasoft-redesign.md](reports/aaasoft-redesign.md).
+
 ## Server operation
 
 Run the same app on a server with Python, FFmpeg, and a supported JavaScript runtime. A single-owner HTTP Basic login protects all routes when **STREAMVAULT_PASSWORD** is set; **STREAMVAULT_USERNAME** defaults to `admin`. Public mode (`STREAMVAULT_PUBLIC=true`) rejects requests until a password is configured. Always put online instances behind **HTTPS**, because Basic authentication depends on transport encryption. The app is a shared owner workspace, not a multi-tenant service. Add proxy request limits and enforce outbound network filtering (block private/link-local addresses), CPU/time limits, and disk quotas before Internet deployment. URL validation allows supported HTTPS site names, but extractor-generated redirects and media requests also need network-level filtering. Browser mutations are restricted to the current origin, and repeated failed logins are throttled.
@@ -93,7 +107,7 @@ node --check app/static/app.js
 
 Tests cover URL rejection, API responses, format normalization, actual yt-dlp downloads of a generated local video, FFmpeg audio conversion, file delivery, deletion, history restoration, retry, low-disk errors, login protection, and cross-site request rejection. Local fixtures do not prove current access to every external platform. A user-confirmed Windows YouTube download played correctly with both picture and audio; that confirms that video on that computer, not every platform or source.
 
-API docs are available at `/docs`. Main routes: `/api/analyze`, `/api/download`, `/api/jobs`, `/api/jobs/{id}/file`, `/api/jobs/{id}/retry`, `/api/jobs/{id}/thumbnail`, `/api/jobs/{id}/stream`, `/api/jobs/{id}/preview` (POST to prepare, GET to poll), `/api/download/bulk`, `/api/playlist/analyze` (direct, non-waiting API), `/api/playlist/loads` (POST to queue), `/api/playlist/loads/{id}` (GET status or DELETE to cancel), `/api/playlist/download`, and `/api/health`. Streaming supports HTTP byte ranges for seeking and remains protected by the same owner login. Error messages deliberately avoid exposing extractor details or credentials.
+API docs are available at `/docs`. Main routes: `/api/analyze`, `/api/download`, `/api/jobs`, `/api/jobs/{id}/file`, `/api/jobs/{id}/retry`, `/api/jobs/{id}/thumbnail`, `/api/jobs/{id}/stream`, `/api/jobs/{id}/preview` (POST to prepare, GET to poll), `/api/download/bulk`, `/api/playlist/analyze` (direct, non-waiting API), `/api/playlist/loads` (POST to queue), `/api/playlist/loads/{id}` (GET status or DELETE to cancel), `/api/playlist/download`, `/api/stats`, `/api/jobs/{id}/redownload`, and `/api/health`. Streaming supports HTTP byte ranges for seeking and remains protected by the same owner login. Error messages deliberately avoid exposing extractor details or credentials.
 
 ## Docker alternative
 
@@ -101,7 +115,7 @@ API docs are available at `/docs`. Main routes: `/api/analyze`, `/api/download`,
 docker compose up --build -d
 ```
 
-The compose file binds to localhost and retains media in a named volume. FFmpeg and Node.js are bundled in the image. `docker compose down` stops the app; add `-v` only if you intend to delete saved media. Both Compose templates pass configuration validation, the image builds successfully, all 138 tests pass inside the image as the unprivileged app user, and container startup/dashboard readiness checks pass. The managed cloud build used the configured proxy route and a trusted CA bundle; TLS and package-signature verification stayed enabled. On ordinary networks, no custom CA configuration is needed. Managed TLS proxies can supply a trusted CA bundle with `docker build --secret id=build_ca,src=/path/to/trusted-ca-bundle.pem .`; the bundle is mounted only for build-time package downloads, not copied into the image. Online domain, HTTPS certificate issuance, and hosted source access still require validation on the actual server.
+The compose file binds to localhost and retains media in a named volume. FFmpeg and Node.js are bundled in the image. `docker compose down` stops the app; add `-v` only if you intend to delete saved media. Both Compose templates pass configuration validation, the image builds successfully, all 162 tests pass inside the image as the unprivileged app user, and container startup/dashboard readiness checks pass. The managed cloud build used the configured proxy route and a trusted CA bundle; TLS and package-signature verification stayed enabled. On ordinary networks, no custom CA configuration is needed. Managed TLS proxies can supply a trusted CA bundle with `docker build --secret id=build_ca,src=/path/to/trusted-ca-bundle.pem .`; the bundle is mounted only for build-time package downloads, not copied into the image. Online domain, HTTPS certificate issuance, and hosted source access still require validation on the actual server.
 
 ## Future online hosting
 

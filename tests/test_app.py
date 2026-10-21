@@ -21,8 +21,11 @@ def test_rejects_unsupported_urls(url):
 
 
 def test_dashboard_and_health():
-    assert 'StreamVault' in client.get('/').text
+    assert 'AAASoft' in client.get('/').text
     assert client.get('/static/app.js').status_code == 200
+    logo = client.get('/static/brand/aaasoft-mark.png')
+    assert logo.status_code == 200
+    assert logo.content.startswith(b'\x89PNG\r\n\x1a\n')
     assert client.get('/api/health').json()['ffmpeg']
 
 
@@ -89,6 +92,7 @@ def test_real_download_and_conversion(tmp_path, monkeypatch, output):
         main.run_download(job_id, req)
         assert main.jobs[job_id]['status'] == 'completed', main.jobs[job_id]
         assert main.jobs[job_id]['has_audio'] is True
+        assert main.storage.statistics(storage)['total'] == 1
         response = client.get(f'/api/jobs/{job_id}/file')
         assert response.status_code == 200
         assert len(response.content) > 1000
@@ -1242,3 +1246,112 @@ def test_shutdown_releases_waiting_playlist_and_does_not_cancel_download(monkeyp
             assert access.slot.active == 1
         finally:
             access.slot.release()
+
+
+def test_lifetime_counts_survive_history_removal_and_restore(tmp_path):
+    import json, sqlite3
+    # Simulate an existing database without the new events table.
+    job = failed_job('legacy') | {'status': 'completed', 'url': 'https://youtu.be/Smjl5LtkLC4'}
+    with sqlite3.connect(tmp_path / 'history.sqlite3') as db:
+        db.execute('CREATE TABLE jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+        db.execute('INSERT INTO jobs VALUES (?, ?)', ('legacy', json.dumps(job)))
+    for _ in range(2):
+        main.storage.restore(tmp_path)
+        assert main.storage.statistics(tmp_path)['total'] == 1
+    main.storage.delete(tmp_path, 'legacy')
+    assert not main.storage.restore(tmp_path)
+    assert main.storage.statistics(tmp_path)['total'] == 1
+    assert main.storage.downloaded_count(tmp_path, 'https://www.youtube.com/watch?v=Smjl5LtkLC4&list=PLtest') == 1
+
+
+@pytest.mark.parametrize('url,platform', [
+    ('https://youtu.be/Smjl5LtkLC4', 'YouTube'), ('https://www.instagram.com/reel/post1/', 'Instagram'),
+    ('https://vm.tiktok.com/post1', 'TikTok'), ('https://fb.watch/post1', 'Facebook'),
+    ('https://twitter.com/name/status/123', 'X / Twitter'), ('https://dai.ly/x123', 'Dailymotion'),
+    ('https://www.threads.net/@name/post/123', 'Threads'),
+])
+def test_completed_counters_use_source_family_and_ignore_preview_updates(tmp_path, url, platform):
+    job = failed_job() | {'status':'completed', 'url':url, 'completion_id':'attempt1'}
+    main.storage.save(tmp_path, job)
+    main.storage.save(tmp_path, job | {'preview_status':'ready'})
+    main.storage.restore(tmp_path)
+    stats = main.storage.statistics(tmp_path)
+    assert stats['total'] == 1
+    assert {p['name']:p['downloads'] for p in stats['platforms']}[platform] == 1
+
+
+@pytest.mark.parametrize('status', ['queued','downloading','processing','failed'])
+def test_unfinished_jobs_never_increment_lifetime_counts(tmp_path, status):
+    main.storage.save(tmp_path, failed_job() | {'status':status})
+    assert main.storage.statistics(tmp_path)['total'] == 0
+
+
+def test_successful_new_attempts_count_once_each(tmp_path):
+    job = failed_job() | {'status':'completed','completion_id':'first'}
+    main.storage.save(tmp_path, job)
+    main.storage.save(tmp_path, job)
+    main.storage.save(tmp_path, job | {'status':'failed'})
+    main.storage.save(tmp_path, job | {'completion_id':'second'})
+    main.storage.save(tmp_path, job | {'completion_id':'second','preview_status':'ready'})
+    assert main.storage.statistics(tmp_path)['total'] == 2
+
+
+@pytest.mark.parametrize('one,two', [
+    ('https://youtu.be/Smjl5LtkLC4?t=20','https://www.youtube.com/watch?v=Smjl5LtkLC4&list=PLtest'),
+    ('https://youtube.com/shorts/Smjl5LtkLC4','https://youtube.com/watch?v=Smjl5LtkLC4'),
+    ('https://twitter.com/name/status/123?s=20','https://x.com/other/status/123'),
+    ('https://www.instagram.com/reel/ABC/?igsh=xyz','https://instagram.com/reel/ABC'),
+    ('https://threads.net/@name/post/ABC?xmt=1','https://threads.com/@name/post/ABC'),
+    ('https://dai.ly/x123','https://www.dailymotion.com/video/x123_title'),
+])
+def test_download_badge_identity_ignores_share_tracking(one,two):
+    assert main.storage.video_key(one) == main.storage.video_key(two)
+
+
+def test_completion_history_and_event_commit_atomically(tmp_path):
+    with main.storage.connect(tmp_path) as db:
+        db.execute("CREATE TRIGGER reject_event BEFORE INSERT ON download_events BEGIN SELECT RAISE(ABORT, 'test failure'); END")
+    with pytest.raises(main.storage.sqlite3.IntegrityError):
+        main.storage.save(tmp_path, failed_job() | {'status':'completed'})
+    assert not main.storage.restore(tmp_path)
+    assert main.storage.statistics(tmp_path)['total'] == 0
+
+
+def test_redownload_creates_new_job_and_preserves_existing_media(monkeypatch):
+    job = failed_job('original') | {'status':'completed'}
+    main.jobs[job['id']] = job.copy()
+    main.storage.save(main.DATA, job)
+    folder = main.DATA / job['id']; folder.mkdir(); (folder / job['filename']).write_bytes(b'original media')
+    submitted = []
+    monkeypatch.setattr(main.pool, 'submit', lambda *args: submitted.append(args))
+    response = client.post('/api/jobs/original/redownload')
+    assert response.status_code == 202
+    assert response.json()['id'] != 'original'
+    assert response.json()['url'] == job['url']
+    assert len(submitted) == 1
+    assert main.jobs['original'] == job
+    assert (folder / job['filename']).read_bytes() == b'original media'
+    assert client.get('/api/stats').json()['total'] == 1
+    assert len(main.jobs) == 2
+
+
+def test_redownload_rejects_active_jobs_and_missing_history():
+    assert client.post('/api/jobs/missing/redownload').status_code == 404
+    main.jobs['active'] = failed_job('active') | {'status':'downloading'}
+    assert client.post('/api/jobs/active/redownload').status_code == 409
+
+
+def test_deleted_download_is_recognized_when_analyzed_again(monkeypatch):
+    job = failed_job() | {'status':'completed', 'url':'https://youtu.be/Smjl5LtkLC4'}
+    main.storage.save(main.DATA,job); main.storage.delete(main.DATA,job['id'])
+    monkeypatch.setattr(main, 'extract_video', lambda *args: {'title':'Same video','formats':[]})
+    response = client.post('/api/analyze',json={'url':'https://youtube.com/watch?v=Smjl5LtkLC4'})
+    assert response.status_code == 200
+    assert response.json()['previous_downloads'] == 1
+
+
+def test_analytics_and_redownload_keep_owner_authentication(monkeypatch):
+    monkeypatch.setenv('STREAMVAULT_PASSWORD', 'local-test-owner')
+    assert client.get('/api/stats').status_code == 401
+    assert client.post('/api/jobs/anything/redownload').status_code == 401
+    assert client.get('/api/stats',auth=('admin','local-test-owner')).status_code == 200

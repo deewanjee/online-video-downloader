@@ -38,7 +38,7 @@ async def lifespan(application):
         stop_previews()
 
 
-app = FastAPI(title='StreamVault', version=__version__, lifespan=lifespan)
+app = FastAPI(title='AAASoft Video Studio', version=__version__, lifespan=lifespan)
 app.add_middleware(AccessControl)
 app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 HOSTS = ('youtube.com', 'youtu.be', 'dailymotion.com', 'dai.ly', 'facebook.com', 'fb.watch', 'tiktok.com', 'instagram.com', 'threads.net', 'threads.com', 'twitter.com', 'x.com')
@@ -334,6 +334,7 @@ def analyze(req: VideoRequest):
             raise HTTPException(400, 'Please choose a single, non-live video.')
         heights = sorted({f['height'] for f in info.get('formats', []) if f.get('height') and f.get('vcodec') != 'none'}, reverse=True)
         result = {'title': info.get('title', 'Untitled video'), 'author': info.get('uploader', 'Unknown creator'), 'duration': info.get('duration'), 'thumbnail': info.get('thumbnail'), 'platform': info.get('extractor_key'), 'qualities': heights, 'url': req.url}
+        result['previous_downloads'] = storage.downloaded_count(DATA, req.url)
         with lock:
             if len(analysis_cache) >= 100:
                 analysis_cache.pop(next(iter(analysis_cache)))
@@ -568,7 +569,7 @@ def run_download(job_id, req):
             media = cap_resolution(file, int(req.quality), media)
         preview_available = bool(cached_playable(file, media))
         duration = media.pop('duration', 0) or info.get('duration')
-        update(job_id, status='completed', progress=100, title=info.get('title', file.stem), filename=file.name, size=file.stat().st_size,
+        update(job_id, status='completed', progress=100, completed_at=time.time(), completion_id=uuid.uuid4().hex, title=info.get('title', file.stem), filename=file.name, size=file.stat().st_size,
                thumbnail=info.get('thumbnail'), duration=duration, platform=info.get('extractor_key'), preview_available=preview_available,
                preview_status='ready' if preview_available else 'not_requested', preview_progress=100 if preview_available else 0, stage='ready', recoverable=False, **media)
     except Exception as exc:
@@ -706,13 +707,31 @@ def retry_job(job_id: str):
 
 @app.get('/api/jobs')
 def list_jobs():
+    counts = storage.video_counts(DATA)
     with lock:
         for job in jobs.values():
             if job['status'] == 'completed' and not saved_path(job):
                 changed = job | {'status': 'failed', 'error': 'The saved file is missing. Use Retry to download it again.', 'preview_available': False}
                 save_queued(changed)
                 job.update(changed)
-        return [j.copy() for j in sorted(jobs.values(), key=lambda j: j['created'], reverse=True)]
+        return [j.copy() | {'previous_downloads': counts.get(storage.video_key(j.get('url', '')), 0), 'source_platform': storage.platform_name(j.get('url', ''))} for j in sorted(jobs.values(), key=lambda j: j['created'], reverse=True)]
+
+
+@app.get('/api/stats')
+def statistics():
+    return storage.statistics(DATA)
+
+
+@app.post('/api/jobs/{job_id}/redownload', status_code=202)
+def redownload(job_id: str):
+    with lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, 'Download not found.')
+        if job['status'] not in ('completed', 'failed'):
+            raise HTTPException(409, 'This video is already queued or downloading.')
+        req = DownloadRequest(url=job['url'], format=job['format'], quality=job['quality'])
+    return download(req)
 
 
 @app.get('/api/jobs/{job_id}/file')

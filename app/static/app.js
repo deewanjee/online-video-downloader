@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const UI_VERSION = '1.3.2';
+const UI_VERSION = '2.0.0';
 const audioFormats = ['mp3', 'm4a', 'wav'];
 function icon(name) {
   const paths = {play:'<path d="m8 5 11 7-11 7z"/>',arrow:'<path d="M6 18 18 6M6 6h12v12"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>'};
@@ -10,28 +10,37 @@ function icon(name) {
 function analyzeLabel() { $('analyze-button').replaceChildren(document.createTextNode('Find my video '),icon('arrow')); }
 const platforms = [['YouTube','▶','#efdfd7','#d63f35'],['Instagram','◎','#f0dce1','#bb4b71'],['TikTok','♪','#d8e3de','#263b30'],['Facebook','f','#dce3ed','#4268a5'],['X / Twitter','𝕏','#e3e4db','#30382f'],['Dailymotion','d','#d9e7e6','#367a7b'],['Threads','@','#e5dfd4','#595344']];
 for (const id of ['platform-grid','all-platforms']) {
-  for (const [name,icon,bg,color] of platforms) {
+  for (const [name,icon,bg,color] of (id === 'all-platforms' ? [...platforms,['Other','◎','#e9edf4','#657189']] : platforms)) {
     const el = document.createElement('div'); el.className = 'platform';
     el.innerHTML = `<span class="platform-logo" style="background:${bg};color:${color}">${icon}</span><div><strong>${name}</strong><small>${name === 'Threads' ? 'Public posts & share links' : 'Public video links'}</small></div>`;
     if (name === 'YouTube') el.querySelector('.platform-logo').innerHTML = '<svg class="ui-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m8 5 11 7-11 7z"/></svg>';
+    if (id === 'all-platforms') {
+      el.dataset.platform = name; el.hidden = name === 'Other';
+      const counter = document.createElement('div'); counter.className = 'platform-counter';
+      const value = document.createElement('span'); value.className = 'platform-download-count'; value.textContent = '0';
+      const caption = document.createElement('small'); caption.textContent = 'Lifetime downloads'; counter.append(value,caption); el.append(counter);
+    }
     $(id).append(el);
   }
 }
 let analyzed = null, jobs = [], busy = false, playingId = null;
 let analysisVersion = 0, analysisController = null, refreshing = null, refreshAgain = false;
-let noticeTimer = null;
+let noticeTimer = null, toastTimer = null;
 let playerVersion = 0, previewTimer = null, previewController = null;
 let originalFallback = null, originalTimer = null;
 const rendered = new Map();
 function view(name) {
   for (const n of ['home','downloads','platforms']) $(n).hidden = n !== name;
   document.querySelectorAll('.nav').forEach(el => { el.classList.toggle('active',el.dataset.view === name); el.setAttribute('aria-current', el.dataset.view === name ? 'page' : 'false'); });
-  $('page-label').textContent = {home:'Overview',downloads:'My library',platforms:'Platforms'}[name];
+  $('page-label').textContent = {home:'Overview',downloads:'Video library',platforms:'Platform insights'}[name];
+  window.scrollTo(0,0);
 }
 document.querySelectorAll('.nav').forEach(el => el.onclick = () => view(el.dataset.view));
 $('view-all').onclick = () => view('downloads'); $('see-platforms').onclick = () => view('platforms');
 function notice(message,retryAfter = 0) {
   clearInterval(noticeTimer); noticeTimer = null;
+  clearTimeout(toastTimer); $('toast').hidden = !message || !$('home').hidden; $('toast').textContent = message;
+  if (message) toastTimer = setTimeout(() => { $('toast').hidden = true; },7000);
   const box = $('notice'); box.hidden = !message; box.setAttribute('aria-live','polite'); box.textContent = message;
   if (!(retryAfter > 0) || !message.includes('YouTube is limiting requests')) return;
   const until = Date.now()+retryAfter*1000;
@@ -60,7 +69,7 @@ async function api(path,options = {}) {
     try { data = JSON.parse(body); } catch { throw Error('The server returned an unreadable response (HTTP '+response.status+'). Check the server connection and retry.'); }
     if (!response.ok) {
       const message = response.status === 404 && path.startsWith('/api/playlist/') && data.detail === 'Not Found'
-        ? 'The running StreamVault server does not have the playlist API. Stop the old server with Ctrl+C, start StreamVault from the updated project folder, then refresh with Ctrl+F5. If this persists, replace all project files with the latest update.'
+        ? 'The running AAASoft Video Studio server does not have the playlist API. Stop the old server with Ctrl+C, start AAASoft Video Studio from the updated project folder, then refresh with Ctrl+F5. If this persists, replace all project files with the latest update.'
         : typeof data.detail === 'string' ? data.detail : 'Request could not be completed (HTTP '+response.status+').';
       const error = Error(message);
       const seconds = Number(response.headers.get('Retry-After'));
@@ -70,20 +79,23 @@ async function api(path,options = {}) {
     return data;
   } catch(e) {
     if (e.name === 'AbortError' && !callerSignal?.aborted) throw Error('The request timed out. Check the server window before retrying; a download may still be running.');
-    if (e instanceof TypeError) throw Error('Cannot reach StreamVault. Check that the server window is open.');
+    if (e instanceof TypeError) throw Error('Cannot reach AAASoft Video Studio. Check that the server window is open.');
     throw e;
   } finally { clearTimeout(timer); callerSignal?.removeEventListener('abort',cancel); }
 }
 function duration(s) { return Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0'); }
 function sourceName(j) {
-  try { return j.platform || new URL(j.url).hostname.replace(/^www\./,''); } catch { return 'Your collection'; }
+  try { return j.source_platform || j.platform || new URL(j.url).hostname.replace(/^www\./,''); } catch { return 'Your collection'; }
 }
 function endpoint(j,kind) { return '/api/jobs/'+encodeURIComponent(j.id)+'/'+kind; }
-function image(parent,url,label) {
+function image(parent,url,label,fallback = null) {
   if (!url) return;
   try { const parsed = new URL(url,location.origin); if (!['https:','http:'].includes(parsed.protocol) || parsed.username || parsed.password || (parsed.origin !== location.origin && parsed.protocol !== 'https:')) return; } catch { return; }
   const img = document.createElement('img'); img.alt = label; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
-  img.onerror = () => { img.hidden = true; }; img.src = url; parent.append(img);
+  img.onerror = () => {
+    if (fallback && img.src !== new URL(fallback,location.origin).href) { img.src = fallback; fallback = null; }
+    else img.hidden = true;
+  }; img.src = url; parent.append(img);
 }
 function placeholder(parent,label) {
   const box = document.createElement('div'); box.className = 'cover-placeholder';
@@ -106,6 +118,9 @@ $('analyze-form').onsubmit = async event => {
     const result = await api('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url}),signal:analysisController.signal});
     if (version !== analysisVersion || $('url').value.trim() !== url) return;
     analyzed = result;
+    $('analysis-history').hidden = !result.previous_downloads;
+    $('analysis-history').textContent = '✓ Downloaded before · '+result.previous_downloads+' successful downloads';
+    $('download-button').textContent = result.previous_downloads ? '↓ Download again' : '↓ Add to queue';
     $('video-title').textContent = analyzed.title; $('video-platform').textContent = analyzed.platform;
     $('video-meta').textContent = analyzed.author+(analyzed.duration ? ' · '+duration(analyzed.duration) : '');
     $('analysis-cover').replaceChildren(); placeholder($('analysis-cover'), 'Your next good find'); image($('analysis-cover'),analyzed.thumbnail,'Thumbnail for '+analyzed.title);
@@ -281,42 +296,104 @@ for (const id of ['video-player','audio-player']) $(id).onerror = () => {
 $('video-player').onloadeddata = () => { clearTimeout(originalTimer); originalFallback = null; };
 $('close-player').onclick = () => $('player-dialog').close(); $('player-dialog').onclose = stopPlayer;
 $('player-dialog').onclick = event => { if (event.target !== $('player-dialog')) return; const rect = $('player-dialog').getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) $('player-dialog').close(); };
+const cardCaches = new Map();
+const paginationState = {recent:{page:1,size:12},library:{page:1,size:24}};
+function createCard(j) {
+  const row = document.createElement('article'); row.className = 'job '+j.status;
+  row.dataset.jobId = j.id; row.tabIndex = 0; row.setAttribute('aria-label',j.title+' · '+j.status+' · Focus for details');
+  const cover = document.createElement('div'); cover.className = 'cover'; placeholder(cover,sourceName(j));
+  const local = j.status === 'completed' && !audioFormats.includes(j.format) ? endpoint(j,'thumbnail') : null;
+  image(cover,j.thumbnail || local,'Thumbnail for '+j.title,local);
+  const stages = {extracting:'Getting video',downloading:'Downloading',merging:'Merging audio + video',converting:'Converting format',resizing:'Resizing video',verifying:'Checking file'};
+  const badge = document.createElement('span');
+  const downloaded = j.status === 'completed' || j.previous_downloads > 0;
+  badge.className = 'status-badge'+(downloaded?' downloaded-before':j.status === 'failed'?' failed':'');
+  badge.textContent = j.status === 'completed' ? '✓ Downloaded' : downloaded ? '✓ Downloaded before' : {failed:'Needs attention',queued:'Queued',processing:stages[j.stage] || 'Finishing file',downloading:(stages[j.stage] || 'Downloading')+' · '+j.progress+'%'}[j.status] || j.status;
+  cover.append(badge);
+  if (j.duration) { const time = document.createElement('span'); time.className = 'cover-duration'; time.textContent = duration(j.duration); cover.append(time); }
+  const toggle = document.createElement('button'); toggle.className = 'details-toggle'; toggle.textContent = 'ⓘ'; toggle.setAttribute('aria-label','Show details for '+j.title);
+  toggle.onclick = () => { row.classList.toggle('details-open'); toggle.setAttribute('aria-expanded',String(row.classList.contains('details-open'))); }; cover.append(toggle);
+  cover.onclick = event => { if (event.target.tagName === 'IMG' || event.target.closest('.cover-placeholder')) row.classList.toggle('details-open'); };
+  row.onkeydown = event => { if (event.target !== row) return; if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); row.classList.toggle('details-open'); } if (event.key === 'Escape') { row.classList.remove('details-open'); row.blur(); } };
+  const detail = document.createElement('div'); detail.className = 'job-details';
+  const title = document.createElement('div'); title.className = 'job-title'; title.textContent = j.title; title.title = j.title;
+  const meta = document.createElement('div'); meta.className = 'job-meta'; meta.textContent = sourceName(j)+' · '+j.format.toUpperCase()+' · '+(audioFormats.includes(j.format) ? 'Audio' : (j.actual_height || j.quality)+'p')+(j.size?' · '+(j.size/1024/1024).toFixed(1)+' MB':'')+(j.duration?' · '+duration(j.duration):''); meta.title = meta.textContent;
+  const status = document.createElement('div'); status.className = 'status'+(j.status === 'failed'?' failed':'');
+  status.textContent = j.error || (j.status === 'completed' ? j.preview_status === 'processing'?'Preview encoding '+(j.preview_progress || 0)+'%':j.preview_status === 'queued'?'Original ready · Preview queued':j.preview_status === 'failed'?'Original ready · Preview can be retried':'Ready to play & save' : j.status === 'queued'?'Waiting for a download slot':(stages[j.stage] || 'Downloading')+(j.stage_started?' · '+duration(Math.max(0,Date.now()/1000-j.stage_started))+' elapsed':''));
+  status.title = status.textContent+(j.playlist_title?' · '+j.playlist_title+' #'+j.playlist_position:'');
+  detail.append(title,meta,status);
+  if (['queued','downloading','processing'].includes(j.status)) { const progress = document.createElement('progress'); progress.max = 100; progress.value = j.progress; progress.setAttribute('aria-label','Download progress'); row.append(progress); }
+  const actions = document.createElement('div'); actions.className = 'job-actions';
+  if (j.status === 'completed') {
+    const play = document.createElement('button'); play.className = 'play-button'; play.append(icon('play'),document.createTextNode(' Play')); play.onclick = () => playJob(j); actions.append(play);
+    const save = document.createElement('a'); save.href = endpoint(j,'file'); save.textContent = '↓ Save'; save.setAttribute('aria-label','Save original '+j.title); actions.append(save);
+    const again = document.createElement('button'); again.className = 'redownload-button'; again.textContent = '↻ Again'; again.setAttribute('aria-label','Download again '+j.title);
+    again.onclick = async () => { again.disabled = true; try { await api(endpoint(j,'redownload'),{method:'POST'}); notice('A fresh download was added. Your existing file is still available.'); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { again.disabled = false; } }; actions.append(again);
+  }
+  if (j.status === 'failed') { const retry = document.createElement('button'); retry.className = 'retry-button'; retry.textContent = j.recoverable?'↻ Resume':'↻ Retry'; retry.onclick = async () => { retry.disabled = true; try { await api(endpoint(j,'retry'),{method:'POST'}); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { retry.disabled = false; } }; actions.append(retry); }
+  if (['failed','completed'].includes(j.status)) { const remove = document.createElement('button'); remove.className = 'remove-button'; remove.textContent = '×'; remove.setAttribute('aria-label','Remove '+j.title); remove.onclick = async () => { try { await api('/api/jobs/'+encodeURIComponent(j.id),{method:'DELETE'}); if (playingId === j.id) $('player-dialog').close(); await refresh(); } catch(e) { notice(e.message); view('home'); } }; actions.append(remove); }
+  row.append(cover,detail,actions); return row;
+}
 function render(target,list) {
   const signature = JSON.stringify(list); if (rendered.get(target) === signature) return; rendered.set(target,signature);
-  const container = $(target); container.replaceChildren();
-  if (!list.length) { container.innerHTML = '<div class="empty"><span class="empty-icon">✳</span><h3>Your collection starts with a link.</h3><p>Find something worth keeping, then drop its link above.</p></div>'; return; }
-  for (const j of list) {
-    const row = document.createElement('article'); row.className = 'job '+j.status;
-    const cover = document.createElement('div'); cover.className = 'cover'; placeholder(cover,sourceName(j));
-    image(cover,j.status === 'completed' && !audioFormats.includes(j.format) ? endpoint(j,'thumbnail') : j.thumbnail,'Thumbnail for '+j.title);
-    const stages = {extracting:'Getting video',downloading:'Downloading',merging:'Merging audio + video',converting:'Converting format',resizing:'Resizing video',verifying:'Checking file'};
-    const badge = document.createElement('span'); badge.className = 'status-badge'+(j.status === 'failed' ? ' failed' : ''); badge.textContent = {completed:'Downloaded',failed:'Needs attention',queued:'Queued',processing:stages[j.stage] || 'Finishing file',downloading:(stages[j.stage] || 'Downloading')+' · '+j.progress+'%'}[j.status] || j.status; cover.append(badge);
-    if (j.duration) { const time = document.createElement('span'); time.className = 'cover-duration'; time.textContent = duration(j.duration); cover.append(time); }
-    const playable = j.status === 'completed';
-    if (playable) { const p = document.createElement('button'); p.className = 'cover-play'; p.append(icon('play')); p.setAttribute('aria-label','Play '+j.title); p.onclick = () => playJob(j); cover.append(p); }
-    const detail = document.createElement('div'); detail.className = 'job-details';
-    const platform = document.createElement('div'); platform.className = 'job-platform'; platform.textContent = sourceName(j);
-    const title = document.createElement('div'); title.className = 'job-title'; title.textContent = j.title; title.title = j.title;
-    const meta = document.createElement('div'); meta.className = 'job-meta'; meta.textContent = j.format.toUpperCase()+' · '+(audioFormats.includes(j.format) ? 'Audio' : (j.actual_height || j.quality)+'p')+(j.size ? ' · '+(j.size/1024/1024).toFixed(1)+' MB' : '')+(j.has_audio === false ? ' · No audio track' : '')+(j.playlist_title ? ' · '+j.playlist_title+' #'+j.playlist_position : '');
-    const previewPending = j.status === 'completed' && j.preview_status !== 'ready';
-    const status = document.createElement('div'); status.className = 'status'+(j.status === 'failed' ? ' failed' : '')+(previewPending?' preview-note':'');
-    status.textContent = j.error || (j.status === 'completed' ? j.preview_status === 'processing' ? 'Original ready · Preview encoding '+(j.preview_progress || 0)+'%' : j.preview_status === 'queued' ? 'Original ready · Preview queued separately' : j.preview_status === 'failed' ? 'Original ready · Preview failed; press Play to retry' : j.preview_available ? 'Ready for a replay' : 'Original ready · Play prepares a browser preview' : j.status === 'queued' ? 'Waiting for a download slot' : (stages[j.stage] || 'Downloading your video')+(j.stage_started?' · '+duration(Math.max(0,Date.now()/1000-j.stage_started))+' elapsed':''));
-    detail.append(platform,title,meta,status);
-    if (['queued','downloading','processing'].includes(j.status)) { const progress = document.createElement('progress'); progress.max = 100; progress.value = j.progress; progress.setAttribute('aria-label','Download progress'); detail.append(progress); }
-    const actions = document.createElement('div'); actions.className = 'job-actions';
-    if (playable) { const p = document.createElement('button'); p.className = 'play-button'; p.append(icon('play'),document.createTextNode(j.preview_status === 'failed'?' Retry preview':' Play')); p.onclick = () => playJob(j); actions.append(p); }
-    if (j.status === 'completed') { const a = document.createElement('a'); a.href = endpoint(j,'file'); a.textContent = '↓ Save original'; actions.append(a); }
-    if (j.status === 'failed') { const retry = document.createElement('button'); retry.className = 'retry-button'; retry.textContent = j.recoverable ? '↻ Resume / Retry' : '↻ Try again'; retry.onclick = async () => { retry.disabled = true; try { await api('/api/jobs/'+encodeURIComponent(j.id)+'/retry',{method:'POST'}); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { retry.disabled = false; } }; actions.append(retry); }
-    if (['failed','completed'].includes(j.status)) { const remove = document.createElement('button'); remove.className = 'remove-button'; remove.textContent = '×'; remove.setAttribute('aria-label','Remove '+j.title); remove.onclick = async () => { try { await api('/api/jobs/'+encodeURIComponent(j.id),{method:'DELETE'}); if (playingId === j.id) $('player-dialog').close(); await refresh(); } catch(e) { notice(e.message); view('home'); } }; actions.append(remove); }
-    row.append(cover,detail,actions); container.append(row);
+  const container = $(target), cache = cardCaches.get(target) || new Map(); cardCaches.set(target,cache);
+  if (!list.length) { cache.clear(); container.innerHTML = '<div class="empty"><span class="empty-icon">▻</span><h3>Your library starts here.</h3><p>Add a video link, or change your search and filters.</p></div>'; return; }
+  container.querySelector('.empty')?.remove();
+  const ids = new Set(list.map(j => j.id));
+  for (const [id,cached] of cache) if (!ids.has(id)) { cached.node.remove(); cache.delete(id); }
+  list.forEach((j,index) => {
+    const signature = JSON.stringify(j), cached = cache.get(j.id);
+    const focused = cached?.node.contains(document.activeElement);
+    let node = cached?.node;
+    if (!cached || (cached.signature !== signature && (!focused || cached.status !== j.status))) {
+      node = createCard(j); if (cached?.node.classList.contains('details-open')) node.classList.add('details-open');
+      if (cached) cached.node.replaceWith(node);
+      cache.set(j.id,{node,signature,status:j.status});
+      if (focused) node.focus({preventScroll:true});
+    }
+    if (container.children[index] !== node) container.insertBefore(node,container.children[index] || null);
+  });
+}
+function paginate(key,list,target,controls) {
+  const state = paginationState[key], pages = Math.max(1,Math.ceil(list.length/state.size));
+  state.page = Math.max(1,Math.min(state.page,pages));
+  const start = (state.page-1)*state.size; render(target,list.slice(start,start+state.size));
+  const signature = [state.page,state.size,list.length].join(':'); if (rendered.get(controls) === signature) return; rendered.set(controls,signature);
+  const nav = $(controls); nav.replaceChildren();
+  const summary = document.createElement('span'); summary.className = 'page-summary'; summary.textContent = list.length?'Showing '+(start+1)+'–'+Math.min(start+state.size,list.length)+' of '+list.length+' videos':'0 videos';
+  const buttons = document.createElement('div'); buttons.className = 'page-controls';
+  function button(text,page,label,disabled = false) {
+    const el = document.createElement('button'); el.type = 'button'; el.textContent = text; el.disabled = disabled; el.setAttribute('aria-label',label);
+    if (page === state.page && /^\d+$/.test(text)) el.setAttribute('aria-current','page');
+    el.onclick = () => { state.page = page; renderAll(); $(target).scrollIntoView({behavior:'smooth',block:'start'}); }; buttons.append(el);
   }
+  button('‹',state.page-1,'Previous page',state.page === 1);
+  const visible = [...new Set([1,pages,state.page-1,state.page,state.page+1].filter(p => p >= 1 && p <= pages))].sort((a,b) => a-b);
+  let previous = 0;
+  for (const page of visible) { if (previous && page-previous > 1) { const dots = document.createElement('span'); dots.className = 'page-ellipsis'; dots.textContent = '…'; buttons.append(dots); } button(String(page),page,'Page '+page); previous = page; }
+  button('›',state.page+1,'Next page',state.page === pages);
+  const label = document.createElement('label'); label.className = 'page-size'; label.append(document.createTextNode('Per page'));
+  const size = document.createElement('select'); size.setAttribute('aria-label','Videos per page');
+  for (const value of [12,24,48]) size.add(new Option(String(value),value)); size.value = String(state.size);
+  size.onchange = () => { state.size = Number(size.value); state.page = 1; renderAll(); }; label.append(size);
+  nav.append(summary,buttons,label);
 }
 function renderAll() {
-  render('recent-jobs',jobs.slice(0,12));
-  const term = $('search').value.toLowerCase(), filter = $('status-filter').value;
-  render('all-jobs',jobs.filter(j => (j.title+' '+j.url).toLowerCase().includes(term) && (filter === 'all' || filter === 'downloading' && ['queued','downloading','processing'].includes(j.status) || j.status === filter)));
+  paginate('recent',jobs,'recent-jobs','recent-pagination');
+  const term = $('search').value.trim().toLowerCase(), filter = $('status-filter').value;
+  const filtered = jobs.filter(j => (j.title+' '+j.url+' '+sourceName(j)).toLowerCase().includes(term) && (filter === 'all' || filter === 'downloading' && ['queued','downloading','processing'].includes(j.status) || j.status === filter));
+  paginate('library',filtered,'all-jobs','library-pagination');
   for (const id of ['total-count','recent-count','nav-count']) $(id).textContent = jobs.length;
   $('ready-count').textContent = jobs.filter(j => j.status === 'completed').length; $('active-count').textContent = jobs.filter(j => ['queued','downloading','processing'].includes(j.status)).length;
+}
+function renderStats(stats) {
+  $('lifetime-total').textContent = stats?stats.total.toLocaleString():'—'; $('insights-total').textContent = stats?stats.total.toLocaleString():'—';
+  for (const card of $('all-platforms').children) {
+    const value = stats?.platforms.find(p => p.name === card.dataset.platform)?.downloads || 0;
+    card.querySelector('.platform-download-count').textContent = stats?value.toLocaleString():'—';
+    if (card.dataset.platform === 'Other') card.hidden = value === 0;
+  }
+  $('stats-status').textContent = stats?'Includes repeat downloads · Saved on this server':'Counters unavailable · Check the server connection and installed version';
 }
 function refresh() {
   refreshAgain = true;
@@ -324,13 +401,13 @@ function refresh() {
   refreshing = (async () => {
     do {
       refreshAgain = false;
-      try { jobs = await api('/api/jobs',{timeout:10000}); renderAll(); const h = await api('/api/health',{timeout:10000}); $('health').textContent = h.version !== UI_VERSION ? '● Restart StreamVault to apply update' : !h.ffmpeg ? '● FFmpeg missing' : h.ffprobe === false ? '● FFprobe missing' : !h.youtube_ejs ? '● YouTube dependency missing' : !h.js_runtimes?.length ? '● JavaScript runtime missing' : h.youtube_cooldown_seconds > 0 ? '● YouTube wait '+Math.ceil(h.youtube_cooldown_seconds/60)+'m' : '● Engine online'; }
+      try { const [items,h,stats] = await Promise.all([api('/api/jobs',{timeout:10000}),api('/api/health',{timeout:10000}),api('/api/stats',{timeout:10000}).catch(() => null)]); jobs = items; renderAll(); renderStats(stats); $('health').textContent = h.version !== UI_VERSION ? '● Restart AAASoft Video Studio to apply update' : !h.ffmpeg ? '● FFmpeg missing' : h.ffprobe === false ? '● FFprobe missing' : !h.youtube_ejs ? '● YouTube dependency missing' : !h.js_runtimes?.length ? '● JavaScript runtime missing' : h.youtube_cooldown_seconds > 0 ? '● YouTube wait '+Math.ceil(h.youtube_cooldown_seconds/60)+'m' : '● Engine online'; }
       catch(e) { $('health').textContent = '● Connection problem'; $('health').title = e.message; }
     } while (refreshAgain);
   })().finally(() => { refreshing = null; });
   return refreshing;
 }
-$('search').oninput = renderAll; $('status-filter').onchange = renderAll;
+$('search').oninput = () => { paginationState.library.page = 1; renderAll(); }; $('status-filter').onchange = () => { paginationState.library.page = 1; renderAll(); };
 $('theme').onclick = () => { document.body.classList.toggle('dark'); try { localStorage.setItem('sv-theme',document.body.classList.contains('dark') ? 'dark' : 'light'); } catch {} };
 try { if (localStorage.getItem('sv-theme') === 'dark') document.body.classList.add('dark'); } catch {}
 refresh(); setInterval(refresh,2000);
