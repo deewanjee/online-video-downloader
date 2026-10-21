@@ -131,11 +131,15 @@ def isolate_history(tmp_path, monkeypatch):
     class ImmediatePreview:
         def submit(self, function, *args):
             function(*args)
+        def shutdown(self, **kwargs):
+            pass
     monkeypatch.setattr(main, 'preview_pool', ImmediatePreview())
     monkeypatch.setattr(main, 'DATA', tmp_path)
     monkeypatch.setattr(main, 'jobs', {})
     monkeypatch.setattr(main, 'analysis_cache', {})
     monkeypatch.setattr(main, 'playlist_cache', {})
+    monkeypatch.setattr(main, 'playlist_loads', {})
+    monkeypatch.setattr(main, 'playlist_pool', ImmediatePreview())
     monkeypatch.setattr(main, 'preview_locks', {})
     monkeypatch.setattr(main.source_access, 'youtube', main.source_access.YoutubeAccess())
     monkeypatch.delenv('STREAMVAULT_PASSWORD', raising=False)
@@ -1099,3 +1103,142 @@ def test_launcher_reads_actual_loopback_identity_without_proxy(payload, status, 
         assert desktop.probe(server.server_port) is bool(expected)
     finally:
         server.shutdown(); server.server_close()
+
+
+def test_background_playlist_load_returns_pollable_result(monkeypatch):
+    load_test_playlist(monkeypatch)
+    response = client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLtest'})
+    assert response.status_code == 202
+    result = client.get('/api/playlist/loads/' + response.json()['id'])
+    assert result.json()['status'] == 'ready'
+    assert len(result.json()['result']['videos']) == 2
+    assert 'cancel' not in result.json()
+
+
+def test_background_playlist_load_error_is_pollable(monkeypatch):
+    def failed(*args): raise main.yt_dlp.utils.DownloadError('Video unavailable')
+    monkeypatch.setattr(main, 'extract_video', failed)
+    started = client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLtest'})
+    state = client.get('/api/playlist/loads/' + started.json()['id']).json()
+    assert state['status'] == 'failed'
+    assert 'unavailable' in state['detail']
+
+
+def wait_until(check, timeout=3):
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if check(): return
+        time.sleep(.01)
+    assert check(), 'Condition did not become true'
+
+
+def test_busy_playlist_waits_and_loads_after_active_transfer_without_retry(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    access = main.source_access.youtube
+    access.slot.acquire()
+    extracted = []
+    def playlist(downloader, url, download):
+        assert '_playlist_cancel' not in downloader.params
+        extracted.append(url)
+        return {'_type': 'playlist', 'entries': [playlist_entry(1)]}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', playlist)
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        monkeypatch.setattr(main, 'playlist_pool', worker)
+        try:
+            response = client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLbusy'})
+            assert response.status_code == 202
+            load_id = response.json()['id']
+            wait_until(lambda: len(access.slot.waiters) == 1)
+            assert not extracted
+            assert client.get('/api/playlist/loads/' + load_id).json()['status'] == 'loading'
+            assert client.get('/api/health').status_code == 200
+        finally:
+            access.slot.release()
+        wait_until(lambda: main.playlist_loads[load_id]['status'] == 'ready')
+    assert len(extracted) == 1
+    assert access.slot.active == 0
+
+
+def test_queued_playlist_can_cancel_without_contacting_youtube(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    access = main.source_access.youtube
+    access.slot.acquire()
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', lambda *a, **kw: pytest.fail('Cancelled playlist contacted YouTube'))
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        monkeypatch.setattr(main, 'playlist_pool', worker)
+        try:
+            started = client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLcancel'})
+            load_id = started.json()['id']
+            wait_until(lambda: len(access.slot.waiters) == 1)
+            assert client.delete('/api/playlist/loads/' + load_id).status_code == 204
+            wait_until(lambda: main.playlist_loads[load_id]['status'] == 'cancelled')
+            assert access.slot.active == 1
+            assert not access.slot.waiters
+        finally:
+            access.slot.release()
+    assert not main.playlist_cache
+
+
+def test_source_gate_is_fifo_and_new_download_cannot_overtake_waiting_playlist():
+    from concurrent.futures import ThreadPoolExecutor
+    access = main.source_access.youtube
+    access.slot.acquire()
+    order = []
+    def request(name, download):
+        with access.request(download, wait=not download):
+            order.append(name)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        try:
+            first = workers.submit(request, 'playlist', False)
+            wait_until(lambda: len(access.slot.waiters) == 1)
+            second = workers.submit(request, 'next download', True)
+            wait_until(lambda: len(access.slot.waiters) == 2)
+            assert access.slot.acquire(blocking=False) is False
+        finally:
+            access.slot.release()
+        first.result(timeout=3); second.result(timeout=3)
+    assert order == ['playlist', 'next download']
+    assert access.slot.active == 0
+
+
+def test_background_playlist_respects_cooldown_before_start():
+    main.source_access.youtube.limited()
+    response = client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLtest'})
+    assert response.status_code == 429
+    assert not main.playlist_loads
+
+
+def test_playlist_load_queue_is_bounded_and_worker_failure_does_not_strand_it(monkeypatch):
+    monkeypatch.setattr(main.playlist_pool, 'submit', lambda *a: None)
+    for _ in range(10):
+        assert client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLtest'}).status_code == 202
+    assert client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLtest'}).status_code == 429
+    assert len(main.playlist_loads) == 10
+    main.playlist_loads.clear()
+    def failed(*a): raise RuntimeError('stopped')
+    monkeypatch.setattr(main.playlist_pool, 'submit', failed)
+    assert client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLtest'}).status_code == 503
+    assert not main.playlist_loads
+
+
+def test_missing_load_is_readable_and_cancel_is_idempotent():
+    assert client.get('/api/playlist/loads/missing').status_code == 404
+    assert client.delete('/api/playlist/loads/missing').status_code == 204
+
+
+def test_shutdown_releases_waiting_playlist_and_does_not_cancel_download(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    access = main.source_access.youtube
+    access.slot.acquire()
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        monkeypatch.setattr(main, 'playlist_pool', worker)
+        try:
+            response = client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLshutdown'})
+            load_id = response.json()['id']
+            wait_until(lambda: len(access.slot.waiters) == 1)
+            main.stop_playlist_loads()
+            wait_until(lambda: main.playlist_loads[load_id]['status'] == 'cancelled')
+            assert access.slot.active == 1
+        finally:
+            access.slot.release()

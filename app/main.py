@@ -34,6 +34,7 @@ async def lifespan(application):
     try:
         yield
     finally:
+        stop_playlist_loads()
         stop_previews()
 
 
@@ -55,6 +56,9 @@ MAX_PLAYLIST = 1000
 MAX_HISTORY = 1100
 playlist_cache = {}
 playlist_lock = threading.Lock()
+playlist_loads = {}
+playlist_load_lock = threading.Lock()
+playlist_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='playlist')
 
 class VideoRequest(BaseModel):
     url: str = Field(max_length=2048)
@@ -111,10 +115,12 @@ def video_downloader(settings):
 
 
 def extract_video(url, download, settings):
+    settings = settings.copy()
+    playlist_cancel = settings.pop('_playlist_cancel', None)
     if not source_access.youtube_url(url):
         with video_downloader(settings) as dl:
             return dl.extract_info(url, download=download)
-    with source_access.youtube.request(download):
+    with source_access.youtube.request(download, wait=playlist_cancel is not None, cancel=playlist_cancel):
         logger = source_access.SourceLogger()
         settings = source_access.authenticated_settings(settings) | {'logger': logger, 'sleep_interval_requests': 1, 'extractor_retries': 1}
         try:
@@ -122,7 +128,12 @@ def extract_video(url, download, settings):
                 result = dl.extract_info(url, download=download)
                 if settings.get('lazy_playlist') and result and result.get('_type') == 'playlist':
                     # Playlist pages are lazy network requests: keep the downloader and source gate open.
-                    result['entries'] = list(islice(result.get('entries') or [], MAX_PLAYLIST + 1))
+                    entries = []
+                    for entry in islice(result.get('entries') or [], MAX_PLAYLIST + 1):
+                        if playlist_cancel is not None and playlist_cancel.is_set():
+                            raise source_access.SourceCancelled('Playlist loading cancelled.')
+                        entries.append(entry)
+                    result['entries'] = entries
                 if settings.get('lazy_playlist') and logger.terminal_rate_limit:
                     raise source_access.SourceRateLimited(600)
                 if settings.get('lazy_playlist') and result and logger.saw_error:
@@ -346,17 +357,28 @@ def update(job_id, **values):
 
 @app.post('/api/playlist/analyze')
 def analyze_playlist(req: VideoRequest):
-    validate_url(req.url)
-    parsed = urlparse(req.url)
+    return build_playlist(req)
+
+
+def playlist_url(url):
+    validate_url(url)
+    parsed = urlparse(url)
     ids = parse_qs(parsed.query).get('list', [])
-    if not source_access.youtube_url(req.url) or len(ids) != 1 or not re.fullmatch(r'[A-Za-z0-9_-]{2,200}', ids[0]):
+    if not source_access.youtube_url(url) or len(ids) != 1 or not re.fullmatch(r'[A-Za-z0-9_-]{2,200}', ids[0]):
         raise HTTPException(400, 'Paste a YouTube playlist URL containing list=PLAYLIST_ID.')
     if ids[0].startswith('RD'):
         raise HTTPException(400, 'YouTube Mix/radio lists change continuously. Use a saved playlist instead.')
-    url = 'https://www.youtube.com/playlist?list=' + ids[0]
+    return 'https://www.youtube.com/playlist?list=' + ids[0]
+
+
+def build_playlist(req, cancel=None):
+    url = playlist_url(req.url)
     try:
         info = extract_video(url, False, options() | {'noplaylist': False, 'extract_flat': 'in_playlist', 'lazy_playlist': True,
-                                                    'playlistend': MAX_PLAYLIST + 1, 'ignoreerrors': True})
+                                                    'playlistend': MAX_PLAYLIST + 1, 'ignoreerrors': True} |
+                             ({'_playlist_cancel': cancel} if cancel is not None else {}))
+        if cancel is not None and cancel.is_set():
+            raise source_access.SourceCancelled('Playlist loading cancelled.')
         if not info or info.get('_type') != 'playlist':
             raise HTTPException(422, 'This playlist is unavailable. Check its visibility and source access.')
         entries = list(islice(info.get('entries') or [], MAX_PLAYLIST + 1))
@@ -394,10 +416,80 @@ def analyze_playlist(req: VideoRequest):
         return result
     except HTTPException:
         raise
+    except source_access.SourceCancelled:
+        raise
     except (source_access.SourceRateLimited, source_access.SourceBusy) as exc:
         raise HTTPException(429, str(exc), headers={'Retry-After': str(exc.retry_after)})
     except Exception as exc:
         raise HTTPException(422, download_error(exc))
+
+
+def load_playlist(load_id, req):
+    with playlist_load_lock:
+        item = playlist_loads[load_id]
+        item['status'] = 'loading'
+    try:
+        if item['cancel'].is_set():
+            raise source_access.SourceCancelled()
+        result = build_playlist(req, item['cancel'])
+        with playlist_load_lock:
+            item.update(status='cancelled' if item['cancel'].is_set() else 'ready', result=result)
+    except source_access.SourceCancelled:
+        with playlist_load_lock:
+            item['status'] = 'cancelled'
+    except Exception as exc:
+        with playlist_load_lock:
+            item.update(status='cancelled' if item['cancel'].is_set() else 'failed', detail=exc.detail if isinstance(exc, HTTPException) else download_error(exc))
+
+
+def stop_playlist_loads():
+    with playlist_load_lock:
+        for item in playlist_loads.values():
+            item['cancel'].set()
+    playlist_pool.shutdown(wait=False, cancel_futures=True)
+
+
+@app.post('/api/playlist/loads', status_code=202)
+def start_playlist_load(req: VideoRequest):
+    playlist_url(req.url)
+    check_source_cooldown(req.url)
+    with playlist_load_lock:
+        finished = [key for key, item in playlist_loads.items() if item['status'] in ('ready', 'failed', 'cancelled')]
+        for key in finished:
+            if time.monotonic() - playlist_loads[key]['created'] > 1800:
+                playlist_loads.pop(key)
+        if len(playlist_loads) >= 10:
+            disposable = next((key for key in finished if key in playlist_loads), None)
+            if disposable is None:
+                raise HTTPException(429, 'Playlist loading queue is full. Wait for a load to finish or cancel it.')
+            playlist_loads.pop(disposable)
+        load_id = uuid.uuid4().hex
+        playlist_loads[load_id] = {'status': 'queued', 'created': time.monotonic(), 'cancel': threading.Event()}
+    try:
+        playlist_pool.submit(load_playlist, load_id, req)
+    except RuntimeError:
+        with playlist_load_lock:
+            playlist_loads.pop(load_id, None)
+        raise HTTPException(503, 'Playlist worker unavailable. Restart StreamVault.')
+    return {'id': load_id, 'status': 'queued'}
+
+
+@app.get('/api/playlist/loads/{load_id}')
+def playlist_load_status(load_id: str):
+    with playlist_load_lock:
+        item = playlist_loads.get(load_id)
+        if not item:
+            raise HTTPException(404, 'Playlist load expired. Load the playlist again.')
+        return {'id': load_id, **{k: item[k] for k in ('status', 'result', 'detail') if k in item}}
+
+
+@app.delete('/api/playlist/loads/{load_id}', status_code=204)
+def cancel_playlist_load(load_id: str):
+    with playlist_load_lock:
+        item = playlist_loads.get(load_id)
+        if item and item['status'] not in ('ready', 'failed', 'cancelled'):
+            item['cancel'].set()
+            item['status'] = 'cancelling'
 
 
 @app.post('/api/playlist/download', status_code=202)

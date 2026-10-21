@@ -20,25 +20,40 @@ class SourceBusy(RuntimeError):
     retry_after = 5
 
 
+class SourceCancelled(RuntimeError):
+    pass
+
+
 class TransferSlots:
     def __init__(self):
         self.condition = threading.Condition()
         self.limit = 1
         self.active = 0
+        self.waiters = []
 
     def set_limit(self, limit):
         with self.condition:
             self.limit = limit
             self.condition.notify_all()
 
-    def acquire(self, blocking=True):
+    def acquire(self, blocking=True, cancel=None):
         with self.condition:
-            while self.active >= self.limit:
-                if not blocking:
-                    return False
-                self.condition.wait()
-            self.active += 1
-            return True
+            ticket = object()
+            if not blocking and (self.active >= self.limit or self.waiters):
+                return False
+            self.waiters.append(ticket)
+            try:
+                while self.active >= self.limit or self.waiters[0] is not ticket:
+                    if cancel is not None and cancel.is_set():
+                        raise SourceCancelled('Playlist loading cancelled.')
+                    self.condition.wait(.2 if cancel is not None else None)
+                if cancel is not None and cancel.is_set():
+                    raise SourceCancelled('Playlist loading cancelled.')
+                self.active += 1
+                return True
+            finally:
+                self.waiters.remove(ticket)
+                self.condition.notify_all()
 
     def release(self):
         with self.condition:
@@ -61,10 +76,10 @@ class YoutubeAccess:
             self.until = max(self.until, time.monotonic() + 600)
 
     @contextmanager
-    def request(self, download):
+    def request(self, download, wait=False, cancel=None):
         if self.remaining():
             raise SourceRateLimited(self.remaining())
-        if not self.slot.acquire(blocking=download):
+        if not self.slot.acquire(blocking=download or wait, cancel=cancel):
             raise SourceBusy('A YouTube request is already running. Wait for it to finish before analyzing another link.')
         try:
             if self.remaining():

@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const UI_VERSION = '1.3.1';
+const UI_VERSION = '1.3.2';
 const audioFormats = ['mp3', 'm4a', 'wav'];
 function icon(name) {
   const paths = {play:'<path d="m8 5 11 7-11 7z"/>',arrow:'<path d="M6 18 18 6M6 6h12v12"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>'};
@@ -55,6 +55,7 @@ async function api(path,options = {}) {
   const timer = setTimeout(cancel,options.timeout || 60000);
   try {
     const response = await fetch(path,{...options,signal:controller.signal});
+    if (response.status === 204) return null;
     const body = await response.text(); let data;
     try { data = JSON.parse(body); } catch { throw Error('The server returned an unreadable response (HTTP '+response.status+'). Check the server connection and retry.'); }
     if (!response.ok) {
@@ -157,17 +158,41 @@ $('playlist-format').onchange = () => { $('playlist-quality-label').hidden = aud
 $('playlist-url').oninput = () => {
   if (playlistQueuing) return;
   playlistVersion++; playlistController?.abort(); playlistController = null; playlist = null;
-  $('playlist-result').hidden = true; $('playlist-message').hidden = true; $('playlist-load').disabled = false;
+  $('playlist-result').hidden = true; $('playlist-message').hidden = true; $('playlist-load').disabled = false; $('playlist-cancel').hidden = true;
 };
+$('playlist-cancel').onclick = () => {
+  playlistVersion++; playlistController?.abort(); playlistController = null;
+  $('playlist-load').disabled = false; $('playlist-cancel').hidden = true;
+  $('playlist-message').textContent = 'Playlist loading cancelled. Downloads already in progress continue.';
+};
+function playlistPause(signal) {
+  return new Promise((resolve,reject) => {
+    const cancel = () => { clearTimeout(timer); signal.removeEventListener('abort',cancel); reject(new DOMException('Cancelled','AbortError')); };
+    const timer = setTimeout(() => { signal.removeEventListener('abort',cancel); resolve(); },1000);
+    signal.addEventListener('abort',cancel,{once:true}); if (signal.aborted) cancel();
+  });
+}
 $('playlist-form').onsubmit = async event => {
   event.preventDefault(); if (playlistQueuing) return;
   const version = ++playlistVersion, box = $('playlist-message');
-  playlistController?.abort(); playlistController = new AbortController(); playlist = null;
+  playlistController?.abort(); const controller = new AbortController(); playlistController = controller; playlist = null;
+  let loadId = null, finished = false;
+  $('playlist-cancel').hidden = false;
   $('playlist-result').hidden = true; $('playlist-load').disabled = true; box.hidden = false;
-  box.textContent = 'Loading the playlist video list…';
+  box.textContent = 'Waiting for a YouTube slot, then loading your playlist… Downloads continue normally.';
   try {
-    const result = await api('/api/playlist/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:$('playlist-url').value.trim()}),signal:playlistController.signal,timeout:180000});
+    const started = await api('/api/playlist/loads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:$('playlist-url').value.trim()})});
+    loadId = started.id;
     if (version !== playlistVersion) return;
+    let result;
+    while (true) {
+      const state = await api('/api/playlist/loads/'+encodeURIComponent(loadId),{signal:controller.signal});
+      if (version !== playlistVersion) return;
+      if (state.status === 'ready') { result = state.result; finished = true; break; }
+      if (state.status === 'failed') { finished = true; throw Error(state.detail || 'Playlist loading failed.'); }
+      if (state.status === 'cancelled') { finished = true; throw Error('Playlist loading cancelled.'); }
+      await playlistPause(controller.signal);
+    }
     playlist = result; $('playlist-title').textContent = result.title;
     $('playlist-summary').textContent = result.videos.length+' available videos'+(result.unavailable?' · '+result.unavailable+' unavailable/live entries skipped':'')+(result.unlisted?' · '+result.unlisted+' entries not listed by YouTube (may be hidden or unavailable)':'')+(result.duplicates_removed?' · '+result.duplicates_removed+' duplicates skipped':'')+'.';
     const fragment = document.createDocumentFragment();
@@ -181,7 +206,10 @@ $('playlist-form').onsubmit = async event => {
     $('playlist-videos').replaceChildren(fragment); $('playlist-result').hidden = false;
     playlistSelection(); box.textContent = 'Choose your format and queue the whole playlist, or select individual videos.';
   } catch(e) { if (version === playlistVersion && e.name !== 'AbortError') box.textContent = e.message; }
-  finally { if (version === playlistVersion) { $('playlist-load').disabled = false; playlistController = null; } }
+  finally {
+    if (loadId && !finished) api('/api/playlist/loads/'+encodeURIComponent(loadId),{method:'DELETE'}).catch(() => {});
+    if (version === playlistVersion) { $('playlist-load').disabled = false; $('playlist-cancel').hidden = true; playlistController = null; }
+  }
 };
 $('playlist-queue').onclick = async () => {
   if (!playlist || playlistQueuing) return;
