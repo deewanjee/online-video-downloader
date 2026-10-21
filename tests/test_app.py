@@ -72,7 +72,8 @@ def test_source_403_is_actionable_and_does_not_expose_urls(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize('output', ['mp4', 'webm', 'mkv', 'mp3', 'm4a', 'wav'])
-def test_real_download_and_conversion(tmp_path, monkeypatch, output):
+@pytest.mark.parametrize('direct', [False, True])
+def test_real_download_and_conversion(tmp_path, monkeypatch, output, direct):
     # A tiny local fixture tests actual yt-dlp transfer and FFmpeg conversion without relying on platform access.
     source = tmp_path / 'fixture.mp4'
     subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'color=c=purple:s=320x240:d=1', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-c:v', 'libx264', '-c:a', 'aac', '-shortest', str(source)], check=True)
@@ -87,11 +88,20 @@ def test_real_download_and_conversion(tmp_path, monkeypatch, output):
     monkeypatch.setattr(main, 'DATA', storage)
     job_id = 'test_' + output
     main.jobs[job_id] = {'id': job_id, 'status': 'queued', 'created': 0, 'format': output}
+    chosen = tmp_path / 'Selected videos'
+    if direct:
+        chosen.mkdir()
+        main.jobs[job_id]['output_dir'] = str(chosen)
     try:
         req = main.DownloadRequest(url=f'http://127.0.0.1:{server.server_port}/fixture.mp4', format=output, quality='720')
         main.run_download(job_id, req)
         assert main.jobs[job_id]['status'] == 'completed', main.jobs[job_id]
         assert main.jobs[job_id]['has_audio'] is True
+        media_file = main.saved_path(main.jobs[job_id])
+        if direct:
+            assert media_file.parent == chosen
+            assert not list((storage / job_id).glob('*.' + output))
+            assert not (chosen / '.aaasoft-work' / job_id).exists()
         assert main.storage.statistics(storage)['total'] == 1
         response = client.get(f'/api/jobs/{job_id}/file')
         assert response.status_code == 200
@@ -105,7 +115,7 @@ def test_real_download_and_conversion(tmp_path, monkeypatch, output):
         assert main.jobs[job_id]['preview_available'] is True
         if output in ('mp4', 'webm', 'mkv'):
             assert stream.headers['content-type'] == 'video/mp4'
-            preview = main.playable_file(storage / job_id / main.jobs[job_id]['filename'], main.jobs[job_id])
+            preview = main.playable_file(media_file, main.jobs[job_id], **main.preview_kwargs(main.jobs[job_id]))
             assert main.describe_media(preview)['video_codec'] == 'h264'
             poster = client.get(f'/api/jobs/{job_id}/thumbnail')
             assert poster.status_code == 200
@@ -124,6 +134,9 @@ def test_real_download_and_conversion(tmp_path, monkeypatch, output):
         assert client.delete(f'/api/jobs/{job_id}').status_code == 200
         assert client.get(f'/api/jobs/{job_id}/stream').status_code == 404
         assert not (storage / job_id).exists()
+        if direct:
+            assert media_file.is_file()  # Library removal never deletes the user's direct-save original.
+        assert main.storage.statistics(storage)['total'] == 1
     finally:
         main.jobs.pop(job_id, None)
         server.shutdown()
@@ -151,6 +164,7 @@ def isolate_history(tmp_path, monkeypatch):
     monkeypatch.delenv('STREAMVAULT_USERNAME', raising=False)
     monkeypatch.delenv('STREAMVAULT_SYSTEM_CERTS', raising=False)
     monkeypatch.delenv('STREAMVAULT_COOKIE_FILE', raising=False)
+    monkeypatch.delenv('STREAMVAULT_DESKTOP', raising=False)
 
 
 def test_history_survives_restart_and_interrupted_jobs_can_retry(tmp_path, monkeypatch):
@@ -403,14 +417,14 @@ def test_youtube_cooldown_expires_without_affecting_other_sources(monkeypatch):
 
 def test_youtube_parallel_analysis_reports_busy_without_blocking(monkeypatch):
     access = main.source_access.youtube
-    access.slot.acquire()
+    access.metadata_slot.acquire()
     try:
         response = client.post('/api/analyze', json={'url': 'https://youtu.be/available'})
         assert response.status_code == 429
         assert 'already running' in response.json()['detail']
         assert response.headers['retry-after'] == '5'
     finally:
-        access.slot.release()
+        access.metadata_slot.release()
 
 
 def test_cookie_file_is_opt_in_local_and_never_returned_in_health(tmp_path, monkeypatch):
@@ -886,16 +900,16 @@ def test_playlist_canonicalizes_watch_link_and_keeps_lazy_pages_inside_source_ga
         assert downloader.params['extract_flat'] == 'in_playlist'
         assert downloader.params['playlistend'] == 1001
         def pages():
-            assert main.source_access.youtube.slot.active == 1
+            assert main.source_access.youtube.metadata_slot.active == 1
             yield playlist_entry(1)
-            assert main.source_access.youtube.slot.active == 1
+            assert main.source_access.youtube.metadata_slot.active == 1
             yield playlist_entry(2)
         return {'_type': 'playlist', 'entries': pages()}
     monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', extracted)
     result = client.post('/api/playlist/analyze', json={'url': 'https://youtube.com/watch?v=clip0000001&list=PLfixture&index=3'})
     assert result.status_code == 200, result.text
     assert len(result.json()['videos']) == 2
-    assert main.source_access.youtube.slot.active == 0
+    assert main.source_access.youtube.metadata_slot.active == 0
 
 
 def test_playlist_queues_all_over_bulk_limit_with_metadata_and_idempotent_retry(monkeypatch):
@@ -1137,10 +1151,10 @@ def wait_until(check, timeout=3):
     assert check(), 'Condition did not become true'
 
 
-def test_busy_playlist_waits_and_loads_after_active_transfer_without_retry(monkeypatch):
+def test_busy_playlist_waits_for_other_metadata_without_retry(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     access = main.source_access.youtube
-    access.slot.acquire()
+    access.metadata_slot.acquire()
     extracted = []
     def playlist(downloader, url, download):
         assert '_playlist_cancel' not in downloader.params
@@ -1153,34 +1167,34 @@ def test_busy_playlist_waits_and_loads_after_active_transfer_without_retry(monke
             response = client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLbusy'})
             assert response.status_code == 202
             load_id = response.json()['id']
-            wait_until(lambda: len(access.slot.waiters) == 1)
+            wait_until(lambda: len(access.metadata_slot.waiters) == 1)
             assert not extracted
             assert client.get('/api/playlist/loads/' + load_id).json()['status'] == 'loading'
             assert client.get('/api/health').status_code == 200
         finally:
-            access.slot.release()
+            access.metadata_slot.release()
         wait_until(lambda: main.playlist_loads[load_id]['status'] == 'ready')
     assert len(extracted) == 1
-    assert access.slot.active == 0
+    assert access.metadata_slot.active == 0
 
 
 def test_queued_playlist_can_cancel_without_contacting_youtube(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     access = main.source_access.youtube
-    access.slot.acquire()
+    access.metadata_slot.acquire()
     monkeypatch.setattr(main.yt_dlp.YoutubeDL, 'extract_info', lambda *a, **kw: pytest.fail('Cancelled playlist contacted YouTube'))
     with ThreadPoolExecutor(max_workers=1) as worker:
         monkeypatch.setattr(main, 'playlist_pool', worker)
         try:
             started = client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLcancel'})
             load_id = started.json()['id']
-            wait_until(lambda: len(access.slot.waiters) == 1)
+            wait_until(lambda: len(access.metadata_slot.waiters) == 1)
             assert client.delete('/api/playlist/loads/' + load_id).status_code == 204
             wait_until(lambda: main.playlist_loads[load_id]['status'] == 'cancelled')
-            assert access.slot.active == 1
-            assert not access.slot.waiters
+            assert access.metadata_slot.active == 1
+            assert not access.metadata_slot.waiters
         finally:
-            access.slot.release()
+            access.metadata_slot.release()
     assert not main.playlist_cache
 
 
@@ -1231,21 +1245,21 @@ def test_missing_load_is_readable_and_cancel_is_idempotent():
     assert client.delete('/api/playlist/loads/missing').status_code == 204
 
 
-def test_shutdown_releases_waiting_playlist_and_does_not_cancel_download(monkeypatch):
+def test_shutdown_releases_waiting_playlist_and_preserves_held_metadata_slot(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     access = main.source_access.youtube
-    access.slot.acquire()
+    access.metadata_slot.acquire()
     with ThreadPoolExecutor(max_workers=1) as worker:
         monkeypatch.setattr(main, 'playlist_pool', worker)
         try:
             response = client.post('/api/playlist/loads', json={'url': 'https://youtube.com/playlist?list=PLshutdown'})
             load_id = response.json()['id']
-            wait_until(lambda: len(access.slot.waiters) == 1)
+            wait_until(lambda: len(access.metadata_slot.waiters) == 1)
             main.stop_playlist_loads()
             wait_until(lambda: main.playlist_loads[load_id]['status'] == 'cancelled')
-            assert access.slot.active == 1
+            assert access.metadata_slot.active == 1
         finally:
-            access.slot.release()
+            access.metadata_slot.release()
 
 
 def test_lifetime_counts_survive_history_removal_and_restore(tmp_path):
@@ -1355,3 +1369,183 @@ def test_analytics_and_redownload_keep_owner_authentication(monkeypatch):
     assert client.get('/api/stats').status_code == 401
     assert client.post('/api/jobs/anything/redownload').status_code == 401
     assert client.get('/api/stats',auth=('admin','local-test-owner')).status_code == 200
+
+
+def local_desktop_client(tmp_path, monkeypatch):
+    data = tmp_path / 'app-data'; data.mkdir()
+    chosen = tmp_path / 'My videos'; chosen.mkdir()
+    monkeypatch.setattr(main, 'DATA', data)
+    monkeypatch.setenv('STREAMVAULT_DESKTOP', '1')
+    local = TestClient(main.app, base_url='http://127.0.0.1:8000', client=('127.0.0.1', 52000))
+    return local, data, chosen
+
+
+def test_desktop_requires_location_then_captures_it_for_each_new_batch(tmp_path, monkeypatch):
+    local, data, chosen = local_desktop_client(tmp_path, monkeypatch)
+    monkeypatch.setattr(main.pool, 'submit', lambda *args: None)
+    assert local.get('/api/download-location').json()['direct_enabled'] is True
+    assert local.post('/api/download',json={'url':'https://youtu.be/one'}).status_code == 409
+    assert not main.jobs
+    selected = local.post('/api/download-location', json={'path':str(chosen)})
+    assert selected.status_code == 200 and selected.json()['available']
+    assert main.destinations.selected(data) == str(chosen)
+    queued = local.post('/api/download/bulk',json={'urls':['https://youtu.be/one','https://youtu.be/two']})
+    assert queued.status_code == 202
+    assert all(j['output_dir'] == str(chosen) for j in main.jobs.values())
+    other = tmp_path / 'Other folder'; other.mkdir()
+    assert local.post('/api/download-location',json={'path':str(other)}).status_code == 200
+    fresh = local.post('/api/download',json={'url':'https://youtu.be/three'}).json()
+    assert fresh['output_dir'] == str(other)
+    assert next(iter(main.jobs.values()))['output_dir'] == str(chosen)
+
+
+def test_local_folder_picker_selection_cancellation_and_failure(tmp_path, monkeypatch):
+    local, data, chosen = local_desktop_client(tmp_path, monkeypatch)
+    monkeypatch.setattr(main.destinations, 'picker', lambda initial: str(chosen))
+    assert local.post('/api/download-location/pick').json()['path'] == str(chosen)
+    monkeypatch.setattr(main.destinations, 'picker', lambda initial: None)
+    cancelled = local.post('/api/download-location/pick').json()
+    assert cancelled['cancelled'] and cancelled['path'] == str(chosen)
+    def failed(*args):raise main.destinations.DestinationError('Enter a folder path instead.')
+    monkeypatch.setattr(main.destinations, 'picker', failed)
+    assert local.post('/api/download-location/pick').status_code == 503
+    assert not main.folder_dialog_lock.locked()
+    assert main.destinations.selected(data) == str(chosen)
+
+
+def test_only_one_native_folder_dialog_can_open(tmp_path, monkeypatch):
+    local, _, _ = local_desktop_client(tmp_path, monkeypatch)
+    main.folder_dialog_lock.acquire()
+    try:
+        monkeypatch.setattr(main.destinations, 'picker', lambda *args:pytest.fail('Second dialog opened'))
+        assert local.post('/api/download-location/pick').status_code == 409
+    finally:main.folder_dialog_lock.release()
+
+
+@pytest.mark.parametrize('kind',['relative','missing','file','app-data'])
+def test_invalid_download_locations_do_not_change_config(tmp_path, monkeypatch, kind):
+    local, data, chosen = local_desktop_client(tmp_path, monkeypatch)
+    main.destinations.configure(data,str(chosen))
+    file = tmp_path / 'not-a-folder';file.write_text('keep')
+    values={'relative':'relative/folder','missing':str(tmp_path/'missing'),'file':str(file),'app-data':str(data)}
+    assert local.post('/api/download-location',json={'path':values[kind]}).status_code == 400
+    assert main.destinations.selected(data) == str(chosen)
+
+
+@pytest.mark.parametrize('host,peer',[('http://127.0.0.1:8000','198.51.100.8'),('http://attacker.example','127.0.0.1')])
+def test_remote_or_rebound_hosts_cannot_change_local_folders(tmp_path, monkeypatch, host, peer):
+    _, data, chosen = local_desktop_client(tmp_path, monkeypatch)
+    main.destinations.configure(data,str(chosen))
+    remote = TestClient(main.app,base_url=host,client=(peer,52000))
+    assert remote.get('/api/download-location').json()['path'] is None
+    assert remote.post('/api/download-location',json={'path':str(chosen)}).status_code == 403
+    assert remote.post('/api/download-location/pick').status_code == 403
+    assert remote.post('/api/download-location/open').status_code == 403
+
+
+def test_public_mode_cannot_use_local_folder_controls(tmp_path, monkeypatch):
+    local, data, chosen = local_desktop_client(tmp_path, monkeypatch)
+    main.destinations.configure(data,str(chosen))
+    monkeypatch.setenv('STREAMVAULT_PUBLIC','true');monkeypatch.setenv('STREAMVAULT_PASSWORD','local-owner-test')
+    auth=('admin','local-owner-test')
+    assert not local.get('/api/download-location',auth=auth).json()['direct_enabled']
+    assert local.post('/api/download-location/pick',auth=auth).status_code == 403
+    assert main.destinations.snapshot(data) == {}
+
+
+def test_folder_controls_keep_same_origin_protection(tmp_path, monkeypatch):
+    local, _, chosen = local_desktop_client(tmp_path, monkeypatch)
+    assert local.post('/api/download-location',json={'path':str(chosen)},headers={'Origin':'https://attacker.example'}).status_code == 403
+
+
+def test_publish_renames_once_and_never_overwrites_existing_file(tmp_path, monkeypatch):
+    local, data, chosen = local_desktop_client(tmp_path, monkeypatch)
+    job=failed_job('direct01')|{'status':'processing','output_dir':str(chosen)}
+    main.jobs[job['id']]=job
+    work=main.destinations.work_folder(data,job);work.mkdir(parents=True)
+    source=work/'Video.mp4';source.write_bytes(b'verified original');inode=source.stat().st_ino
+    existing=chosen/'Video [direct01].mp4';existing.write_bytes(b'user file')
+    monkeypatch.setattr(main.shutil,'copy2',lambda *args:pytest.fail('Same-volume original was copied'))
+    output=main.publish_original(job['id'],source)
+    assert output.read_bytes()==b'verified original' and output.stat().st_ino==inode
+    assert existing.read_bytes()==b'user file'
+    assert not source.exists()
+    assert main.storage.restore(data)[job['id']]['planned_filename']==output.name
+
+
+def test_folder_change_does_not_accept_extra_client_job_path(tmp_path, monkeypatch):
+    local, data, chosen = local_desktop_client(tmp_path, monkeypatch)
+    main.destinations.configure(data,str(chosen))
+    monkeypatch.setattr(main.pool,'submit',lambda *args:None)
+    response=local.post('/api/download',json={'url':'https://youtu.be/one','output_dir':'/not-selected'})
+    assert response.status_code==202
+    assert response.json()['output_dir']==str(chosen)
+
+
+def tiny_video(path):
+    subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','color=s=160x120:d=1','-c:v','libx264','-pix_fmt','yuv420p',str(path)],check=True)
+
+
+def test_published_original_recovers_after_restart_without_source_request(tmp_path, monkeypatch):
+    local, data, chosen = local_desktop_client(tmp_path, monkeypatch)
+    file=chosen/'Saved.mp4';tiny_video(file)
+    job=failed_job('recovered')|{'status':'failed','recoverable':True,'output_dir':str(chosen),'planned_filename':file.name,'duration':1}
+    main.jobs[job['id']]=job
+    monkeypatch.setattr(main,'extract_video',lambda *args:pytest.fail('Already published file re-downloaded'))
+    main.run_download(job['id'],main.DownloadRequest(url=job['url'],quality='720'))
+    assert main.jobs[job['id']]['status']=='completed'
+    assert main.saved_path(main.jobs[job['id']])==file
+    assert len(list(chosen.glob('*.mp4')))==1
+    assert local.get('/api/jobs/recovered/stream?original=true').status_code==200
+
+
+def test_legacy_merged_original_can_finish_into_selected_folder_on_retry(tmp_path, monkeypatch):
+    local, data, chosen = local_desktop_client(tmp_path, monkeypatch)
+    main.destinations.configure(data,str(chosen))
+    job=failed_job('legacy_move')|{'recoverable':True,'duration':1}
+    main.jobs[job['id']]=job
+    folder=data/job['id'];folder.mkdir();old=folder/'Merged.mp4';tiny_video(old)
+    def immediate(function,*args):function(*args)
+    monkeypatch.setattr(main.pool,'submit',immediate)
+    monkeypatch.setattr(main,'extract_video',lambda *args:pytest.fail('Valid legacy merge re-downloaded'))
+    assert local.post('/api/jobs/legacy_move/retry').status_code==202
+    assert main.jobs[job['id']]['status']=='completed',main.jobs[job['id']]
+    assert main.saved_path(main.jobs[job['id']]).parent==chosen
+    assert not old.exists()
+
+
+def test_direct_saved_file_opening_is_local_and_uses_recorded_path(tmp_path, monkeypatch):
+    local, data, chosen = local_desktop_client(tmp_path, monkeypatch)
+    main.destinations.configure(data,str(chosen))
+    job=failed_job('saved')|{'status':'completed','output_dir':str(chosen),'filename':'Saved.mp4'}
+    (chosen/job['filename']).write_bytes(b'original')
+    main.jobs[job['id']]=job
+    opened=[];monkeypatch.setattr(main.destinations,'open_folder',opened.append)
+    assert local.post('/api/jobs/saved/open-folder').status_code==200
+    assert local.post('/api/download-location/open').status_code==200
+    assert opened==[chosen,chosen]
+    assert client.post('/api/jobs/saved/open-folder').status_code==403
+
+
+def test_playlist_listing_runs_while_both_media_transfers_are_busy(monkeypatch):
+    access=main.source_access.youtube
+    access.slot.set_limit(2);access.slot.acquire();access.slot.acquire()
+    def extracted(dl,*args,**kwargs):
+        assert access.slot.active==2
+        assert access.metadata_slot.active==1
+        assert '_playlist_phase' not in dl.params
+        return {'_type':'playlist','entries':[playlist_entry(1)]}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extracted)
+    try:
+        response=client.post('/api/playlist/loads',json={'url':'https://youtube.com/playlist?list=PLready'})
+        state=client.get('/api/playlist/loads/'+response.json()['id']).json()
+        assert state['status']=='ready'
+        assert state['phase']=='fetching' and state['started']>0
+        assert access.slot.active==2 and access.metadata_slot.active==0
+    finally:access.slot.release();access.slot.release()
+
+
+def test_playlist_missing_thumbnail_gets_youtube_poster(monkeypatch):
+    result=load_test_playlist(monkeypatch,[playlist_entry(1),playlist_entry(2,thumbnails=[{'url':'https://i.ytimg.com/example.jpg'}])])
+    assert result['videos'][0]['thumbnail']=='https://i.ytimg.com/vi/clip0000001/hqdefault.jpg'
+    assert result['videos'][1]['thumbnail']=='https://i.ytimg.com/example.jpg'

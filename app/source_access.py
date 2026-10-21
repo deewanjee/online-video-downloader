@@ -64,6 +64,7 @@ class TransferSlots:
 class YoutubeAccess:
     def __init__(self):
         self.slot = TransferSlots()
+        self.metadata_slot = TransferSlots()
         self.state = threading.Lock()
         self.until = 0
 
@@ -76,17 +77,18 @@ class YoutubeAccess:
             self.until = max(self.until, time.monotonic() + 600)
 
     @contextmanager
-    def request(self, download, wait=False, cancel=None):
+    def request(self, download, wait=False, cancel=None, metadata=False):
         if self.remaining():
             raise SourceRateLimited(self.remaining())
-        if not self.slot.acquire(blocking=download or wait, cancel=cancel):
+        slot = self.metadata_slot if metadata else self.slot
+        if not slot.acquire(blocking=download or wait, cancel=cancel):
             raise SourceBusy('A YouTube request is already running. Wait for it to finish before analyzing another link.')
         try:
             if self.remaining():
                 raise SourceRateLimited(self.remaining())
             yield
         finally:
-            self.slot.release()
+            slot.release()
 
 
 youtube = YoutubeAccess()

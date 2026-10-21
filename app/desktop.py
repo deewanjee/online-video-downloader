@@ -1,6 +1,7 @@
 """Local-only launcher that opens the browser after the API is ready."""
 import argparse
 import json
+import os
 import shutil
 import socket
 import threading
@@ -42,6 +43,8 @@ def main():
             print('A protected StreamVault is running. If you updated project files, stop its server with Ctrl+C and launch again to load the update.')
         elif existing.get('version') != __version__:
             parser.error(f"StreamVault {existing.get('version') or '(unknown version)'} is still running; installed files are {__version__}. Stop the previous server with Ctrl+C, then launch again from this project folder. Refresh the browser with Ctrl+F5.")
+        elif existing.get('capabilities', {}).get('direct_save') is False:
+            parser.error('The running server is not in desktop mode. Stop it with Ctrl+C, then launch again to enable local folder selection.')
         print('StreamVault is already running. Opening your dashboard.')
         webbrowser.open(url)
         return
@@ -63,6 +66,7 @@ def main():
         print('The browser could not open automatically. Check the server output.')
     print(f'StreamVault is starting at {url}')
     print('Keep this window open. Press Ctrl+C to stop.')
+    os.environ['STREAMVAULT_DESKTOP'] = '1'
     threading.Thread(target=open_when_ready, daemon=True).start()
     import uvicorn
     uvicorn.run('app.main:app', host='127.0.0.1', port=args.port, log_level='warning')

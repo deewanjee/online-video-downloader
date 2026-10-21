@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const UI_VERSION = '2.0.0';
+const UI_VERSION = '2.1.0';
 const audioFormats = ['mp3', 'm4a', 'wav'];
 function icon(name) {
   const paths = {play:'<path d="m8 5 11 7-11 7z"/>',arrow:'<path d="M6 18 18 6M6 6h12v12"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>'};
@@ -26,6 +26,7 @@ for (const id of ['platform-grid','all-platforms']) {
 let analyzed = null, jobs = [], busy = false, playingId = null;
 let analysisVersion = 0, analysisController = null, refreshing = null, refreshAgain = false;
 let noticeTimer = null, toastTimer = null;
+let locationSettings = null, destinationPromise = null, locationInputDirty = false;
 let playerVersion = 0, previewTimer = null, previewController = null;
 let originalFallback = null, originalTimer = null;
 const rendered = new Map();
@@ -83,6 +84,49 @@ async function api(path,options = {}) {
     throw e;
   } finally { clearTimeout(timer); callerSignal?.removeEventListener('abort',cancel); }
 }
+function applyDownloadLocation(settings) {
+  locationSettings = settings;
+  $('location-path').textContent = settings.direct_enabled ? settings.path || 'No folder selected' : 'Browser download';
+  $('location-path').title = settings.path || '';
+  $('location-help').textContent = settings.direct_enabled ? settings.configured ? settings.available ? 'New downloads save directly here. No second Save step is needed.' : 'This folder is unavailable. Reconnect the drive or choose another folder.' : 'Choose a folder before adding downloads. Files will be saved there automatically.' : 'Server mode: files are prepared on the server; Save to device uses your browser. For direct laptop saving, use Start StreamVault.bat locally.';
+  $('location-choose').hidden = !settings.direct_enabled; $('location-manual').hidden = !settings.direct_enabled;
+  $('location-open').hidden = !settings.direct_enabled || !settings.configured;
+  if (settings.path && !locationInputDirty && document.activeElement !== $('location-input')) $('location-input').value = settings.path;
+}
+async function chooseDownloadFolder() {
+  if (destinationPromise) return destinationPromise;
+  destinationPromise = (async () => {
+    $('location-choose').disabled = true; $('location-message').hidden = false;
+    $('location-message').textContent = 'Choose a folder in the desktop dialog. Your browser will wait here.';
+    try {
+      const result = await api('/api/download-location/pick',{method:'POST',timeout:150000});
+      locationInputDirty = false; applyDownloadLocation(result);
+      $('location-message').textContent = result.cancelled ? 'Folder selection cancelled.' : 'Folder confirmed. New downloads will be saved directly here.';
+      renderAll(); return result.configured && result.available;
+    } catch(e) {
+      $('location-message').textContent = e.message; $('location-manual').open = true; $('location-input').focus(); return false;
+    } finally { $('location-choose').disabled = false; }
+  })();
+  try { return await destinationPromise; } finally { destinationPromise = null; }
+}
+async function ensureDownloadLocation() {
+  if (!locationSettings) applyDownloadLocation(await api('/api/download-location'));
+  if (locationSettings.direct_enabled && (!locationSettings.configured || !locationSettings.available)) {
+    if (!await chooseDownloadFolder()) throw Error('Choose an available download folder before adding videos.');
+  }
+}
+$('location-choose').onclick = chooseDownloadFolder;
+$('location-open').onclick = async () => { try { await api('/api/download-location/open',{method:'POST'}); } catch(e) { notice(e.message); } };
+$('location-input').oninput = () => { locationInputDirty = true; };
+$('location-form').onsubmit = async event => {
+  event.preventDefault(); $('location-save').disabled = true; $('location-message').hidden = false;
+  try {
+    const result = await api('/api/download-location',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:$('location-input').value.trim()})});
+    locationInputDirty = false; applyDownloadLocation(result); $('location-message').textContent = 'Folder confirmed. New downloads will be saved directly here.'; renderAll();
+  } catch(e) { $('location-message').textContent = e.message; }
+  finally { $('location-save').disabled = false; }
+};
+async function openJobFolder(j) { try { await api(endpoint(j,'open-folder'),{method:'POST'}); } catch(e) { notice(e.message); } }
 function duration(s) { return Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0'); }
 function sourceName(j) {
   try { return j.source_platform || j.platform || new URL(j.url).hostname.replace(/^www\./,''); } catch { return 'Your collection'; }
@@ -136,8 +180,9 @@ $('format').onchange = () => { $('quality-label').hidden = audioFormats.includes
 $('download-button').onclick = async () => {
   if (!analyzed) return; $('download-button').disabled = true;
   try {
+    await ensureDownloadLocation();
     await api('/api/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:analyzed.url,format:$('format').value,quality:$('quality').value})});
-    notice('Added to your collection. Play or save it when processing is complete.'); await refresh();
+    notice(locationSettings?.direct_enabled ? 'Added to your collection. The file will save automatically in your selected folder.' : 'Added to your collection. Play or save it when processing is complete.'); await refresh();
   } catch(e) { notice(e.message,e.retryAfter); } finally { $('download-button').disabled = false; }
 };
 $('bulk-format').onchange = () => { $('bulk-quality-label').hidden = audioFormats.includes($('bulk-format').value); };
@@ -148,8 +193,9 @@ $('bulk-form').onsubmit = async event => {
   if (!urls.length || urls.length > 50) { box.textContent = 'Paste between 1 and 50 video links, one per line.'; return; }
   $('bulk-button').disabled = true; box.textContent = 'Adding your videos to the queue…';
   try {
+    await ensureDownloadLocation();
     const result = await api('/api/download/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls,format:$('bulk-format').value,quality:$('bulk-quality').value,youtube_concurrency:Number($('bulk-concurrency').value)})});
-    box.textContent = result.added+' videos added.'+(result.duplicates_removed?' '+result.duplicates_removed+' repeated links skipped.':'')+(result.submission_failures?' '+result.submission_failures+' jobs could not start; use Retry after restarting the app.':' Originals will be ready to save before optional preview encoding.');
+    box.textContent = result.added+' videos added.'+(result.duplicates_removed?' '+result.duplicates_removed+' repeated links skipped.':'')+(result.submission_failures?' '+result.submission_failures+' jobs could not start; use Retry after restarting the app.':' Originals finish before optional preview encoding.');
     $('bulk-urls').value = ''; await refresh();
   } catch(e) { box.textContent = e.message; }
   finally { $('bulk-button').disabled = false; }
@@ -194,7 +240,7 @@ $('playlist-form').onsubmit = async event => {
   let loadId = null, finished = false;
   $('playlist-cancel').hidden = false;
   $('playlist-result').hidden = true; $('playlist-load').disabled = true; box.hidden = false;
-  box.textContent = 'Waiting for a YouTube slot, then loading your playlist… Downloads continue normally.';
+  box.textContent = 'Loading your playlist… Video downloads continue independently.';
   try {
     const started = await api('/api/playlist/loads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:$('playlist-url').value.trim()})});
     loadId = started.id;
@@ -206,6 +252,8 @@ $('playlist-form').onsubmit = async event => {
       if (state.status === 'ready') { result = state.result; finished = true; break; }
       if (state.status === 'failed') { finished = true; throw Error(state.detail || 'Playlist loading failed.'); }
       if (state.status === 'cancelled') { finished = true; throw Error('Playlist loading cancelled.'); }
+      const elapsed = state.started ? ' · '+duration(Math.max(0,Date.now()/1000-state.started))+' elapsed' : '';
+      box.textContent = state.status === 'queued' ? 'Playlist analysis queued. Video downloads continue independently.' : state.phase === 'waiting_metadata' ? 'Another YouTube analysis is running. Waiting for a metadata slot'+elapsed : state.entries > 0 ? 'Reading playlist · '+state.entries+' entries found'+elapsed : 'Loading playlist from YouTube'+elapsed+'. Video downloads continue independently.';
       await playlistPause(controller.signal);
     }
     playlist = result; $('playlist-title').textContent = result.title;
@@ -232,6 +280,7 @@ $('playlist-queue').onclick = async () => {
   playlistQueuing = true; $('playlist-queue').disabled = true; $('playlist-load').disabled = true; $('playlist-url').disabled = true;
   $('playlist-message').hidden = false; $('playlist-message').textContent = 'Adding selected playlist videos…';
   try {
+    await ensureDownloadLocation();
     const result = await api('/api/playlist/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:playlist.token,video_ids,format:$('playlist-format').value,quality:$('playlist-quality').value,youtube_concurrency:Number($('playlist-concurrency').value)})});
     $('playlist-message').textContent = result.added+' playlist videos added. Track each video in My library.'+(result.submission_failures?' '+result.submission_failures+' jobs need Retry after restarting the app.':'');
     playlist = null; $('playlist-result').hidden = true; await refresh();
@@ -247,6 +296,8 @@ function stopPlayer() {
 }
 async function playJob(j) {
   stopPlayer(); playingId = j.id; $('player-title').textContent = j.title; $('player-save').href = endpoint(j,'file'); $('player-error').hidden = true;
+  $('player-open-folder').hidden = !locationSettings?.direct_enabled; $('player-open-folder').onclick = () => openJobFolder(j);
+  $('player-save').textContent = locationSettings?.direct_enabled ? '↓ Save a copy' : '↓ Save to device';
   const version = playerVersion, audio = audioFormats.includes(j.format);
   $('video-player').hidden = true; $('audio-player').hidden = true; $('preview-wait').hidden = false;
   $('preview-status').textContent = 'Checking your browser preview…'; $('preview-progress').value = 0;
@@ -326,23 +377,24 @@ function createCard(j) {
   const actions = document.createElement('div'); actions.className = 'job-actions';
   if (j.status === 'completed') {
     const play = document.createElement('button'); play.className = 'play-button'; play.append(icon('play'),document.createTextNode(' Play')); play.onclick = () => playJob(j); actions.append(play);
-    const save = document.createElement('a'); save.href = endpoint(j,'file'); save.textContent = '↓ Save'; save.setAttribute('aria-label','Save original '+j.title); actions.append(save);
+    if (locationSettings?.direct_enabled) { const folder = document.createElement('button'); folder.className = 'open-folder-button'; folder.textContent = 'Folder'; folder.setAttribute('aria-label','Open folder for '+j.title); folder.onclick = () => openJobFolder(j); actions.append(folder); }
+    else { const save = document.createElement('a'); save.href = endpoint(j,'file'); save.textContent = '↓ Save'; save.setAttribute('aria-label','Save to device '+j.title); actions.append(save); }
     const again = document.createElement('button'); again.className = 'redownload-button'; again.textContent = '↻ Again'; again.setAttribute('aria-label','Download again '+j.title);
-    again.onclick = async () => { again.disabled = true; try { await api(endpoint(j,'redownload'),{method:'POST'}); notice('A fresh download was added. Your existing file is still available.'); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { again.disabled = false; } }; actions.append(again);
+    again.onclick = async () => { again.disabled = true; try { await ensureDownloadLocation(); await api(endpoint(j,'redownload'),{method:'POST'}); notice('A fresh download was added. Your existing file is still available.'); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { again.disabled = false; } }; actions.append(again);
   }
-  if (j.status === 'failed') { const retry = document.createElement('button'); retry.className = 'retry-button'; retry.textContent = j.recoverable?'↻ Resume':'↻ Retry'; retry.onclick = async () => { retry.disabled = true; try { await api(endpoint(j,'retry'),{method:'POST'}); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { retry.disabled = false; } }; actions.append(retry); }
-  if (['failed','completed'].includes(j.status)) { const remove = document.createElement('button'); remove.className = 'remove-button'; remove.textContent = '×'; remove.setAttribute('aria-label','Remove '+j.title); remove.onclick = async () => { try { await api('/api/jobs/'+encodeURIComponent(j.id),{method:'DELETE'}); if (playingId === j.id) $('player-dialog').close(); await refresh(); } catch(e) { notice(e.message); view('home'); } }; actions.append(remove); }
+  if (j.status === 'failed') { const retry = document.createElement('button'); retry.className = 'retry-button'; retry.textContent = j.recoverable?'↻ Resume':'↻ Retry'; retry.onclick = async () => { retry.disabled = true; try { await ensureDownloadLocation(); await api(endpoint(j,'retry'),{method:'POST'}); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { retry.disabled = false; } }; actions.append(retry); }
+  if (['failed','completed'].includes(j.status)) { const remove = document.createElement('button'); remove.className = 'remove-button'; remove.textContent = '×'; remove.setAttribute('aria-label','Remove '+j.title); remove.title = j.output_dir ? 'Remove from library; keep the saved file' : 'Remove video and history'; remove.onclick = async () => { try { await api('/api/jobs/'+encodeURIComponent(j.id),{method:'DELETE'}); if (playingId === j.id) $('player-dialog').close(); await refresh(); } catch(e) { notice(e.message); view('home'); } }; actions.append(remove); }
   row.append(cover,detail,actions); return row;
 }
 function render(target,list) {
-  const signature = JSON.stringify(list); if (rendered.get(target) === signature) return; rendered.set(target,signature);
+  const signature = JSON.stringify([list,locationSettings?.direct_enabled]); if (rendered.get(target) === signature) return; rendered.set(target,signature);
   const container = $(target), cache = cardCaches.get(target) || new Map(); cardCaches.set(target,cache);
   if (!list.length) { cache.clear(); container.innerHTML = '<div class="empty"><span class="empty-icon">▻</span><h3>Your library starts here.</h3><p>Add a video link, or change your search and filters.</p></div>'; return; }
   container.querySelector('.empty')?.remove();
   const ids = new Set(list.map(j => j.id));
   for (const [id,cached] of cache) if (!ids.has(id)) { cached.node.remove(); cache.delete(id); }
   list.forEach((j,index) => {
-    const signature = JSON.stringify(j), cached = cache.get(j.id);
+    const signature = JSON.stringify([j,locationSettings?.direct_enabled]), cached = cache.get(j.id);
     const focused = cached?.node.contains(document.activeElement);
     let node = cached?.node;
     if (!cached || (cached.signature !== signature && (!focused || cached.status !== j.status))) {
@@ -401,7 +453,7 @@ function refresh() {
   refreshing = (async () => {
     do {
       refreshAgain = false;
-      try { const [items,h,stats] = await Promise.all([api('/api/jobs',{timeout:10000}),api('/api/health',{timeout:10000}),api('/api/stats',{timeout:10000}).catch(() => null)]); jobs = items; renderAll(); renderStats(stats); $('health').textContent = h.version !== UI_VERSION ? '● Restart AAASoft Video Studio to apply update' : !h.ffmpeg ? '● FFmpeg missing' : h.ffprobe === false ? '● FFprobe missing' : !h.youtube_ejs ? '● YouTube dependency missing' : !h.js_runtimes?.length ? '● JavaScript runtime missing' : h.youtube_cooldown_seconds > 0 ? '● YouTube wait '+Math.ceil(h.youtube_cooldown_seconds/60)+'m' : '● Engine online'; }
+      try { const [items,h,stats,destination] = await Promise.all([api('/api/jobs',{timeout:10000}),api('/api/health',{timeout:10000}),api('/api/stats',{timeout:10000}).catch(() => null),api('/api/download-location',{timeout:10000}).catch(() => null)]); if (destination) applyDownloadLocation(destination); jobs = items; renderAll(); renderStats(stats); $('health').textContent = h.version !== UI_VERSION ? '● Restart AAASoft Video Studio to apply update' : !h.ffmpeg ? '● FFmpeg missing' : h.ffprobe === false ? '● FFprobe missing' : !h.youtube_ejs ? '● YouTube dependency missing' : !h.js_runtimes?.length ? '● JavaScript runtime missing' : h.youtube_cooldown_seconds > 0 ? '● YouTube wait '+Math.ceil(h.youtube_cooldown_seconds/60)+'m' : '● Engine online'; }
       catch(e) { $('health').textContent = '● Connection problem'; $('health').title = e.message; }
     } while (refreshAgain);
   })().finally(() => { refreshing = null; });

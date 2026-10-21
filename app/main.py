@@ -1,4 +1,5 @@
 import os
+import errno
 import importlib.util
 import json
 import shutil
@@ -16,7 +17,7 @@ from urllib.parse import urlparse, parse_qs
 from itertools import islice
 
 import yt_dlp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -25,6 +26,7 @@ from app import __version__
 from app.auth import AccessControl
 from app.threads import ThreadsIE
 from app import source_access
+from app import destinations
 
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get('DOWNLOAD_DIR', ROOT.parent / 'data')).resolve()
@@ -59,6 +61,7 @@ playlist_lock = threading.Lock()
 playlist_loads = {}
 playlist_load_lock = threading.Lock()
 playlist_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='playlist')
+folder_dialog_lock = threading.Lock()
 
 class VideoRequest(BaseModel):
     url: str = Field(max_length=2048)
@@ -81,6 +84,10 @@ class PlaylistDownloadRequest(BaseModel):
     format: str = 'mp4'
     quality: str = '720'
     youtube_concurrency: int = Field(default=1, ge=1, le=2)
+
+
+class FolderRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
 
 
 def validate_url(url):
@@ -117,10 +124,15 @@ def video_downloader(settings):
 def extract_video(url, download, settings):
     settings = settings.copy()
     playlist_cancel = settings.pop('_playlist_cancel', None)
+    phase = settings.pop('_playlist_phase', None)
     if not source_access.youtube_url(url):
         with video_downloader(settings) as dl:
             return dl.extract_info(url, download=download)
-    with source_access.youtube.request(download, wait=playlist_cancel is not None, cancel=playlist_cancel):
+    if phase:
+        phase('waiting_metadata', 0)
+    with source_access.youtube.request(download, wait=playlist_cancel is not None, cancel=playlist_cancel, metadata=not download):
+        if phase:
+            phase('fetching', 0)
         logger = source_access.SourceLogger()
         settings = source_access.authenticated_settings(settings) | {'logger': logger, 'sleep_interval_requests': 1, 'extractor_retries': 1}
         try:
@@ -133,6 +145,8 @@ def extract_video(url, download, settings):
                         if playlist_cancel is not None and playlist_cancel.is_set():
                             raise source_access.SourceCancelled('Playlist loading cancelled.')
                         entries.append(entry)
+                        if phase and len(entries) % 10 == 0:
+                            phase('reading_entries', len(entries))
                     result['entries'] = entries
                 if settings.get('lazy_playlist') and logger.terminal_rate_limit:
                     raise source_access.SourceRateLimited(600)
@@ -173,9 +187,9 @@ def cap_resolution(file, height, media):
     return media
 
 
-def make_thumbnail(file):
-    directory = file.parent / '_preview'
-    directory.mkdir(exist_ok=True)
+def make_thumbnail(file, cache_dir=None):
+    directory = cache_dir or file.parent / '_preview'
+    directory.mkdir(parents=True, exist_ok=True)
     target = directory / 'cover.jpg'
     if not target.is_file():
         temporary = directory / 'cover.tmp.jpg'
@@ -187,21 +201,21 @@ def make_thumbnail(file):
     return target
 
 
-def cached_playable(file, media):
+def cached_playable(file, media, cache_dir=None):
     if file.suffix == '.mp4' and media.get('video_codec') == 'h264' and media.get('video_pixel_format') == 'yuv420p' and media.get('audio_codec') in (None, 'aac', 'mp3'):
         return file
     if file.suffix in ('.mp3', '.m4a', '.wav'):
         return file
-    target = file.parent / '_preview' / 'browser.mp4'
+    target = (cache_dir or file.parent / '_preview') / 'browser.mp4'
     return target if target.is_file() else None
 
 
-def playable_file(file, media, progress=None):
-    ready = cached_playable(file, media)
+def playable_file(file, media, progress=None, cache_dir=None):
+    ready = cached_playable(file, media, cache_dir)
     if ready:
         return ready
-    directory = file.parent / '_preview'
-    directory.mkdir(exist_ok=True)
+    directory = cache_dir or file.parent / '_preview'
+    directory.mkdir(parents=True, exist_ok=True)
     target = directory / 'browser.mp4'
     if not target.is_file():
         temporary = directory / 'browser.tmp.mp4'
@@ -316,13 +330,75 @@ def index():
 def health():
     with lock:
         active = sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())
-    return {'application': 'StreamVault', 'version': app.version, 'status': 'ok', 'capabilities': {'youtube_playlists': True}, 'ffmpeg': bool(shutil.which('ffmpeg')), 'ffprobe': bool(shutil.which('ffprobe')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'youtube_cooldown_seconds': int(source_access.youtube.remaining()), 'active': active}
+    return {'application': 'StreamVault', 'version': app.version, 'status': 'ok', 'capabilities': {'youtube_playlists': True, 'direct_save': destinations.enabled()}, 'ffmpeg': bool(shutil.which('ffmpeg')), 'ffprobe': bool(shutil.which('ffprobe')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'youtube_cooldown_seconds': int(source_access.youtube.remaining()), 'active': active}
 
 
 def check_source_cooldown(url):
     if source_access.youtube_url(url) and source_access.youtube.remaining():
         exc = source_access.SourceRateLimited(source_access.youtube.remaining())
         raise HTTPException(429, str(exc), headers={'Retry-After': str(exc.retry_after)})
+
+
+def local_desktop(request):
+    return destinations.enabled() and request.client is not None and request.client.host in ('127.0.0.1', '::1') and request.url.hostname in ('localhost', '127.0.0.1', '::1')
+
+
+def require_local_desktop(request):
+    if not local_desktop(request):
+        raise HTTPException(403, 'Folder selection is available only in the local desktop launcher, on this computer.')
+
+
+@app.get('/api/download-location')
+def download_location(request: Request):
+    local = local_desktop(request)
+    path = destinations.selected(DATA) if local else None
+    return {'direct_enabled': local, 'path': path, 'configured': bool(path), 'available': bool(path and Path(path).is_dir())}
+
+
+@app.post('/api/download-location')
+def set_download_location(req: FolderRequest, request: Request):
+    require_local_desktop(request)
+    try:
+        destinations.configure(DATA, req.path)
+    except destinations.DestinationError as exc:
+        raise HTTPException(400, str(exc))
+    return download_location(request)
+
+
+@app.post('/api/download-location/pick')
+def pick_download_location(request: Request):
+    require_local_desktop(request)
+    if not folder_dialog_lock.acquire(blocking=False):
+        raise HTTPException(409, 'The folder dialog is already open. Choose or cancel that dialog first.')
+    try:
+        path = destinations.picker(destinations.selected(DATA))
+        if path:
+            destinations.configure(DATA, path)
+        return download_location(request) | {'cancelled': not bool(path)}
+    except (destinations.DestinationError, subprocess.TimeoutExpired, OSError) as exc:
+        raise HTTPException(503, str(exc) if isinstance(exc, destinations.DestinationError) else 'The folder dialog could not finish. Enter a folder path instead.')
+    finally:
+        folder_dialog_lock.release()
+
+
+@app.post('/api/download-location/open')
+def open_selected_download_folder(request: Request):
+    require_local_desktop(request)
+    path = destinations.selected(DATA)
+    if not path or not Path(path).is_dir():
+        raise HTTPException(409, 'Choose an available download folder first.')
+    try:
+        destinations.open_folder(Path(path))
+    except (destinations.DestinationError, OSError):
+        raise HTTPException(503, 'The file manager could not open. Open the displayed folder path manually.')
+    return {'opened': True}
+
+
+def destination_snapshot():
+    try:
+        return destinations.snapshot(DATA)
+    except destinations.DestinationError as exc:
+        raise HTTPException(409, str(exc))
 
 
 @app.post('/api/analyze')
@@ -352,7 +428,7 @@ def update(job_id, **values):
     with lock:
         previous_status = jobs[job_id]['status']
         jobs[job_id].update(values)
-        if jobs[job_id]['status'] != previous_status or jobs[job_id]['status'] in ('completed', 'failed'):
+        if jobs[job_id]['status'] != previous_status or jobs[job_id]['status'] in ('completed', 'failed') or 'planned_filename' in values:
             storage.save(DATA, jobs[job_id])
 
 
@@ -372,12 +448,12 @@ def playlist_url(url):
     return 'https://www.youtube.com/playlist?list=' + ids[0]
 
 
-def build_playlist(req, cancel=None):
+def build_playlist(req, cancel=None, phase=None):
     url = playlist_url(req.url)
     try:
         info = extract_video(url, False, options() | {'noplaylist': False, 'extract_flat': 'in_playlist', 'lazy_playlist': True,
                                                     'playlistend': MAX_PLAYLIST + 1, 'ignoreerrors': True} |
-                             ({'_playlist_cancel': cancel} if cancel is not None else {}))
+                             ({'_playlist_cancel': cancel, '_playlist_phase': phase} if cancel is not None else {}))
         if cancel is not None and cancel.is_set():
             raise source_access.SourceCancelled('Playlist loading cancelled.')
         if not info or info.get('_type') != 'playlist':
@@ -399,7 +475,9 @@ def build_playlist(req, cancel=None):
             seen.add(video_id)
             videos.append({'id': video_id, 'url': 'https://www.youtube.com/watch?v=' + video_id,
                            'title': str(entry.get('title') or 'YouTube video')[:500], 'duration': entry.get('duration'),
-                           'position': position, 'platform': 'YouTube', 'thumbnail': entry.get('thumbnail')})
+                           'position': position, 'platform': 'YouTube', 'thumbnail': entry.get('thumbnail') or
+                           next((t.get('url') for t in reversed(entry.get('thumbnails') or []) if isinstance(t, dict) and isinstance(t.get('url'), str) and t['url'].startswith('https://')), None) or
+                           'https://i.ytimg.com/vi/' + video_id + '/hqdefault.jpg'})
         if not videos:
             raise HTTPException(422, 'No available videos were found in this playlist. Check its visibility and source access.')
         token = uuid.uuid4().hex
@@ -428,11 +506,14 @@ def build_playlist(req, cancel=None):
 def load_playlist(load_id, req):
     with playlist_load_lock:
         item = playlist_loads[load_id]
-        item['status'] = 'loading'
+        item.update(status='loading', started=time.time(), phase='waiting_metadata', entries=0)
     try:
         if item['cancel'].is_set():
             raise source_access.SourceCancelled()
-        result = build_playlist(req, item['cancel'])
+        def phase(name, entries):
+            with playlist_load_lock:
+                item.update(phase=name, entries=entries)
+        result = build_playlist(req, item['cancel'], phase)
         with playlist_load_lock:
             item.update(status='cancelled' if item['cancel'].is_set() else 'ready', result=result)
     except source_access.SourceCancelled:
@@ -481,7 +562,7 @@ def playlist_load_status(load_id: str):
         item = playlist_loads.get(load_id)
         if not item:
             raise HTTPException(404, 'Playlist load expired. Load the playlist again.')
-        return {'id': load_id, **{k: item[k] for k in ('status', 'result', 'detail') if k in item}}
+        return {'id': load_id, **{k: item[k] for k in ('status', 'result', 'detail', 'phase', 'started', 'entries') if k in item}}
 
 
 @app.delete('/api/playlist/loads/{load_id}', status_code=204)
@@ -515,8 +596,9 @@ def download_playlist(req: PlaylistDownloadRequest):
 
 
 def run_download(job_id, req):
-    folder = DATA / job_id
+    folder = None
     recovered = None
+    verified = None
     def progress(event):
         if event['status'] == 'downloading':
             total = event.get('total_bytes') or event.get('total_bytes_estimate') or 0
@@ -530,7 +612,17 @@ def run_download(job_id, req):
             name = event.get('postprocessor', '')
             update(job_id, status='processing', stage='merging' if 'Merger' in name else 'converting', stage_started=time.time(), progress=99)
     try:
-        recovered = recover_file(folder, req) if jobs[job_id].get('recoverable') else None
+        job = jobs[job_id]
+        folder = destinations.work_folder(DATA, job)
+        if job.get('recoverable'):
+            planned = job.get('planned_filename')
+            if job.get('output_dir') and planned:
+                candidate = saved_path(job | {'filename': planned})
+                if candidate and recoverable_media(candidate, req, job):
+                    recovered = candidate
+            recovered = recovered or recover_file(folder, req)
+            if not recovered and job.get('legacy_recovery'):
+                recovered = recover_file(DATA / job_id, req)
         opts = ({} if recovered else options()) | {'outtmpl': str(folder / '%(title).120B.%(ext)s'), 'progress_hooks': [progress], 'postprocessor_hooks': [postprocess], 'max_filesize': 2 * 1024**3, 'playlistend': 1}
         if req.format in ('mp3', 'm4a', 'wav'):
             opts |= {'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': req.format, 'preferredquality': '192'}]}
@@ -541,8 +633,13 @@ def run_download(job_id, req):
         # Interrupted attempts can leave stale originals and browser previews behind.
         if folder.exists() and not recovered:
             shutil.rmtree(folder)
-        folder.mkdir(parents=True, exist_ok=True)
-        if not recovered and shutil.disk_usage(DATA).free < 256 * 1024**2:
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            if job.get('output_dir'):
+                raise destinations.DestinationError('The selected folder is not writable. Check the drive and folder permissions, then Retry.') from None
+            raise
+        if not recovered and shutil.disk_usage(folder).free < 256 * 1024**2:
             raise RuntimeError('Insufficient free disk space')
         if recovered:
             info = {'title': jobs[job_id].get('title', recovered.stem), 'thumbnail': jobs[job_id].get('thumbnail'), 'extractor_key': jobs[job_id].get('platform')}
@@ -553,7 +650,7 @@ def run_download(job_id, req):
             raise RuntimeError('Choose individual, non-live video links. Playlists and channels are not supported by the bulk queue.')
         update(job_id, status='processing', stage='verifying', stage_started=time.time(), progress=99)
         files = [p for p in folder.iterdir() if p.suffix == '.' + req.format]
-        if not files:
+        if not files and not recovered:
             raise RuntimeError('No output file')
         file = recovered or max(files, key=lambda p: p.stat().st_size)
         media = describe_media(file)
@@ -567,31 +664,86 @@ def run_download(job_id, req):
             if media.get('actual_height', 0) and media['actual_height'] > int(req.quality):
                 update(job_id, stage='resizing', stage_started=time.time())
             media = cap_resolution(file, int(req.quality), media)
-        preview_available = bool(cached_playable(file, media))
+        verified = file
+        if job.get('output_dir'):
+            file = publish_original(job_id, file)
+            verified = file
+        preview_available = bool(cached_playable(file, media, **preview_kwargs(job)))
         duration = media.pop('duration', 0) or info.get('duration')
         update(job_id, status='completed', progress=100, completed_at=time.time(), completion_id=uuid.uuid4().hex, title=info.get('title', file.stem), filename=file.name, size=file.stat().st_size,
                thumbnail=info.get('thumbnail'), duration=duration, platform=info.get('extractor_key'), preview_available=preview_available,
-               preview_status='ready' if preview_available else 'not_requested', preview_progress=100 if preview_available else 0, stage='ready', recoverable=False, **media)
+               preview_status='ready' if preview_available else 'not_requested', preview_progress=100 if preview_available else 0, stage='ready', recoverable=False, legacy_recovery=False, **media)
+        if job.get('output_dir'):
+            shutil.rmtree(folder, ignore_errors=True)
+            try:
+                folder.parent.rmdir()
+            except OSError:
+                pass  # Other downloads may still be using this staging directory.
     except Exception as exc:
-        message = 'Not enough free disk space. Free space and retry.' if 'disk space' in str(exc).lower() else download_error(exc)
+        message = str(exc) if isinstance(exc, destinations.DestinationError) else 'Not enough free disk space. Free space and retry.' if 'disk space' in str(exc).lower() else download_error(exc)
         if req.format in ('mp3', 'm4a', 'wav') and 'requested format' in str(exc).lower():
             message = 'No compatible audio stream is available. The source may contain video only; try MP4.'
         # Finish cleanup before Retry can see a failed job and start a new attempt.
-        if not recovered:
+        if folder is not None and not recovered and not verified:
             shutil.rmtree(folder, ignore_errors=True)
-        update(job_id, status='failed', error=message)
+        update(job_id, status='failed', error=message, recoverable=bool(recovered or verified))
+
+
+def preview_kwargs(job):
+    return {'cache_dir': DATA / job['id'] / '_preview'} if job.get('output_dir') else {}
+
+
+def publish_original(job_id, file):
+    job = jobs[job_id]
+    root = Path(job['output_dir']).resolve()
+    if file.parent.resolve() == root:
+        return file
+    target = None
+    for _ in range(5):
+        name = file.stem + ' [' + job_id[:8] + ('-' + uuid.uuid4().hex[:4] if _ else '') + ']' + file.suffix
+        candidate = root / name
+        try:
+            with candidate.open('xb'):
+                pass
+            target = candidate
+            break
+        except FileExistsError:
+            continue
+        except OSError:
+            raise destinations.DestinationError('The selected folder cannot be written. Reconnect the drive or check its permissions, then Retry.') from None
+    if target is None:
+        raise destinations.DestinationError('A unique output filename could not be reserved. Retry the download.')
+    try:
+        update(job_id, planned_filename=target.name, stage='saving')
+        # New downloads are staged on this same filesystem: rename, not a second copy.
+        try:
+            file.replace(target)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            # Only legacy recovery/mounted filesystem boundaries need a move via copy.
+            shutil.copy2(file, target)
+            file.unlink()
+    except Exception:
+        if target.is_file() and (file.exists() or target.stat().st_size == 0):
+            target.unlink()
+        raise
+    return target
+
+
+def recoverable_media(file, req, job):
+    media = describe_media(file)
+    expected = job.get('duration') or 0
+    if media.get('duration', 0) < max(0.1, expected - 2):
+        return False
+    return bool(media.get('video_codec') if req.format in ('mp4', 'mkv', 'webm') else media.get('has_audio'))
 
 
 def recover_file(folder, req):
     for file in sorted(folder.glob('*.' + req.format), key=lambda p: p.stat().st_size, reverse=True):
         if re.search(r'\.f\d+|\.scaled$', file.stem):
             continue
-        media = describe_media(file)
-        expected = jobs[folder.name].get('duration') or 0
-        if media.get('duration', 0) < max(0.1, expected - 2):
-            continue
-        has_track = media.get('video_codec') if req.format in ('mp4', 'mkv', 'webm') else media.get('has_audio')
-        if has_track:
+        if recoverable_media(file, req, jobs[folder.name]):
             return file
     return None
 
@@ -619,6 +771,7 @@ def download(req: DownloadRequest):
         raise HTTPException(400, 'Unsupported format or quality.')
     if not all(shutil.which(tool) for tool in ('ffmpeg', 'ffprobe')):
         raise HTTPException(503, 'Install FFmpeg and FFprobe to enable verified downloads and conversion.')
+    destination = destination_snapshot()
     with lock:
         if sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values()) >= MAX_ACTIVE:
             raise HTTPException(429, 'Queue is full. Wait for a download to finish.')
@@ -626,6 +779,7 @@ def download(req: DownloadRequest):
             raise HTTPException(429, 'History is full. Remove older downloads first.')
         job_id = uuid.uuid4().hex
         job = {'id': job_id, 'url': req.url, 'title': 'Preparing download', 'format': req.format, 'quality': req.quality, 'status': 'queued', 'progress': 0, 'created': time.time()}
+        job.update(destination)
         cached = analysis_cache.get(req.url)
         if cached and time.monotonic() - cached[0] < 900:
             job.update(cached[1])
@@ -653,6 +807,7 @@ def queue_batch(input_urls, req, active_limit=MAX_ACTIVE, metadata=None):
         raise HTTPException(400, 'Unsupported format or quality.')
     if not all(shutil.which(tool) for tool in ('ffmpeg', 'ffprobe')):
         raise HTTPException(503, 'Install FFmpeg and FFprobe to enable downloads.')
+    destination = destination_snapshot()
     pending = []
     with lock:
         available = min(active_limit - sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values()), MAX_HISTORY - len(jobs))
@@ -660,6 +815,7 @@ def queue_batch(input_urls, req, active_limit=MAX_ACTIVE, metadata=None):
             raise HTTPException(429, f'Only {max(0, available)} queue/history slots are available. Submit fewer links or remove old history.')
         for item in requests:
             job = {'id': uuid.uuid4().hex, 'url': item.url, 'title': 'Queued video', 'format': item.format, 'quality': item.quality, 'created': time.time(), 'status': 'queued', 'stage': 'queued', 'progress': 0}
+            job.update(destination)
             cached = analysis_cache.get(item.url)
             if cached and time.monotonic() - cached[0] < 900:
                 job.update(cached[1])
@@ -697,6 +853,10 @@ def retry_job(job_id: str):
         if not all(shutil.which(tool) for tool in ('ffmpeg', 'ffprobe')):
             raise HTTPException(503, 'Install FFmpeg and FFprobe to enable verified downloads and conversion.')
         pending = {key: value for key, value in job.items() if key not in ('error', 'filename', 'size', 'preview_available', 'preview_status', 'preview_error', 'preview_progress', 'video_codec', 'video_pixel_format', 'audio_codec', 'actual_height', 'has_audio')}
+        if not pending.get('output_dir'):
+            pending.update(destination_snapshot())
+            if pending.get('output_dir') and pending.get('recoverable'):
+                pending['legacy_recovery'] = True
         pending.update(status='queued', progress=0, speed=None, eta=None)
         save_queued(pending)
         jobs[job_id] = pending
@@ -753,7 +913,7 @@ def completed_file(job_id):
 def saved_path(job):
     if not job.get('filename'):
         return None
-    folder = (DATA / job['id']).resolve()
+    folder = Path(job['output_dir']).resolve() if job.get('output_dir') else (DATA / job['id']).resolve()
     file = (folder / job['filename']).resolve()
     return file if file.is_relative_to(folder) and file.is_file() else None
 
@@ -767,8 +927,8 @@ def media_lock(job_id):
 
 @app.get('/api/jobs/{job_id}/thumbnail')
 def get_thumbnail(job_id: str):
-    file, _ = completed_file(job_id)
-    cached = file.parent / '_preview' / 'cover.jpg'
+    file, job = completed_file(job_id)
+    cached = (preview_kwargs(job).get('cache_dir') or file.parent / '_preview') / 'cover.jpg'
     if cached.is_file():
         return FileResponse(cached, media_type='image/jpeg', headers={'Cache-Control': 'private, max-age=86400'})
     if jobs[job_id].get('preview_status') == 'processing':
@@ -778,7 +938,7 @@ def get_thumbnail(job_id: str):
         if job.get('format') not in ('mp4', 'mkv', 'webm'):
             raise HTTPException(404, 'No video thumbnail is available.')
         try:
-            thumbnail = make_thumbnail(file)
+            thumbnail = make_thumbnail(file, **preview_kwargs(job))
             return FileResponse(thumbnail, media_type='image/jpeg', headers={'Cache-Control': 'private, max-age=86400'})
         except (OSError, subprocess.SubprocessError):
             raise HTTPException(404, 'Thumbnail is unavailable.')
@@ -790,7 +950,7 @@ def stream_file(job_id: str, original: bool = False):
     types = {'.mp4': 'video/mp4', '.webm': 'video/webm', '.mkv': 'video/x-matroska', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.wav': 'audio/wav'}
     if original:
         return FileResponse(file, media_type=types.get(file.suffix, 'application/octet-stream'), headers={'Cache-Control': 'private, no-cache'})
-    preview = cached_playable(file, job if 'video_pixel_format' in job else describe_media(file))
+    preview = cached_playable(file, job if 'video_pixel_format' in job else describe_media(file), **preview_kwargs(job))
     if not preview:
         raise HTTPException(409, 'Prepare the browser preview first. The original file is already available.', headers={'Retry-After': '2'})
     return FileResponse(preview, media_type=types.get(preview.suffix, 'application/octet-stream'), headers={'Cache-Control': 'private, no-cache'})
@@ -815,7 +975,7 @@ def build_preview(job_id):
                     if percent != last:
                         last = percent
                         update(job_id, preview_progress=percent)
-                playable_file(file, media, progress=progress)
+                playable_file(file, media, progress=progress, **preview_kwargs(job))
                 update(job_id, preview_available=True, preview_status='ready', preview_progress=100, preview_error=None)
             except Exception:
                 update(job_id, preview_available=False, preview_status='failed', preview_progress=0,
@@ -830,7 +990,7 @@ def prepare_preview(job_id: str):
     if job.get('preview_status') in ('queued', 'processing'):
         return preview_state(job)
     media = job if 'video_pixel_format' in job else describe_media(file)
-    if cached_playable(file, media):
+    if cached_playable(file, media, **preview_kwargs(job)):
         update(job_id, preview_available=True, preview_status='ready', preview_progress=100)
         return preview_state(job)
     with lock:
@@ -855,6 +1015,17 @@ def get_preview(job_id: str):
     return preview_state(job)
 
 
+@app.post('/api/jobs/{job_id}/open-folder')
+def open_download_folder(job_id: str, request: Request):
+    require_local_desktop(request)
+    file, _ = completed_file(job_id)
+    try:
+        destinations.open_folder(file.parent)
+    except (destinations.DestinationError, OSError):
+        raise HTTPException(503, 'The file manager could not open. Open the displayed download folder path manually.')
+    return {'opened': True}
+
+
 @app.delete('/api/jobs/{job_id}')
 def remove_job(job_id: str):
     guard = media_lock(job_id)
@@ -871,6 +1042,11 @@ def remove_job(job_id: str):
             del jobs[job_id]
             preview_locks.pop(job_id, None)
         shutil.rmtree(DATA / job_id, ignore_errors=True)
+        if job.get('output_dir'):
+            try:
+                shutil.rmtree(destinations.work_folder(DATA, job), ignore_errors=True)
+            except destinations.DestinationError:
+                pass
     finally:
         guard.release()
     return {'removed': True}
