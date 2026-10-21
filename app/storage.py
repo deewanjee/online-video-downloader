@@ -22,6 +22,12 @@ def save(directory, job):
         connection.execute('INSERT OR REPLACE INTO jobs VALUES (?, ?)', (job['id'], json.dumps(job)))
 
 
+def save_many(directory, jobs):
+    records = [(job['id'], json.dumps(job)) for job in jobs]
+    with connect(directory) as connection:
+        connection.executemany('INSERT OR REPLACE INTO jobs VALUES (?, ?)', records)
+
+
 def delete(directory, job_id):
     with connect(directory) as connection:
         connection.execute('DELETE FROM jobs WHERE id = ?', (job_id,))
@@ -33,7 +39,11 @@ def restore(directory):
         jobs = {job['id']: job for job in records}
         for job in jobs.values():
             if job['status'] in ('queued', 'downloading', 'processing'):
+                job['recoverable'] = job['status'] == 'processing'
                 job.update(status='failed', progress=0, speed=None, eta=None,
                            error='Interrupted by a server restart. Use Retry to download again.')
+                connection.execute('UPDATE jobs SET payload = ? WHERE id = ?', (json.dumps(job), job['id']))
+            if job.get('preview_status') in ('queued', 'processing'):
+                job.update(preview_status='not_requested', preview_available=False, preview_progress=0)
                 connection.execute('UPDATE jobs SET payload = ? WHERE id = ?', (json.dumps(job), job['id']))
     return jobs

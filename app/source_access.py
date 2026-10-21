@@ -20,9 +20,35 @@ class SourceBusy(RuntimeError):
     retry_after = 5
 
 
+class TransferSlots:
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.limit = 1
+        self.active = 0
+
+    def set_limit(self, limit):
+        with self.condition:
+            self.limit = limit
+            self.condition.notify_all()
+
+    def acquire(self, blocking=True):
+        with self.condition:
+            while self.active >= self.limit:
+                if not blocking:
+                    return False
+                self.condition.wait()
+            self.active += 1
+            return True
+
+    def release(self):
+        with self.condition:
+            self.active -= 1
+            self.condition.notify_all()
+
+
 class YoutubeAccess:
     def __init__(self):
-        self.slot = threading.Lock()
+        self.slot = TransferSlots()
         self.state = threading.Lock()
         self.until = 0
 

@@ -1,0 +1,15 @@
+# Bulk downloads and non-blocking playback
+
+The supplied Windows terminal log shows that download/merge completed into MP4 using AV1 video (itag 399) and Opus audio (itag 251). The old application then encoded a full compatible preview inside each download worker before marking the original completed. Two long encodes could occupy both download workers and keep subsequent jobs queued; the UI called merging and conversion "Preparing preview" as well.
+
+The new flow marks the verified original completed before optional preview work. Thumbnails are generated on demand. The player first tries MP4/WebM originals directly; modern Chromium successfully played the AV1/Opus test file. Unsupported playback, or the manual **Use compatible preview** button, starts a separate preview worker. Its 720p H.264/AAC output uses two CPU threads and reports elapsed time/progress, with a thirty-minute encoding limit. App shutdown kills active preview processes. Original saving and the download queue remain available during preview generation.
+
+Bulk download accepts 1–50 direct links, deduplicates exact matches, checks every URL/format and available capacity before committing the batch transaction, and starts up to two download workers. YouTube defaults to one transfer; selecting two parallel transfers raises the running workspace's bounded YouTube gate to two. Existing cooldown/verification behavior is retained. Playlists/channels are rejected by the batch form/API. Worker submission failures produce retriable failed jobs rather than stranded queued entries.
+
+On restart, interrupted finalization jobs become retriable with a recovery flag. Retry checks final files against expected duration and skips separate format components and partial scaled outputs. A valid merged file can finish locally without a source request. Other incomplete jobs restart normally. Interrupted optional previews do not fail completed originals.
+
+## Verification
+
+- 92 backend tests passed locally and inside the fresh Docker image as its unprivileged user. Coverage includes actual six-format media transfer/conversion, byte-range delivery, batch validation/deduplication/capacity/rollback, source concurrency, completed-file recovery, preview failure/shutdown and queue throughput while preview work is blocked.
+- Chromium end-to-end checks submitted a batch of three unique video URLs (plus one duplicate) through the real bulk form. All originals completed with no preview encoding. The generated AV1/Opus MP4 played natively. During a deliberately delayed compatible preview, a second batch of two files also completed. The compatible H.264 preview then played, original saving worked, the player closed cleanly, and invalid batch input remained editable. No JavaScript errors were observed.
+- The browser test uses a local source adapter with real generated media, real FastAPI queues, FFprobe, FFmpeg and browser streaming. It does not claim five live YouTube downloads or removal of YouTube access restrictions. Native Windows execution and Firefox/Safari were not exercised by these cloud checks.

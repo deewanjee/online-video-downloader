@@ -19,6 +19,8 @@ for (const id of ['platform-grid','all-platforms']) {
 let analyzed = null, jobs = [], busy = false, playingId = null;
 let analysisVersion = 0, analysisController = null, refreshing = null, refreshAgain = false;
 let noticeTimer = null;
+let playerVersion = 0, previewTimer = null, previewController = null;
+let originalFallback = null, originalTimer = null;
 const rendered = new Map();
 function view(name) {
   for (const n of ['home','downloads','platforms']) $(n).hidden = n !== name;
@@ -110,22 +112,76 @@ $('download-button').onclick = async () => {
     notice('Added to your collection. Play or save it when processing is complete.'); await refresh();
   } catch(e) { notice(e.message,e.retryAfter); } finally { $('download-button').disabled = false; }
 };
+$('bulk-format').onchange = () => { $('bulk-quality-label').hidden = audioFormats.includes($('bulk-format').value); };
+$('bulk-form').onsubmit = async event => {
+  event.preventDefault();
+  const urls = $('bulk-urls').value.trim().split(/\s+/).filter(Boolean), box = $('bulk-message');
+  box.hidden = false;
+  if (!urls.length || urls.length > 50) { box.textContent = 'Paste between 1 and 50 video links, one per line.'; return; }
+  $('bulk-button').disabled = true; box.textContent = 'Adding your videos to the queue…';
+  try {
+    const result = await api('/api/download/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls,format:$('bulk-format').value,quality:$('bulk-quality').value,youtube_concurrency:Number($('bulk-concurrency').value)})});
+    box.textContent = result.added+' videos added.'+(result.duplicates_removed?' '+result.duplicates_removed+' repeated links skipped.':'')+(result.submission_failures?' '+result.submission_failures+' jobs could not start; use Retry after restarting the app.':' Originals will be ready to save before optional preview encoding.');
+    $('bulk-urls').value = ''; await refresh();
+  } catch(e) { box.textContent = e.message; }
+  finally { $('bulk-button').disabled = false; }
+};
 function stopPlayer() {
+  playerVersion++; clearTimeout(previewTimer); previewController?.abort(); previewController = null;
+  clearTimeout(originalTimer); originalFallback = null;
+  $('compatible-preview').hidden = true; $('compatible-preview').onclick = null;
   for (const id of ['video-player','audio-player']) { const media = $(id); media.pause(); media.removeAttribute('src'); media.load(); }
   playingId = null;
 }
-function playJob(j) {
+async function playJob(j) {
   stopPlayer(); playingId = j.id; $('player-title').textContent = j.title; $('player-save').href = endpoint(j,'file'); $('player-error').hidden = true;
-  const audio = audioFormats.includes(j.format); $('video-player').hidden = audio; $('audio-player').hidden = !audio;
+  const version = playerVersion, audio = audioFormats.includes(j.format);
+  $('video-player').hidden = true; $('audio-player').hidden = true; $('preview-wait').hidden = false;
+  $('preview-status').textContent = 'Checking your browser preview…'; $('preview-progress').value = 0;
   const player = $(audio ? 'audio-player' : 'video-player');
   if (!audio) player.poster = endpoint(j,'thumbnail');
-  $('player-dialog').showModal(); player.src = endpoint(j,'stream'); player.load();
-  player.play().catch(() => { /* Native controls remain available if autoplay is blocked. */ });
+  if (!$('player-dialog').open) $('player-dialog').showModal();
+  previewController = new AbortController();
+  async function check(start) {
+    if (version !== playerVersion || !previewController) return;
+    try {
+      const state = await api(endpoint(j,'preview'),{method:start?'POST':'GET',signal:previewController.signal,timeout:30000});
+      if (version !== playerVersion) return;
+      if (state.status === 'ready') {
+        $('preview-wait').hidden = true; player.hidden = false; player.src = state.stream_url; player.load();
+        player.play().catch(() => {}); return;
+      }
+      if (state.status === 'failed') throw Error(state.error || 'Preview could not finish. Save original is available.');
+      $('preview-progress').value = state.progress || 0;
+      $('preview-status').textContent = state.status === 'processing' ? 'Preparing preview · '+(state.progress || 0)+'%'+(state.started?' · '+duration(Math.max(0,Date.now()/1000-state.started))+' elapsed':'') : 'Preview queued. Your original is already ready to save.';
+      previewTimer = setTimeout(() => check(false),2000);
+    } catch(e) {
+      if (version !== playerVersion || e.name === 'AbortError') return;
+      $('preview-wait').hidden = true; $('player-error').hidden = false; $('player-error').textContent = e.message;
+    }
+  }
+  if (!audio && ['mp4','webm'].includes(j.format)) {
+    originalFallback = () => {
+      if (version !== playerVersion) return;
+      $('compatible-preview').hidden = true;
+      clearTimeout(originalTimer); originalFallback = null;
+      player.pause(); player.removeAttribute('src'); player.load(); player.hidden = true;
+      $('preview-wait').hidden = false; check(true);
+    };
+    $('compatible-preview').hidden = false; $('compatible-preview').onclick = originalFallback;
+    $('preview-wait').hidden = true; player.hidden = false;
+    player.src = endpoint(j,'stream')+'?original=true'; player.load(); player.play().catch(() => {});
+    originalTimer = setTimeout(() => { if (version === playerVersion && player.readyState < 2) originalFallback?.(); },15000);
+    return;
+  }
+  await check(true);
 }
 for (const id of ['video-player','audio-player']) $(id).onerror = () => {
+  if (originalFallback) { originalFallback(); return; }
   if (!playingId) return; $('player-error').hidden = false;
   $('player-error').textContent = 'This preview could not be played in your browser. Use Save original to play the downloaded file on your device.';
 };
+$('video-player').onloadeddata = () => { clearTimeout(originalTimer); originalFallback = null; };
 $('close-player').onclick = () => $('player-dialog').close(); $('player-dialog').onclose = stopPlayer;
 $('player-dialog').onclick = event => { if (event.target !== $('player-dialog')) return; const rect = $('player-dialog').getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) $('player-dialog').close(); };
 function render(target,list) {
@@ -136,21 +192,24 @@ function render(target,list) {
     const row = document.createElement('article'); row.className = 'job '+j.status;
     const cover = document.createElement('div'); cover.className = 'cover'; placeholder(cover,sourceName(j));
     image(cover,j.status === 'completed' && !audioFormats.includes(j.format) ? endpoint(j,'thumbnail') : j.thumbnail,'Thumbnail for '+j.title);
-    const badge = document.createElement('span'); badge.className = 'status-badge'+(j.status === 'failed' ? ' failed' : ''); badge.textContent = {completed:'In your vault',failed:'Needs attention',queued:'Queued',processing:'Preparing preview',downloading:'Downloading · '+j.progress+'%'}[j.status] || j.status; cover.append(badge);
+    const stages = {extracting:'Getting video',downloading:'Downloading',merging:'Merging audio + video',converting:'Converting format',resizing:'Resizing video',verifying:'Checking file'};
+    const badge = document.createElement('span'); badge.className = 'status-badge'+(j.status === 'failed' ? ' failed' : ''); badge.textContent = {completed:'Downloaded',failed:'Needs attention',queued:'Queued',processing:stages[j.stage] || 'Finishing file',downloading:(stages[j.stage] || 'Downloading')+' · '+j.progress+'%'}[j.status] || j.status; cover.append(badge);
     if (j.duration) { const time = document.createElement('span'); time.className = 'cover-duration'; time.textContent = duration(j.duration); cover.append(time); }
-    const playable = j.status === 'completed' && j.preview_available !== false;
+    const playable = j.status === 'completed';
     if (playable) { const p = document.createElement('button'); p.className = 'cover-play'; p.append(icon('play')); p.setAttribute('aria-label','Play '+j.title); p.onclick = () => playJob(j); cover.append(p); }
     const detail = document.createElement('div'); detail.className = 'job-details';
     const platform = document.createElement('div'); platform.className = 'job-platform'; platform.textContent = sourceName(j);
     const title = document.createElement('div'); title.className = 'job-title'; title.textContent = j.title; title.title = j.title;
     const meta = document.createElement('div'); meta.className = 'job-meta'; meta.textContent = j.format.toUpperCase()+' · '+(audioFormats.includes(j.format) ? 'Audio' : (j.actual_height || j.quality)+'p')+(j.size ? ' · '+(j.size/1024/1024).toFixed(1)+' MB' : '')+(j.has_audio === false ? ' · No audio track' : '');
-    const status = document.createElement('div'); status.className = 'status'+(j.status === 'failed' ? ' failed' : '')+(j.preview_available === false ? ' needs-attention' : ''); status.textContent = j.error || (j.status === 'completed' ? j.preview_available === false ? 'Preview unavailable · Save the original' : 'Ready for a replay' : j.status === 'processing' ? 'Finishing your file and browser preview…' : 'We’re bringing this one home.');
+    const previewPending = j.status === 'completed' && j.preview_status !== 'ready';
+    const status = document.createElement('div'); status.className = 'status'+(j.status === 'failed' ? ' failed' : '')+(previewPending?' preview-note':'');
+    status.textContent = j.error || (j.status === 'completed' ? j.preview_status === 'processing' ? 'Original ready · Preview encoding '+(j.preview_progress || 0)+'%' : j.preview_status === 'queued' ? 'Original ready · Preview queued separately' : j.preview_status === 'failed' ? 'Original ready · Preview failed; press Play to retry' : j.preview_available ? 'Ready for a replay' : 'Original ready · Play prepares a browser preview' : j.status === 'queued' ? 'Waiting for a download slot' : (stages[j.stage] || 'Downloading your video')+(j.stage_started?' · '+duration(Math.max(0,Date.now()/1000-j.stage_started))+' elapsed':''));
     detail.append(platform,title,meta,status);
     if (['queued','downloading','processing'].includes(j.status)) { const progress = document.createElement('progress'); progress.max = 100; progress.value = j.progress; progress.setAttribute('aria-label','Download progress'); detail.append(progress); }
     const actions = document.createElement('div'); actions.className = 'job-actions';
-    if (playable) { const p = document.createElement('button'); p.className = 'play-button'; p.append(icon('play'),document.createTextNode(' Play')); p.onclick = () => playJob(j); actions.append(p); }
+    if (playable) { const p = document.createElement('button'); p.className = 'play-button'; p.append(icon('play'),document.createTextNode(j.preview_status === 'failed'?' Retry preview':' Play')); p.onclick = () => playJob(j); actions.append(p); }
     if (j.status === 'completed') { const a = document.createElement('a'); a.href = endpoint(j,'file'); a.textContent = '↓ Save original'; actions.append(a); }
-    if (j.status === 'failed') { const retry = document.createElement('button'); retry.className = 'retry-button'; retry.textContent = '↻ Try again'; retry.onclick = async () => { retry.disabled = true; try { await api('/api/jobs/'+encodeURIComponent(j.id)+'/retry',{method:'POST'}); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { retry.disabled = false; } }; actions.append(retry); }
+    if (j.status === 'failed') { const retry = document.createElement('button'); retry.className = 'retry-button'; retry.textContent = j.recoverable ? '↻ Resume / Retry' : '↻ Try again'; retry.onclick = async () => { retry.disabled = true; try { await api('/api/jobs/'+encodeURIComponent(j.id)+'/retry',{method:'POST'}); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { retry.disabled = false; } }; actions.append(retry); }
     if (['failed','completed'].includes(j.status)) { const remove = document.createElement('button'); remove.className = 'remove-button'; remove.textContent = '×'; remove.setAttribute('aria-label','Remove '+j.title); remove.onclick = async () => { try { await api('/api/jobs/'+encodeURIComponent(j.id),{method:'DELETE'}); if (playingId === j.id) $('player-dialog').close(); await refresh(); } catch(e) { notice(e.message); view('home'); } }; actions.append(remove); }
     row.append(cover,detail,actions); container.append(row);
   }

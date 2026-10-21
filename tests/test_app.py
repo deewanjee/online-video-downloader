@@ -92,6 +92,7 @@ def test_real_download_and_conversion(tmp_path, monkeypatch, output):
         response = client.get(f'/api/jobs/{job_id}/file')
         assert response.status_code == 200
         assert len(response.content) > 1000
+        assert client.post(f'/api/jobs/{job_id}/preview').status_code == 202
         stream = client.get(f'/api/jobs/{job_id}/stream', headers={'Range': 'bytes=0-99'})
         assert stream.status_code == 206
         assert len(stream.content) == 100
@@ -127,6 +128,10 @@ def test_real_download_and_conversion(tmp_path, monkeypatch, output):
 
 @pytest.fixture(autouse=True)
 def isolate_history(tmp_path, monkeypatch):
+    class ImmediatePreview:
+        def submit(self, function, *args):
+            function(*args)
+    monkeypatch.setattr(main, 'preview_pool', ImmediatePreview())
     monkeypatch.setattr(main, 'DATA', tmp_path)
     monkeypatch.setattr(main, 'jobs', {})
     monkeypatch.setattr(main, 'analysis_cache', {})
@@ -556,7 +561,7 @@ def test_unrelated_thumbnail_requests_are_not_serialized(tmp_path, monkeypatch):
 def test_preview_timeout_keeps_original_available(tmp_path, monkeypatch):
     import shutil
     original = tmp_path / 'source.mp4'
-    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=s=160x120:d=1', '-c:v', 'libx264', str(original)], check=True)
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=s=160x120:d=1', '-c:v', 'libx264', '-pix_fmt', 'yuv444p', str(original)], check=True)
     main.jobs['retry'] = failed_job() | {'status': 'queued'}
     def extracted(*args):
         shutil.copyfile(original, tmp_path / 'retry' / 'download.mp4')
@@ -565,6 +570,7 @@ def test_preview_timeout_keeps_original_available(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'extract_video', extracted)
     monkeypatch.setattr(main, 'playable_file', failed_preview)
     main.run_download('retry', main.DownloadRequest(url='https://youtu.be/fixture'))
+    assert client.post('/api/jobs/retry/preview').status_code == 202
     assert main.jobs['retry']['status'] == 'completed'
     assert main.jobs['retry']['preview_available'] is False
     assert client.get('/api/jobs/retry/file').content == original.read_bytes()
@@ -630,3 +636,203 @@ def test_youtube_warning_then_real_transfer_can_complete(tmp_path, monkeypatch):
         assert main.source_access.youtube.remaining() == 0
     finally:
         server.shutdown();server.server_close()
+
+
+def test_bulk_queue_accepts_multiple_links_and_removes_duplicates(monkeypatch):
+    submitted = []
+    monkeypatch.setattr(main.pool, 'submit', lambda *args: submitted.append(args))
+    urls = ['https://youtu.be/one', 'https://youtu.be/two', 'https://youtu.be/one']
+    response = client.post('/api/download/bulk', json={'urls': urls, 'quality': '720'})
+    assert response.status_code == 202
+    assert response.json()['added'] == 2
+    assert response.json()['duplicates_removed'] == 1
+    assert len(submitted) == 2
+    assert len(main.storage.restore(main.DATA)) == 2
+    assert {job['url'] for job in main.jobs.values()} == set(urls)
+
+
+@pytest.mark.parametrize('payload,status', [
+    ({'urls':['https://youtu.be/one','http://localhost/private']},400),
+    ({'urls':['https://youtu.be/one'],'format':'exe'},400),
+    ({'urls':['https://youtu.be/one']*51},422),
+])
+def test_bulk_validation_is_atomic(payload, status, monkeypatch):
+    monkeypatch.setattr(main.pool, 'submit', lambda *args: pytest.fail('Invalid batch was submitted'))
+    assert client.post('/api/download/bulk', json=payload).status_code == status
+    assert not main.jobs
+    assert not main.storage.restore(main.DATA)
+
+
+def test_bulk_queue_checks_capacity_before_adding_anything(monkeypatch):
+    main.jobs.update({str(i):{'id':str(i),'status':'queued','created':i} for i in range(49)})
+    response = client.post('/api/download/bulk', json={'urls':['https://youtu.be/one','https://youtu.be/two']})
+    assert response.status_code == 429
+    assert '1 queue/history slots' in response.json()['detail']
+    assert len(main.jobs) == 49
+
+
+def test_bulk_storage_failure_does_not_leave_queued_jobs(monkeypatch):
+    def rejected(*args):raise main.storage.sqlite3.OperationalError('disk full')
+    monkeypatch.setattr(main.storage, 'save_many', rejected)
+    response = client.post('/api/download/bulk', json={'urls':['https://youtu.be/one','https://youtu.be/two']})
+    assert response.status_code == 503
+    assert not main.jobs
+
+
+def test_bulk_worker_failure_marks_every_submission_failed(monkeypatch):
+    def rejected(*args):raise RuntimeError('worker unavailable')
+    monkeypatch.setattr(main.pool, 'submit', rejected)
+    response = client.post('/api/download/bulk', json={'urls':['https://youtu.be/one','https://youtu.be/two']})
+    assert response.status_code == 202
+    assert response.json()['submission_failures'] == 2
+    assert all(job['status']=='failed' for job in main.jobs.values())
+
+
+def test_bulk_honors_youtube_cooldown_without_partial_batch():
+    main.source_access.youtube.limited()
+    response = client.post('/api/download/bulk', json={'urls':['https://www.tiktok.com/@public/video/1','https://youtu.be/limited']})
+    assert response.status_code == 429
+    assert not main.jobs
+
+
+def test_background_preview_does_not_block_download_completion(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import shutil
+    source = tmp_path/'source.mp4'
+    subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','color=s=160x120:d=1','-c:v','libx264','-pix_fmt','yuv444p',str(source)],check=True)
+    def extracted(url, *args):
+        shutil.copyfile(source, tmp_path/url.rsplit('/',1)[-1]/'video.mp4')
+        return {'title':'Saved original'}
+    started,release=threading.Event(),threading.Event()
+    def slow_preview(file, media, progress=None):
+        started.set();assert release.wait(8)
+        return file
+    monkeypatch.setattr(main,'extract_video',extracted)
+    monkeypatch.setattr(main,'playable_file',slow_preview)
+    for job_id in ('first','second','third'):
+        main.jobs[job_id]=failed_job(job_id)|{'status':'queued'}
+    with ThreadPoolExecutor(max_workers=1) as previews, ThreadPoolExecutor(max_workers=2) as downloads:
+        monkeypatch.setattr(main,'preview_pool',previews)
+        try:
+            downloads.submit(main.run_download,'first',main.DownloadRequest(url='https://youtu.be/first')).result(timeout=3)
+            assert main.jobs['first']['status']=='completed'
+            assert main.jobs['first']['preview_status']=='not_requested'
+            assert client.post('/api/jobs/first/preview').status_code==202
+            assert started.wait(2)
+            assert client.post('/api/jobs/first/preview').status_code==202
+            for name in ('second','third'):
+                downloads.submit(main.run_download,name,main.DownloadRequest(url='https://youtu.be/'+name)).result(timeout=3)
+                assert main.jobs[name]['status']=='completed'
+            assert client.get('/api/jobs/first/file').status_code==200
+            assert client.get('/api/jobs/first/stream?original=true',headers={'Range':'bytes=0-99'}).status_code==206
+        finally:release.set()
+
+
+def test_interrupted_merged_file_is_recovered_without_source_download(tmp_path, monkeypatch):
+    folder=tmp_path/'recover';folder.mkdir()
+    original=folder/'merged.mp4'
+    subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','color=s=160x120:d=1','-c:v','libx264',str(original)],check=True)
+    content=original.read_bytes()
+    job=failed_job('recover')|{'status':'processing','duration':1}
+    main.storage.save(tmp_path,job)
+    monkeypatch.setattr(main,'jobs',main.storage.restore(tmp_path))
+    assert main.jobs['recover']['recoverable'] is True
+    monkeypatch.setattr(main.pool,'submit',lambda *args:None)
+    monkeypatch.setattr(main,'extract_video',lambda *args:pytest.fail('Recovered file must not be downloaded again'))
+    assert client.post('/api/jobs/recover/retry').status_code==202
+    main.run_download('recover',main.DownloadRequest(url='https://youtu.be/recover'))
+    assert main.jobs['recover']['status']=='completed'
+    assert client.get('/api/jobs/recover/file').content==content
+
+
+def test_restart_resets_preview_without_failing_completed_original(tmp_path):
+    job=failed_job('finished')|{'status':'completed','preview_status':'processing','preview_progress':40}
+    main.storage.save(tmp_path,job)
+    restored=main.storage.restore(tmp_path)['finished']
+    assert restored['status']=='completed'
+    assert restored['preview_status']=='not_requested'
+    assert restored['preview_progress']==0
+
+
+def test_parallel_youtube_setting_allows_two_bounded_transfers(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(main.pool,'submit',lambda *args:None)
+    response=client.post('/api/download/bulk',json={'urls':['https://youtu.be/first','https://youtu.be/second'],'youtube_concurrency':2})
+    assert response.status_code==202
+    barrier=threading.Barrier(2)
+    def extracted(*args,**kwargs):
+        barrier.wait(timeout=3)
+        return {'title':'Parallel transfer'}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extracted)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures=[workers.submit(main.extract_video,'https://youtu.be/'+name,True,main.options()) for name in ('first','second')]
+        assert all(f.result(timeout=4)['title']=='Parallel transfer' for f in futures)
+    assert main.source_access.youtube.slot.active==0
+
+
+def test_bulk_parallel_setting_is_bounded():
+    assert client.post('/api/download/bulk',json={'urls':['https://youtu.be/one'],'youtube_concurrency':3}).status_code==422
+    assert not main.jobs
+
+
+def test_bulk_history_transaction_rolls_back_all_rows(tmp_path):
+    with main.storage.connect(tmp_path) as db:
+        db.execute("CREATE TRIGGER reject_bad BEFORE INSERT ON jobs WHEN NEW.id='bad' BEGIN SELECT RAISE(ABORT,'reject'); END")
+    with pytest.raises(main.storage.sqlite3.IntegrityError):
+        main.storage.save_many(tmp_path,[failed_job('good'),failed_job('bad')])
+    assert not main.storage.restore(tmp_path)
+
+
+def test_recovery_ignores_separate_stream_components(tmp_path,monkeypatch):
+    folder=tmp_path/'retry';folder.mkdir()
+    fragment=folder/'video.f137.mp4';fragment.write_bytes(b'fragment'*30)
+    merged=folder/'video.mp4';merged.write_bytes(b'merged')
+    main.jobs['retry']=failed_job()|{'duration':10}
+    monkeypatch.setattr(main,'describe_media',lambda file:{'duration':10,'video_codec':'h264','has_audio':True})
+    assert main.recover_file(folder,main.DownloadRequest(url='https://youtu.be/fixture'))==merged
+
+
+def test_recovery_rejects_truncated_duration(tmp_path,monkeypatch):
+    folder=tmp_path/'retry';folder.mkdir();(folder/'video.mp4').write_bytes(b'partial')
+    main.jobs['retry']=failed_job()|{'duration':100}
+    monkeypatch.setattr(main,'describe_media',lambda file:{'duration':5,'video_codec':'h264','has_audio':True})
+    assert main.recover_file(folder,main.DownloadRequest(url='https://youtu.be/fixture')) is None
+
+
+@pytest.mark.parametrize('url',['https://www.youtube.com/playlist?list=PLfixture','https://www.youtube.com/@channel'])
+def test_bulk_requires_individual_video_links(url):
+    assert client.post('/api/download/bulk',json={'urls':[url]}).status_code==400
+    assert not main.jobs
+
+
+def test_shutdown_terminates_active_preview_process(monkeypatch):
+    import sys,time
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(main,'previews_stopping',threading.Event())
+    monkeypatch.setattr(main,'preview_processes',set())
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        monkeypatch.setattr(main,'preview_pool',workers)
+        future=workers.submit(main.encode_preview,[sys.executable,'-c','import time; time.sleep(60)'],None,None)
+        deadline=time.monotonic()+3
+        while time.monotonic()<deadline:
+            with main.preview_process_lock:
+                if main.preview_processes:break
+            time.sleep(.01)
+        main.stop_previews()
+        with pytest.raises(subprocess.CalledProcessError):future.result(timeout=3)
+    assert not main.preview_processes
+
+
+def test_removed_queued_preview_does_not_recreate_files(tmp_path,monkeypatch):
+    folder=tmp_path/'finished';folder.mkdir();(folder/'stale.mp4').write_bytes(b'fixture')
+    main.jobs['finished']=failed_job('finished')|{'status':'completed'}
+    tasks=[]
+    class Pending:
+        def submit(self,*args):tasks.append(args)
+    monkeypatch.setattr(main,'preview_pool',Pending())
+    monkeypatch.setattr(main,'describe_media',lambda file:{'video_codec':'av1'})
+    assert client.post('/api/jobs/finished/preview').status_code==202
+    assert client.delete('/api/jobs/finished').status_code==200
+    function,*args=tasks[0];function(*args)
+    assert not folder.exists()
+    assert 'finished' not in main.jobs
