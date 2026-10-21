@@ -1019,3 +1019,83 @@ def test_empty_or_unavailable_playlist_cannot_be_queued(monkeypatch, entries):
     response = client.post('/api/playlist/analyze', json={'url': 'https://youtube.com/playlist?list=PLempty'})
     assert response.status_code == 422
     assert not main.playlist_cache
+
+
+def test_supplied_playlist_watch_url_reaches_existing_api(monkeypatch):
+    captured = []
+    def listing(url, download, settings):
+        captured.append((url, download))
+        return {'_type': 'playlist', 'entries': [{'id': 'Smjl5LtkLC4', 'title': 'Video'}]}
+    monkeypatch.setattr(main, 'extract_video', listing)
+    response = client.post('/api/playlist/analyze', json={'url': 'https://www.youtube.com/watch?v=Smjl5LtkLC4&list=PLOpqmtbg1STVxAqdA-ndhhR4Q4U876aPx'})
+    assert response.status_code == 200
+    assert captured == [('https://www.youtube.com/playlist?list=PLOpqmtbg1STVxAqdA-ndhhR4Q4U876aPx', False)]
+    assert response.json()['videos'][0]['id'] == 'Smjl5LtkLC4'
+
+
+def test_dashboard_is_not_cached_and_reports_playlist_capability():
+    assert client.get('/').headers['cache-control'] == 'no-store'
+    info = client.get('/api/health').json()
+    assert info['version'] == main.__version__
+    assert info['capabilities']['youtube_playlists'] is True
+
+
+@pytest.mark.parametrize('version', ['1.2.0', '1.3.0', None])
+def test_launcher_does_not_silently_reopen_stale_server(monkeypatch, capsys, version):
+    from app import desktop
+    monkeypatch.setattr('sys.argv', ['streamvault'])
+    monkeypatch.setattr(desktop, 'server_info', lambda port: {'application': 'StreamVault', 'version': version})
+    monkeypatch.setattr(desktop.webbrowser, 'open', lambda *a: pytest.fail('Stale server reopened'))
+    with pytest.raises(SystemExit) as error:
+        desktop.main()
+    assert error.value.code == 2
+    assert 'Stop the previous server with Ctrl+C' in capsys.readouterr().err
+
+
+def test_launcher_reuses_matching_version(monkeypatch):
+    from app import desktop
+    opened = []
+    monkeypatch.setattr('sys.argv', ['streamvault'])
+    monkeypatch.setattr(desktop, 'server_info', lambda port: {'application': 'StreamVault', 'version': main.__version__})
+    monkeypatch.setattr(desktop.webbrowser, 'open', opened.append)
+    desktop.main()
+    assert opened == ['http://127.0.0.1:8000']
+
+
+def test_launcher_protected_server_does_not_claim_version_match(monkeypatch, capsys):
+    from app import desktop
+    monkeypatch.setattr('sys.argv', ['streamvault'])
+    monkeypatch.setattr(desktop, 'server_info', lambda port: {'application': 'StreamVault', 'authentication_required': True})
+    monkeypatch.setattr(desktop.webbrowser, 'open', lambda *a: None)
+    desktop.main()
+    assert 'stop its server with Ctrl+C' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('payload,status,expected', [
+    ({'application': 'StreamVault', 'version': '1.2.0'}, 200, {'application': 'StreamVault', 'version': '1.2.0'}),
+    ({'application': 'another-app'}, 200, None),
+    ([], 200, None),
+    ({}, 401, {'application': 'StreamVault', 'authentication_required': True}),
+    ({}, 404, None),
+])
+def test_launcher_reads_actual_loopback_identity_without_proxy(payload, status, expected, monkeypatch):
+    import json
+    from http.server import BaseHTTPRequestHandler
+    from app import desktop
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            assert self.path == '/api/health'
+            self.send_response(status)
+            if status == 401:
+                self.send_header('WWW-Authenticate', 'Basic realm="StreamVault"')
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode())
+        def log_message(self, *args): pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv('HTTP_PROXY', 'http://127.0.0.1:1')
+    try:
+        assert desktop.server_info(server.server_port) == expected
+        assert desktop.probe(server.server_port) is bool(expected)
+    finally:
+        server.shutdown(); server.server_close()

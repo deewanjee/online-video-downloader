@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from app import storage
+from app import __version__
 from app.auth import AccessControl
 from app.threads import ThreadsIE
 from app import source_access
@@ -36,7 +37,7 @@ async def lifespan(application):
         stop_previews()
 
 
-app = FastAPI(title='StreamVault', version='1.3.0', lifespan=lifespan)
+app = FastAPI(title='StreamVault', version=__version__, lifespan=lifespan)
 app.add_middleware(AccessControl)
 app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
 HOSTS = ('youtube.com', 'youtu.be', 'dailymotion.com', 'dai.ly', 'facebook.com', 'fb.watch', 'tiktok.com', 'instagram.com', 'threads.net', 'threads.com', 'twitter.com', 'x.com')
@@ -297,14 +298,14 @@ def download_error(exc):
 
 @app.get('/')
 def index():
-    return FileResponse(ROOT / 'static' / 'index.html')
+    return FileResponse(ROOT / 'static' / 'index.html', headers={'Cache-Control': 'no-store'})
 
 
 @app.get('/api/health')
 def health():
     with lock:
         active = sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())
-    return {'application': 'StreamVault', 'version': app.version, 'status': 'ok', 'ffmpeg': bool(shutil.which('ffmpeg')), 'ffprobe': bool(shutil.which('ffprobe')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'youtube_cooldown_seconds': int(source_access.youtube.remaining()), 'active': active}
+    return {'application': 'StreamVault', 'version': app.version, 'status': 'ok', 'capabilities': {'youtube_playlists': True}, 'ffmpeg': bool(shutil.which('ffmpeg')), 'ffprobe': bool(shutil.which('ffprobe')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'youtube_cooldown_seconds': int(source_access.youtube.remaining()), 'active': active}
 
 
 def check_source_cooldown(url):

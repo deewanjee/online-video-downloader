@@ -1,4 +1,5 @@
 const $ = id => document.getElementById(id);
+const UI_VERSION = '1.3.1';
 const audioFormats = ['mp3', 'm4a', 'wav'];
 function icon(name) {
   const paths = {play:'<path d="m8 5 11 7-11 7z"/>',arrow:'<path d="M6 18 18 6M6 6h12v12"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>'};
@@ -57,7 +58,10 @@ async function api(path,options = {}) {
     const body = await response.text(); let data;
     try { data = JSON.parse(body); } catch { throw Error('The server returned an unreadable response (HTTP '+response.status+'). Check the server connection and retry.'); }
     if (!response.ok) {
-      const error = Error(typeof data.detail === 'string' ? data.detail : 'Request could not be completed (HTTP '+response.status+').');
+      const message = response.status === 404 && path.startsWith('/api/playlist/') && data.detail === 'Not Found'
+        ? 'The running StreamVault server does not have the playlist API. Stop the old server with Ctrl+C, start StreamVault from the updated project folder, then refresh with Ctrl+F5. If this persists, replace all project files with the latest update.'
+        : typeof data.detail === 'string' ? data.detail : 'Request could not be completed (HTTP '+response.status+').';
+      const error = Error(message);
       const seconds = Number(response.headers.get('Retry-After'));
       if (Number.isFinite(seconds) && seconds > 0) error.retryAfter = seconds;
       throw error;
@@ -292,7 +296,7 @@ function refresh() {
   refreshing = (async () => {
     do {
       refreshAgain = false;
-      try { jobs = await api('/api/jobs',{timeout:10000}); renderAll(); const h = await api('/api/health',{timeout:10000}); $('health').textContent = !h.ffmpeg ? '● FFmpeg missing' : h.ffprobe === false ? '● FFprobe missing' : !h.youtube_ejs ? '● YouTube dependency missing' : !h.js_runtimes?.length ? '● JavaScript runtime missing' : h.youtube_cooldown_seconds > 0 ? '● YouTube wait '+Math.ceil(h.youtube_cooldown_seconds/60)+'m' : '● Engine online'; }
+      try { jobs = await api('/api/jobs',{timeout:10000}); renderAll(); const h = await api('/api/health',{timeout:10000}); $('health').textContent = h.version !== UI_VERSION ? '● Restart StreamVault to apply update' : !h.ffmpeg ? '● FFmpeg missing' : h.ffprobe === false ? '● FFprobe missing' : !h.youtube_ejs ? '● YouTube dependency missing' : !h.js_runtimes?.length ? '● JavaScript runtime missing' : h.youtube_cooldown_seconds > 0 ? '● YouTube wait '+Math.ceil(h.youtube_cooldown_seconds/60)+'m' : '● Engine online'; }
       catch(e) { $('health').textContent = '● Connection problem'; $('health').title = e.message; }
     } while (refreshAgain);
   })().finally(() => { refreshing = null; });
