@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const UI_VERSION = '2.1.0';
+const UI_VERSION = '2.2.0';
 const audioFormats = ['mp3', 'm4a', 'wav'];
 function icon(name) {
   const paths = {play:'<path d="m8 5 11 7-11 7z"/>',arrow:'<path d="M6 18 18 6M6 6h12v12"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>'};
@@ -7,7 +7,7 @@ function icon(name) {
   span.innerHTML = `<svg class="ui-icon" viewBox="0 0 24 24" fill="${name==='play'?'currentColor':'none'}" stroke="currentColor" stroke-width="1.7" aria-hidden="true">${paths[name]}</svg>`;
   return span;
 }
-function analyzeLabel() { $('analyze-button').replaceChildren(document.createTextNode('Find my video '),icon('arrow')); }
+function analyzeLabel() { $('analyze-button').replaceChildren(document.createTextNode('Find video '),icon('arrow')); }
 const platforms = [['YouTube','▶','#efdfd7','#d63f35'],['Instagram','◎','#f0dce1','#bb4b71'],['TikTok','♪','#d8e3de','#263b30'],['Facebook','f','#dce3ed','#4268a5'],['X / Twitter','𝕏','#e3e4db','#30382f'],['Dailymotion','d','#d9e7e6','#367a7b'],['Threads','@','#e5dfd4','#595344']];
 for (const id of ['platform-grid','all-platforms']) {
   for (const [name,icon,bg,color] of (id === 'all-platforms' ? [...platforms,['Other','◎','#e9edf4','#657189']] : platforms)) {
@@ -33,10 +33,11 @@ const rendered = new Map();
 function view(name) {
   for (const n of ['home','downloads','platforms']) $(n).hidden = n !== name;
   document.querySelectorAll('.nav').forEach(el => { el.classList.toggle('active',el.dataset.view === name); el.setAttribute('aria-current', el.dataset.view === name ? 'page' : 'false'); });
-  $('page-label').textContent = {home:'Overview',downloads:'Video library',platforms:'Platform insights'}[name];
+  $('page-label').textContent = {home:'Dashboard',downloads:'Video library',platforms:'Platform insights'}[name];
   window.scrollTo(0,0);
 }
 document.querySelectorAll('.nav').forEach(el => el.onclick = () => view(el.dataset.view));
+$('home-library').onclick = () => view('downloads');
 $('view-all').onclick = () => view('downloads'); $('see-platforms').onclick = () => view('platforms');
 function notice(message,retryAfter = 0) {
   clearInterval(noticeTimer); noticeTimer = null;
@@ -86,6 +87,7 @@ async function api(path,options = {}) {
 }
 function applyDownloadLocation(settings) {
   locationSettings = settings;
+  $('location-help').classList.remove('location-warning');
   $('location-path').textContent = settings.direct_enabled ? settings.path || 'No folder selected' : 'Browser download';
   $('location-path').title = settings.path || '';
   $('location-help').textContent = settings.direct_enabled ? settings.configured ? settings.available ? 'New downloads save directly here. No second Save step is needed.' : 'This folder is unavailable. Reconnect the drive or choose another folder.' : 'Choose a folder before adding downloads. Files will be saved there automatically.' : 'Server mode: files are prepared on the server; Save to device uses your browser. For direct laptop saving, use Start StreamVault.bat locally.';
@@ -453,8 +455,30 @@ function refresh() {
   refreshing = (async () => {
     do {
       refreshAgain = false;
-      try { const [items,h,stats,destination] = await Promise.all([api('/api/jobs',{timeout:10000}),api('/api/health',{timeout:10000}),api('/api/stats',{timeout:10000}).catch(() => null),api('/api/download-location',{timeout:10000}).catch(() => null)]); if (destination) applyDownloadLocation(destination); jobs = items; renderAll(); renderStats(stats); $('health').textContent = h.version !== UI_VERSION ? '● Restart AAASoft Video Studio to apply update' : !h.ffmpeg ? '● FFmpeg missing' : h.ffprobe === false ? '● FFprobe missing' : !h.youtube_ejs ? '● YouTube dependency missing' : !h.js_runtimes?.length ? '● JavaScript runtime missing' : h.youtube_cooldown_seconds > 0 ? '● YouTube wait '+Math.ceil(h.youtube_cooldown_seconds/60)+'m' : '● Engine online'; }
-      catch(e) { $('health').textContent = '● Connection problem'; $('health').title = e.message; }
+      try {
+        const [items,h,stats,destination] = await Promise.all([
+          api('/api/jobs',{timeout:10000}), api('/api/health',{timeout:10000}),
+          api('/api/stats',{timeout:10000}).catch(() => null),
+          api('/api/download-location',{timeout:10000}).catch(() => null)
+        ]);
+        if (destination) applyDownloadLocation(destination);
+        else {
+          $('location-path').textContent = h.version !== UI_VERSION ? 'Restart to apply the update' : 'Download settings unavailable';
+          $('location-help').textContent = 'Stop the server with Ctrl+C, launch the updated app, then refresh with Ctrl+F5.';
+          $('location-help').classList.add('location-warning');
+        }
+        jobs = items; renderAll(); renderStats(stats);
+        const status = h.version !== UI_VERSION ? 'Restart to apply update'
+          : !h.ffmpeg ? 'FFmpeg missing' : h.ffprobe === false ? 'FFprobe missing'
+          : !h.youtube_ejs ? 'YouTube dependency missing' : !h.js_runtimes?.length ? 'JavaScript runtime missing'
+          : h.youtube_cooldown_seconds > 0 ? 'YouTube wait '+Math.ceil(h.youtube_cooldown_seconds/60)+'m' : 'Engine online';
+        $('health').textContent = status;
+        $('health').dataset.state = status === 'Engine online' ? 'ready' : 'warning';
+        $('health').title = h.version !== UI_VERSION ? 'Stop the previous server with Ctrl+C. Launch the updated project, then refresh with Ctrl+F5.' : status;
+      } catch(e) {
+        $('health').textContent = 'Connection problem'; $('health').title = e.message; $('health').dataset.state = 'error';
+        if (!locationSettings) $('location-path').textContent = 'Waiting for the local server';
+      }
     } while (refreshAgain);
   })().finally(() => { refreshing = null; });
   return refreshing;

@@ -1,10 +1,16 @@
 # AAASoft Video Studio
 
-AAASoft-branded browser video downloader with a professional indigo/navy dashboard, generated company logo, thumbnail gallery, pagination, permanent platform counters, repeat downloads, bulk/playlist queues, audio extraction and an in-app player. Built with FastAPI, yt-dlp, FFmpeg, and a lightweight browser interface.
+AAASoft-branded browser video downloader with a professional emerald/charcoal dashboard, generated company logo, thumbnail gallery, pagination, permanent platform counters, repeat downloads, bulk/playlist queues, audio extraction and an in-app player. Built with FastAPI, yt-dlp, FFmpeg, and a lightweight browser interface.
 
-![AAASoft dashboard with local demonstration thumbnails](reports/aaasoft-studio.png)
+![AAASoft redesigned dashboard with local demonstration thumbnails](reports/aaasoft-studio-v22.png)
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
+
+## Dashboard redesign (2.2.0)
+
+The workspace now uses a white sidebar, emerald/charcoal download panel and Manrope/Inter typography. A compact dashboard header and four summary counters replace the oversized promotional banner. The download composer and destination sit together, bulk/playlist tools expand when needed, and the collection appears before the advertising placeholder. Thumbnail-only cards retain hover/keyboard/touch actions and pagination; the dark theme uses the same green palette. Both the dashboard and full library have direct navigation controls.
+
+When the browser is serving newer UI files than the running Python server, the status and download-location panel provide restart instructions instead of staying on “Checking download mode…”. Stop the old console with Ctrl+C, launch the updated batch file and refresh with Ctrl+F5. Keep `data/`, `.venv/` and `.env` when replacing project files. Screenshots and verification: [reports/studio-redesign-v22.md](reports/studio-redesign-v22.md).
 
 ## Windows quick start
 
@@ -65,9 +71,9 @@ Validation: [reports/playlist-verification.md](reports/playlist-verification.md)
 
 If the playlist panel shows plain **Not Found**, the running server may still have the old Python routes while serving newly copied UI files. Stop the original server console with **Ctrl+C**, launch **Start StreamVault.bat** from the updated folder, and refresh with **Ctrl+F5**. The launcher now refuses to silently reuse a running server whose version differs from the installed files. A password-protected server cannot expose its version before login; the launcher prints restart guidance instead. The dashboard also flags a UI/server version mismatch, and a missing playlist API gives actionable restart/update instructions. Check the running version in PowerShell with `(Invoke-RestMethod http://127.0.0.1:8000/api/health).version` (owner authentication is required when enabled). See [reports/playlist-not-found.md](reports/playlist-not-found.md).
 
-## AAASoft workspace (2.0.0)
+## AAASoft workspace
 
-The new dashboard uses navy, indigo and sky-blue branding, **Plus Jakarta Sans / Inter** fonts with system fallbacks, light/dark themes and the generated AAASoft mark in `app/static/brand/aaasoft-mark.png`. Source thumbnails are preferred; unavailable source images fall back to the existing local video poster. Normal video cards show the thumbnail, duration and a **Downloaded** badge. Hover or keyboard focus reveals title, source, format, resolution, file size, status and **Play / Save / Again / Remove** actions. Touch users can open details with the information control. Opening another workspace view returns to its top.
+The dashboard uses emerald, charcoal and warm neutral colours, **Manrope / Inter** fonts with system fallbacks, light/dark themes and the generated AAASoft mark in `app/static/brand/aaasoft-mark.png`. Source thumbnails are preferred; unavailable source images fall back to the existing local video poster. Normal video cards show the thumbnail, duration and a **Downloaded** badge. Hover or keyboard focus reveals title, source, format, resolution, file size, status and **Play / Save / Again / Remove** actions. Touch users can open details with the information control. Opening another workspace view returns to its top.
 
 Overview and Video library have independent numbered pagination and **12 / 24 / 48** page sizes. Search/status filters reset the library to page one; polling preserves page selection and clamps it when a list shrinks. Only the current page is rendered, and focused cards are retained during ordinary polling updates. **Again** queues a new job using the video's original format/quality without deleting its existing file. A previously completed normalized source link is marked during analysis even after its library entry was removed. Common YouTube watch/short/share, X/Twitter and other tracking URL variants are normalized; arbitrary short-link redirects are not resolved by the fingerprint alone.
 
