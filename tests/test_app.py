@@ -2480,3 +2480,52 @@ def test_retained_tiktok_history_repairs_older_url_identity():
     main.storage.restore(main.DATA)
     assert main.storage.downloaded_count(main.DATA,'https://www.tiktok.com/@renamed/video/7000000000000000001')==1
     assert main.storage.statistics(main.DATA)['total']==1
+
+
+@pytest.mark.parametrize('url',[
+    'https://vt.tiktok.com/ZSgPDYT5q/',
+    'https://vm.tiktok.com/ZSgPDYT5q/?share=1',
+    'https://www.tiktok.com/t/ZSgPDYT5q/',
+])
+def test_account_seed_share_links_are_resolved_before_same_account_check(tiktok_accounts,monkeypatch,url):
+    calls=[]
+    def extract(dl,target,download=False):
+        calls.append((target,download))
+        if target.startswith('tiktokuser:'):
+            return {'_type':'playlist','entries':[tik_entry(1,formats=[{'vcodec':'h264'}])]}
+        return {'uploader_id':'Creator','channel_id':'MS4wLjABAAAA'+'A'*64,'formats':[{'vcodec':'h264'}]}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    response=client.post('/api/tiktok/loads',json={'account':'@creator','seed_url':url})
+    assert response.status_code==202,response.text
+    task=client.get('/api/tiktok/tasks/'+response.json()['id']).json()
+    assert task['status']=='ready'
+    assert calls[0][0]==url.split('?')[0] and all(not download for _,download in calls)
+    assert calls[1][0].startswith('tiktokuser:')
+
+
+def test_account_seed_share_link_actual_uploader_must_match(tiktok_accounts,monkeypatch):
+    calls=[]
+    def extract(dl,url,download=False):
+        calls.append(url)
+        return {'uploader_id':'someone_else','channel_id':'MS4wLjABAAAA'+'A'*64}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    response=client.post('/api/tiktok/loads',json={'account':'creator','seed_url':'https://vt.tiktok.com/ZSgPDYT5q/'})
+    task=client.get('/api/tiktok/tasks/'+response.json()['id']).json()
+    assert task['status']=='failed' and 'same account' in task['detail']
+    assert len(calls)==1
+
+
+@pytest.mark.parametrize('url',[
+    'https://vt.tiktok.com.evil.test/ZSgPDYT5q/',
+    'https://user:pass@vt.tiktok.com/ZSgPDYT5q/',
+    'https://vt.tiktok.com:8443/ZSgPDYT5q/',
+    'https://vt.tiktok.com/../../example',
+    'https://vt.tiktok.com/',
+    'https://yt.tiktok.com/ZSgPDYT5q/',
+    'https://www.tiktok.com/@creator',
+    'https://www.tiktok.com/t/ZSgPDYT5q/other',
+])
+def test_account_seed_rejects_unrecognized_share_urls(tiktok_accounts,url):
+    response=client.post('/api/tiktok/loads',json={'account':'creator','seed_url':url})
+    assert response.status_code==400,response.text
+    assert not tiktok_accounts.tasks

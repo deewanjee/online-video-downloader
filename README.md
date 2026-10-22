@@ -6,6 +6,10 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## TikTok share-link fix (3.4.1)
+
+The optional account-lookup video now accepts `vt.tiktok.com`, `vm.tiktok.com` and `tiktok.com/t/` share links as well as direct post URLs. The existing TikTok extractor resolves a supported share link and verifies the actual uploader before listing the requested account. Unknown aliases must be opened in a browser to copy the final video URL; do not change their hostname manually. An account-listing failure no longer displays a misleading `Checks failed · 0 / 0` counter. Source IP/verification restrictions may still prevent listing. This fixes URL validation, not TikTok access restrictions.
+
 ## TikTok accounts and separate platform workspaces (3.4.0)
 
 Open **Platform workspaces → TikTok**. Enter an `@username` or `https://www.tiktok.com/@username` profile, then choose **Load & check**. The importer lists source-returned posts and checks their video metadata before selection. Available videos can be selected across pages; private, removed, restricted and non-video posts stay disabled. A network failure leaves untested posts **Not verified**, rather than falsely calling them removed. Stop and recheck controls, caption/ID search, availability/history filters, checked timestamps and live queue badges are included.

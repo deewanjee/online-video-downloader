@@ -248,8 +248,16 @@ def register(main):
             main.validate_url(req.seed_url)
             parsed=urlparse(req.seed_url)
             match=re.fullmatch(r'/@([A-Za-z0-9_.]{1,24})/video/([0-9]{6,25})/?',parsed.path)
-            if parsed.hostname not in ('www.tiktok.com','tiktok.com') or not match or match[1].casefold()!=url.rsplit('@',1)[-1].casefold():raise HTTPException(400,'Use a direct TikTok video link from the same username as the account.')
-            seed='https://www.tiktok.com/@'+match[1]+'/video/'+match[2]
+            direct=parsed.hostname in ('www.tiktok.com','tiktok.com') and match
+            short=(parsed.hostname in ('vm.tiktok.com','vt.tiktok.com') and re.fullmatch(r'/[A-Za-z0-9_-]{3,100}/?',parsed.path)) or (parsed.hostname in ('www.tiktok.com','tiktok.com') and re.fullmatch(r'/t/[A-Za-z0-9_-]{3,100}/?',parsed.path))
+            if direct:
+                if match[1].casefold()!=url.rsplit('@',1)[-1].casefold():raise HTTPException(400,'Use a public video from the same username as the account.')
+                seed='https://www.tiktok.com/@'+match[1]+'/video/'+match[2]
+            elif short:
+                # yt-dlp's TikTok share extractor resolves these supported aliases.
+                # The worker verifies the actual uploader before using its account ID.
+                seed='https://'+parsed.hostname+parsed.path
+            else:raise HTTPException(400,'Use a TikTok video URL or a vt.tiktok.com / vm.tiktok.com share link from this account. Open other share links in your browser and copy the final video address.')
         return manager.start(url,req.offset,seed_url=seed)
 
     @app.get('/api/tiktok/tasks/{id}')
