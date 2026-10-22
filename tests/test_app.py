@@ -156,6 +156,8 @@ def isolate_history(tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'analysis_cache', {})
     monkeypatch.setattr(main, 'playlist_cache', {})
     monkeypatch.setattr(main, 'playlist_loads', {})
+    monkeypatch.setattr(main, 'playlist_checks', {})
+    monkeypatch.setattr(main, 'search_cache', {})
     monkeypatch.setattr(main, 'playlist_pool', ImmediatePreview())
     monkeypatch.setattr(main, 'preview_locks', {})
     monkeypatch.setattr(main.source_access, 'youtube', main.source_access.YoutubeAccess())
@@ -1043,8 +1045,16 @@ def test_playlist_page_failure_does_not_offer_partial_import(monkeypatch):
 def test_empty_or_unavailable_playlist_cannot_be_queued(monkeypatch, entries):
     monkeypatch.setattr(main, 'extract_video', lambda *a: {'_type': 'playlist', 'entries': entries})
     response = client.post('/api/playlist/analyze', json={'url': 'https://youtube.com/playlist?list=PLempty'})
-    assert response.status_code == 422
-    assert not main.playlist_cache
+    if not entries:
+        assert response.status_code == 422
+        assert not main.playlist_cache
+    else:
+        assert response.status_code == 200
+        data=response.json()
+        assert data['videos']==[]
+        assert all(not row['selectable'] for row in data['entries'])
+        assert client.post('/api/playlist/download',json={'token':data['token']}).status_code==400
+        assert not main.jobs
 
 
 def test_supplied_playlist_watch_url_reaches_existing_api(monkeypatch):
@@ -1823,7 +1833,7 @@ def test_recovery_and_help_keep_owner_access_controls(monkeypatch):
 
 
 def test_separate_english_help_documents_are_served_and_downloadable():
-    topics=['getting-started','single-video','bulk-downloads','playlists','formats-quality','download-location','playback','library-selection','automatic-recovery','troubleshooting','updates-backups']
+    topics=['search-discovery','getting-started','single-video','bulk-downloads','playlists','formats-quality','download-location','playback','library-selection','automatic-recovery','troubleshooting','updates-backups']
     assert client.get('/help').status_code==200
     for topic in topics:
         document=client.get('/help/'+topic)
@@ -1884,3 +1894,135 @@ def test_legacy_auto_recovery_waits_for_confirmed_desktop_destination(tmp_path,m
     assert job['status']=='failed' and not job.get('output_dir') and 'folder' in job['next_action']
     assert local.post('/api/download-location',json={'path':str(chosen)}).status_code==200
     assert job['status']=='queued' and job['output_dir']==str(chosen) and job['legacy_recovery']
+
+
+@pytest.mark.parametrize('provider,kind',[('other','videos'),('youtube','channels'),('dailymotion','playlists')])
+def test_search_rejects_unsupported_sources_and_types(provider,kind):
+    assert client.post('/api/search',json={'query':'nature','provider':provider,'kind':kind}).status_code in (400,422)
+
+
+def test_source_search_canonical_urls_cache_and_paging(monkeypatch):
+    captured=[]
+    def extract(url,download,settings):
+        captured.append((url,download,settings))
+        return {'entries':[playlist_entry(i) for i in range(1,14)]}
+    monkeypatch.setattr(main,'extract_video',extract)
+    first=client.post('/api/search',json={'query':'  Nature   films ','page':2}).json()
+    assert len(first['results'])==12 and first['has_more']
+    assert first['results'][0]['url']=='https://www.youtube.com/watch?v='+playlist_entry(1)['id']
+    assert not first['cached']
+    second=client.post('/api/search',json={'query':'nature films','page':2}).json()
+    assert second['cached'] and len(captured)==1
+    assert 'search_query=Nature+films' in captured[0][0]
+    assert captured[0][1] is False
+    assert captured[0][2]['playliststart']==13 and captured[0][2]['playlistend']==25
+
+
+def test_search_filters_untrusted_ids_private_live_and_thumbnails(monkeypatch):
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'entries':[
+        playlist_entry(1,thumbnail='https://evil.test/image',url='https://evil.test/video'),
+        playlist_entry(2,availability='private'),playlist_entry(3,is_live=True),
+        {'id':'../bad','title':'Bad'},None,playlist_entry(1)]})
+    data=client.post('/api/search',json={'query':'films'}).json()
+    assert len(data['results'])==1
+    assert data['results'][0]['thumbnail'].startswith('https://i.ytimg.com/')
+    assert 'evil.test' not in str(data)
+
+
+def test_playlist_search_canonicalizes_source_results(monkeypatch):
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'entries':[{'id':'PLabcdefghijklm','title':'A playlist','playlist_count':25,'url':'https://evil.test'},playlist_entry(1)]})
+    rows=client.post('/api/search',json={'query':'nature','kind':'playlists'}).json()['results']
+    assert len(rows)==1 and rows[0]['url']=='https://www.youtube.com/playlist?list=PLabcdefghijklm'
+    assert rows[0]['video_count']==25
+
+
+def test_search_rate_limit_releases_provider_lock(monkeypatch):
+    def limited(*a):raise main.source_access.SourceRateLimited(60)
+    monkeypatch.setattr(main,'extract_video',limited)
+    result=client.post('/api/search',json={'query':'nature'})
+    assert result.status_code==429 and result.headers['retry-after']=='60'
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'entries':[]})
+    assert client.post('/api/search',json={'query':'nature'}).status_code==200
+
+
+@pytest.mark.parametrize('value',['http://i.ytimg.com/test','https://evil.test/x','https://i.ytimg.com.evil.test/x','https://user@i.ytimg.com/x','https://i.ytimg.com:bad/x','https://[bad'])
+def test_discovery_rejects_untrusted_thumbnail(value):
+    assert main.discovery.thumbnail(value,'youtube') is None
+
+
+def test_dailymotion_search_bounded_api_and_canonical_links(monkeypatch):
+    import json
+    captured=[]
+    class Response:
+        status_code=200
+        def __enter__(self):return self
+        def __exit__(self,*a):pass
+        def iter_content(self,*a):yield json.dumps({'list':[{'id':'x123abc','title':'Travel','owner.screenname':'Creator','thumbnail_360_url':'https://evil.test/x'},{'id':'../escape'}],'has_more':True}).encode()
+    def get(url,**kwargs):captured.append((url,kwargs));return Response()
+    monkeypatch.setattr(main.discovery.requests,'get',get)
+    data=client.post('/api/search',json={'query':'travel','provider':'dailymotion'}).json()
+    assert len(data['results'])==1 and data['has_more']
+    assert data['results'][0]['url']=='https://www.dailymotion.com/video/x123abc'
+    assert captured[0][0]=='https://api.dailymotion.com/videos'
+    assert captured[0][1]['allow_redirects'] is False
+    assert captured[0][1]['params']['search']=='travel'
+
+
+def test_dailymotion_search_failure_is_actionable(monkeypatch):
+    def fail(*a,**k):raise main.discovery.requests.ConnectionError('secret upstream url')
+    monkeypatch.setattr(main.discovery.requests,'get',fail)
+    result=client.post('/api/search',json={'query':'travel','provider':'dailymotion'})
+    assert result.status_code==502 and 'connection' in result.json()['detail']
+    assert 'secret' not in result.text
+
+
+def test_playlist_review_preserves_unavailable_and_duplicate_entries(monkeypatch):
+    entries=[playlist_entry(1,availability='public'),playlist_entry(2,title='[Private video]'),playlist_entry(3,title='[Deleted video]'),playlist_entry(4),playlist_entry(1),None]
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'_type':'playlist','entries':entries})
+    data=client.post('/api/playlist/analyze',json={'url':'https://youtube.com/playlist?list=PLreview'}).json()
+    assert [row['status'] for row in data['entries']]==['listed','private','removed','unknown','duplicate','invalid']
+    assert len(data['videos'])==2
+    assert all(not row['selectable'] for row in data['entries'] if row['status'] in main.availability.BLOCKED)
+
+
+def test_playlist_live_check_disables_new_private_and_blocks_queue(monkeypatch):
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'_type':'playlist','entries':[playlist_entry(1),playlist_entry(2),playlist_entry(1)]})
+    data=client.post('/api/playlist/analyze',json={'url':'https://youtube.com/playlist?list=PLcheck'}).json()
+    def check(url,*a):
+        if playlist_entry(2)['id'] in url:raise main.yt_dlp.utils.DownloadError('This video is private')
+        return {'formats':[{'vcodec':'h264'}]}
+    monkeypatch.setattr(main,'extract_video',check)
+    started=client.post('/api/playlist/checks',json={'token':data['token'],'video_ids':[row['id'] for row in data['videos']]})
+    assert started.status_code==202
+    state=client.get('/api/playlist/checks/'+started.json()['id']).json()
+    assert state['status']=='ready' and state['checked']==2
+    assert [row['status'] for row in state['updates']]==['available','private']
+    assert main.playlist_cache[data['token']]['data']['entries'][-1]['status']=='duplicate'
+    assert not main.playlist_cache[data['token']]['checking']
+    rejected=client.post('/api/playlist/download',json={'token':data['token'],'video_ids':[playlist_entry(2)['id']]})
+    assert rejected.status_code==400
+
+
+def test_playlist_check_stops_on_rate_limit_without_false_removed_labels(monkeypatch):
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'_type':'playlist','entries':[playlist_entry(1),playlist_entry(2)]})
+    data=client.post('/api/playlist/analyze',json={'url':'https://youtube.com/playlist?list=PLrate'}).json()
+    def limited(*a):raise main.source_access.SourceRateLimited(60)
+    monkeypatch.setattr(main,'extract_video',limited)
+    started=client.post('/api/playlist/checks',json={'token':data['token'],'video_ids':[row['id'] for row in data['videos']]}).json()
+    state=client.get('/api/playlist/checks/'+started['id']).json()
+    assert state['status']=='failed' and state['checked']==0 and state['updates']==[]
+    assert all(row['status']=='unknown' for row in main.playlist_cache[data['token']]['data']['videos'])
+
+
+def test_playlist_check_running_rejects_queue_and_foreign_ids(monkeypatch):
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'_type':'playlist','entries':[playlist_entry(1)]})
+    data=client.post('/api/playlist/analyze',json={'url':'https://youtube.com/playlist?list=PLrace'}).json()
+    assert client.post('/api/playlist/checks',json={'token':data['token'],'video_ids':[playlist_entry(2)['id']]}).status_code==400
+    class Held:
+        def submit(self,*a):pass
+    monkeypatch.setattr(main,'playlist_pool',Held())
+    started=client.post('/api/playlist/checks',json={'token':data['token'],'video_ids':[playlist_entry(1)['id']]})
+    assert started.status_code==202
+    assert client.post('/api/playlist/download',json={'token':data['token']}).status_code==409
+    assert client.delete('/api/playlist/checks/'+started.json()['id']).status_code==204
+    assert main.playlist_checks[started.json()['id']]['cancel'].is_set()

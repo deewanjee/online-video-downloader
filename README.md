@@ -6,11 +6,19 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## Search and playlist availability (3.1.0)
+
+Open **Discover** to search **YouTube videos/playlists** or **Dailymotion videos** inside the portal. Results include thumbnails and creators, with five pages of twelve results. Select up to fifty videos across pages, choose format/quality, then download with the existing destination and queue workflow. Playlist results open the playlist review. Other supported platforms currently require pasted links; this is not universal cross-platform search. Recent searches are cached for five minutes and obey source request gates/cooldowns.
+
+Playlist review retains the source's returned private, removed, restricted, invalid and duplicate entries as disabled rows. **Publicly listed** and **Not verified** describe flat listing metadata. **Check next 20 selected videos** performs sequential metadata-only access checks; repeat for the next unchecked selected batch. **Available · checked** confirms a usable media listing at check time, not guaranteed future download access. A newly private/unavailable entry is deselected and rejected by the queue API. Queueing is blocked while checking; cancellation waits for the current source request to finish. Source cooldown/network failures do not label untested entries as removed. Entries hidden entirely by the source cannot be individually identified.
+
+Read the separate English [search guide](app/static/help/search-discovery.md) and [playlist guide](app/static/help/playlists.md). Verification and limitations: [reports/search-discovery-v31.md](reports/search-discovery-v31.md).
+
 ## Product workspace and English help (3.0.0)
 
 The portal now includes a focused download workbench, live activity overview, searchable/sortable library, dedicated **Recovery center**, **System checks**, clipboard Paste button, keyboard library search (`/`), a dismissible quick-start tip and contextual help links. AAASoft branding uses a navy navigation rail, blue accents, legible form hierarchy, status colours and light/dark themes.
 
-Open **Help center** in the navigation or visit `/help`. Eleven separate English guides cover getting started, copying/pasting a single link, bulk downloads, playlists, formats/quality, download locations, playback, library selection/deletion, automatic recovery, troubleshooting and updates/backups/hosting. Each article has contents navigation, a downloadable Markdown guide and **Print / Save as PDF**. Search covers article contents as well as titles. Guides are served with the app and do not depend on an external help service. Regenerate them from the repository root with `python scripts/build_help.py`.
+Open **Help center** in the navigation or visit `/help`. Twelve separate English guides cover getting started, copying/pasting a single link, bulk downloads, in-portal search, playlists, formats/quality, download locations, playback, library selection/deletion, automatic recovery, troubleshooting and updates/backups/hosting. Each article has contents navigation, a downloadable Markdown guide and **Print / Save as PDF**. Search covers article contents as well as titles. Guides are served with the app and do not depend on an external help service. Regenerate them from the repository root with `python scripts/build_help.py`.
 
 Automatic recovery is enabled by default. Temporary network/source-server errors receive up to **three** end-of-queue automatic attempts with increasing waits (30/120/300 seconds); YouTube 429 waits at least the shared source cooldown. Generic unavailable responses receive one recovery recheck. First-pass queued/running work completes before scheduled recovery work is released. Recovery center shows reasons, attempt counts, timing and next steps; automatic attempts can be paused/resumed. Pausing or restarting a still-pending retry does not burn an attempt. Pending budgets, settings and timing survive restarts. Manual Retry resets the budget. Completed originals are not re-downloaded by recovery.
 

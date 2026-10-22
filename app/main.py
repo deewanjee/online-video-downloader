@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 import re
-from typing import Annotated
+from typing import Annotated, Literal
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -26,7 +26,7 @@ from app import __version__
 from app.auth import AccessControl
 from app.threads import ThreadsIE
 from app import source_access
-from app import destinations, recovery
+from app import destinations, recovery, discovery, availability
 from app.deferred import DeferredDownloads
 
 ROOT = Path(__file__).parent
@@ -64,6 +64,10 @@ playlist_lock = threading.Lock()
 playlist_loads = {}
 playlist_load_lock = threading.Lock()
 playlist_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='playlist')
+search_locks = {'youtube':threading.Lock(),'dailymotion':threading.Lock()}
+search_cache = {}
+search_cache_lock = threading.Lock()
+playlist_checks = {}
 folder_dialog_lock = threading.Lock()
 deferred_downloads = DeferredDownloads(lambda: source_access.youtube.remaining(), lambda job_id, req: resume_deferred(job_id, req), delay_for=lambda job_id, req: recovery_delay(job_id, req))
 
@@ -322,7 +326,7 @@ def download_error(exc):
         return 'This video is DRM-protected and cannot be downloaded by StreamVault.'
     if any(text in message for text in ('not available in your country', 'geo restricted', 'geographic restriction', 'geo-restricted')):
         return 'This video is unavailable in your region. Download access follows the source restrictions.'
-    if any(text in message for text in ('private video', 'sign in', 'login required', 'login-required', 'log in', 'age-restricted', 'confirm your age')):
+    if any(text in message for text in ('private video', 'video is private', 'sign in', 'login required', 'login-required', 'log in', 'age-restricted', 'confirm your age')):
         return 'This video requires sign-in, age verification, or private access. Try a publicly accessible video.'
     if any(text in message for text in ('video unavailable', 'has been removed', 'has been deleted', 'not found', 'http error 404')):
         return 'The video is unavailable or has been removed. Check the link and its availability on the source website.'
@@ -363,7 +367,7 @@ def help_article(topic: str):
 def health():
     with lock:
         active = sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())
-    return {'application': 'StreamVault', 'version': app.version, 'status': 'ok', 'capabilities': {'youtube_playlists': True, 'direct_save': destinations.enabled()}, 'ffmpeg': bool(shutil.which('ffmpeg')), 'ffprobe': bool(shutil.which('ffprobe')), 'js_runtimes': list(options()['js_runtimes']), 'yt_dlp_version': yt_dlp.version.__version__, 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'youtube_cooldown_seconds': int(source_access.youtube.remaining()), 'active': active}
+    return {'application': 'StreamVault', 'version': app.version, 'status': 'ok', 'capabilities': {'youtube_playlists': True, 'source_search': ['youtube','dailymotion'], 'playlist_availability_checks': True, 'direct_save': destinations.enabled()}, 'ffmpeg': bool(shutil.which('ffmpeg')), 'ffprobe': bool(shutil.which('ffprobe')), 'js_runtimes': list(options()['js_runtimes']), 'yt_dlp_version': yt_dlp.version.__version__, 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'youtube_cooldown_seconds': int(source_access.youtube.remaining()), 'active': active}
 
 
 def check_source_cooldown(url):
@@ -436,6 +440,59 @@ def destination_snapshot():
         raise HTTPException(409, str(exc))
 
 
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=2,max_length=200)
+    provider: Literal['youtube','dailymotion'] = 'youtube'
+    kind: Literal['videos','playlists'] = 'videos'
+    page: int = Field(default=1,ge=1,le=discovery.MAX_PAGE)
+
+
+@app.post('/api/search')
+def search_sources(req: SearchRequest):
+    query=' '.join(req.query.split())
+    if len(query)<2:
+        raise HTTPException(400,'Enter at least two characters to search.')
+    if req.provider=='dailymotion' and req.kind!='videos':
+        raise HTTPException(400,'Dailymotion discovery currently supports video search. Use YouTube for playlist search.')
+    key=(req.provider,req.kind,query.casefold(),req.page)
+    guard=search_locks[req.provider]
+    if not guard.acquire(blocking=False):
+        raise HTTPException(429,'A search for this platform is already running. Wait for it to finish.',headers={'Retry-After':'3'})
+    try:
+        with search_cache_lock:
+            cached=search_cache.get(key)
+        if cached and time.monotonic()-cached[0]<300:
+            result=cached[1]
+        else:
+            if req.provider=='youtube':
+                result=discovery.youtube(query,req.kind,req.page,lambda url,download,settings:extract_video(url,download,options()|settings))
+            else:
+                result=discovery.dailymotion(query,req.page)
+            with search_cache_lock:
+                if len(search_cache)>=50:
+                    search_cache.pop(next(iter(search_cache)))
+                search_cache[key]=(time.monotonic(),result)
+        counts=storage.video_counts(DATA)
+        rows=[row|{'previous_downloads':counts.get(storage.video_key(row['url']),0) if row['kind']=='videos' else 0} for row in result['results']]
+        # Safe flat metadata improves queued-card labels without treating search as full format analysis.
+        with lock:
+            for row in rows:
+                if row['kind']!='videos':continue
+                if len(analysis_cache)>=100:analysis_cache.pop(next(iter(analysis_cache)))
+                analysis_cache[row['url']]=(time.monotonic(),{name:row[name] for name in ('title','thumbnail','duration','platform')})
+        return {'query':query,'provider':req.provider,'kind':req.kind,'page':req.page,
+                'results':rows,'has_more':result['has_more'],'cached':bool(cached and time.monotonic()-cached[0]<300)}
+    except (source_access.SourceRateLimited,source_access.SourceBusy) as exc:
+        raise HTTPException(429,str(exc),headers={'Retry-After':str(exc.retry_after)})
+    except discovery.SearchFailure as exc:
+        raise HTTPException(502,str(exc))
+    except HTTPException:raise
+    except Exception as exc:
+        raise HTTPException(422,download_error(exc))
+    finally:
+        guard.release()
+
+
 @app.post('/api/analyze')
 def analyze(req: VideoRequest):
     validate_url(req.url)
@@ -498,25 +555,28 @@ def build_playlist(req, cancel=None, phase=None):
         reported = reported if isinstance(reported, int) and reported >= 0 else len(entries)
         if max(len(entries), reported) > MAX_PLAYLIST:
             raise HTTPException(400, f'This playlist exceeds {MAX_PLAYLIST} entries. Split it into smaller playlists; no partial playlist was queued.')
-        videos, seen, unavailable, duplicates = [], set(), 0, 0
+        videos, seen, unavailable, duplicates, review = [], set(), 0, 0, []
         for position, entry in enumerate(entries, 1):
-            video_id = entry.get('id', '') if isinstance(entry, dict) else ''
-            if not isinstance(video_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id) or entry.get('availability') in ('private', 'premium_only', 'subscriber_only', 'needs_auth') or entry.get('title') in ('[Private video]', '[Deleted video]') or entry.get('is_live') or entry.get('live_status') in ('is_live', 'is_upcoming', 'post_live'):
-                unavailable += 1
+            row=availability.listed(entry,position)
+            review.append(row)
+            video_id=row['id']
+            if not row['selectable']:
+                unavailable+=1
                 continue
             if video_id in seen:
-                duplicates += 1
+                duplicates+=1
+                row.update(status='duplicate',status_label=availability.LABELS['duplicate'],selectable=False)
                 continue
             seen.add(video_id)
-            videos.append({'id': video_id, 'url': 'https://www.youtube.com/watch?v=' + video_id,
+            videos.append({'status':row['status'],'status_label':row['status_label'],'selectable':True,'id': video_id, 'url': 'https://www.youtube.com/watch?v=' + video_id,
                            'title': str(entry.get('title') or 'YouTube video')[:500], 'duration': entry.get('duration'),
                            'position': position, 'platform': 'YouTube', 'thumbnail': entry.get('thumbnail') or
                            next((t.get('url') for t in reversed(entry.get('thumbnails') or []) if isinstance(t, dict) and isinstance(t.get('url'), str) and t['url'].startswith('https://')), None) or
                            'https://i.ytimg.com/vi/' + video_id + '/hqdefault.jpg'})
-        if not videos:
-            raise HTTPException(422, 'No available videos were found in this playlist. Check its visibility and source access.')
+        if not review:
+            raise HTTPException(422, 'No playlist entries were listed. Check its visibility and source access.')
         token = uuid.uuid4().hex
-        result = {'token': token, 'title': str(info.get('title') or 'YouTube playlist')[:500], 'url': url, 'videos': videos,
+        result = {'token': token, 'title': str(info.get('title') or 'YouTube playlist')[:500], 'url': url, 'videos': videos, 'entries':review,
                   'unavailable': unavailable, 'duplicates_removed': duplicates, 'entries_found': len(entries),
                   'unlisted': max(0, reported - len(entries))}
         with playlist_lock:
@@ -561,7 +621,7 @@ def load_playlist(load_id, req):
 
 def stop_playlist_loads():
     with playlist_load_lock:
-        for item in playlist_loads.values():
+        for item in list(playlist_loads.values())+list(playlist_checks.values()):
             item['cancel'].set()
     playlist_pool.shutdown(wait=False, cancel_futures=True)
 
@@ -609,6 +669,87 @@ def cancel_playlist_load(load_id: str):
             item['status'] = 'cancelling'
 
 
+class PlaylistCheckRequest(BaseModel):
+    token: str = Field(min_length=1,max_length=64)
+    video_ids: list[Annotated[str,Field(min_length=11,max_length=11)]] = Field(min_length=1,max_length=20)
+
+
+def perform_playlist_check(check_id,cache,videos):
+    item=playlist_checks[check_id]
+    with playlist_load_lock:item['status']='running'
+    terminal,detail='ready',None
+    try:
+        for video in videos:
+            if item['cancel'].is_set():
+                raise source_access.SourceCancelled()
+            try:
+                info=extract_video(video['url'],False,options()|{'_playlist_cancel':item['cancel']})
+                state=availability.checked(info)
+            except (source_access.SourceRateLimited,source_access.SourceBusy,source_access.SourceCancelled):raise
+            except Exception as exc:state=availability.checked(error=exc)
+            if item['cancel'].is_set():raise source_access.SourceCancelled()
+            state['check_attempted']=True
+            update_row={'id':video['id'],**state}
+            with playlist_lock:
+                for row in cache['data']['videos']+cache['data'].get('entries',[]):
+                    if row['id']==video['id'] and row.get('status')!='duplicate':row.update(state)
+            with playlist_load_lock:
+                item['updates'].append(update_row)
+                item['checked']+=1
+    except source_access.SourceCancelled:
+        terminal='cancelled'
+    except Exception as exc:
+        terminal,detail='failed',download_error(exc)
+    finally:
+        with playlist_lock:cache['checking']=False
+        with playlist_load_lock:
+            item['status']=terminal
+            if detail:item['detail']=detail
+
+
+@app.post('/api/playlist/checks',status_code=202)
+def start_playlist_check(req: PlaylistCheckRequest):
+    with playlist_lock:
+        cache=playlist_cache.get(req.token)
+        if not cache or time.monotonic()-cache['created']>1800:
+            raise HTTPException(410,'Playlist preview expired. Load it again before checking.')
+        if cache['queued'] is not None or cache.get('checking'):
+            raise HTTPException(409,'This playlist is already queued or being checked. Wait or load a new preview.')
+        ids=set(req.video_ids)
+        videos=[v.copy() for v in cache['data']['videos'] if v['id'] in ids]
+        if len(videos)!=len(ids):raise HTTPException(400,'Choose videos from this playlist preview.')
+        check_source_cooldown(cache['data']['url'])
+        with playlist_load_lock:
+            finished=[key for key,item in playlist_checks.items() if item['status'] in ('ready','failed','cancelled')]
+            if len(playlist_checks)>=10:
+                if not finished:raise HTTPException(429,'Availability checking queue is full. Wait for a check to finish.')
+                playlist_checks.pop(finished[0])
+            check_id=uuid.uuid4().hex
+            playlist_checks[check_id]={'status':'queued','cancel':threading.Event(),'checked':0,'total':len(videos),'updates':[]}
+            cache['checking']=True
+    try:playlist_pool.submit(perform_playlist_check,check_id,cache,videos)
+    except RuntimeError:
+        with playlist_lock:cache['checking']=False
+        with playlist_load_lock:playlist_checks.pop(check_id,None)
+        raise HTTPException(503,'Availability worker unavailable. Restart the app.')
+    return {'id':check_id,'total':len(videos)}
+
+
+@app.get('/api/playlist/checks/{check_id}')
+def playlist_check_status(check_id: str):
+    with playlist_load_lock:
+        item=playlist_checks.get(check_id)
+        if not item:raise HTTPException(404,'Availability check expired. Start a new check.')
+        return {key:item[key] for key in ('status','checked','total','detail') if key in item}|{'updates':[row.copy() for row in item['updates']]}
+
+
+@app.delete('/api/playlist/checks/{check_id}',status_code=204)
+def cancel_playlist_check(check_id: str):
+    with playlist_load_lock:
+        item=playlist_checks.get(check_id)
+        if item:item['cancel'].set()
+
+
 @app.post('/api/playlist/download', status_code=202)
 def download_playlist(req: PlaylistDownloadRequest):
     # Serialize consumption of one preview token, including duplicate HTTP submissions.
@@ -618,8 +759,13 @@ def download_playlist(req: PlaylistDownloadRequest):
             raise HTTPException(410, 'Playlist preview expired. Load the playlist again.')
         if cached['queued'] is not None:
             return cached['queued']
+        if cached.get('checking'):
+            raise HTTPException(409,'Availability check is running. Wait for it to finish or cancel it before queueing.')
         data = cached['data']
-        selected = set(req.video_ids) if req.video_ids is not None else {v['id'] for v in data['videos']}
+        blocked={v['id'] for v in data['videos'] if not v.get('selectable',True)}
+        selected = set(req.video_ids) if req.video_ids is not None else {v['id'] for v in data['videos'] if v.get('selectable',True)}
+        if selected & blocked:
+            raise HTTPException(400,'Some selected videos are private, removed or unavailable. Deselect them before queueing.')
         if not selected or not selected.issubset({v['id'] for v in data['videos']}):
             raise HTTPException(400, 'Select at least one video from the loaded playlist.')
         videos = [v for v in data['videos'] if v['id'] in selected]

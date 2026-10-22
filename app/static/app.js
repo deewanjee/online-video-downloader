@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const UI_VERSION = '3.0.0';
+const UI_VERSION = '3.1.0';
 const audioFormats = ['mp3', 'm4a', 'wav'];
 function icon(name) {
   const paths = {play:'<path d="m8 5 11 7-11 7z"/>',arrow:'<path d="M6 18 18 6M6 6h12v12"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>'};
@@ -31,13 +31,14 @@ let playerVersion = 0, previewTimer = null, previewController = null;
 let originalFallback = null, originalTimer = null;
 const rendered = new Map();
 function view(name) {
-  for (const n of ['home','downloads','platforms','recovery']) $(n).hidden = n !== name;
+  for (const n of ['home','discover','downloads','platforms','recovery']) $(n).hidden = n !== name;
   document.querySelectorAll('.nav').forEach(el => { el.classList.toggle('active',el.dataset.view === name); el.setAttribute('aria-current', el.dataset.view === name ? 'page' : 'false'); });
-  $('page-label').textContent = {home:'Dashboard',downloads:'Video library',platforms:'Platform insights',recovery:'Recovery center'}[name];
+  $('page-label').textContent = {home:'Dashboard',discover:'Discover',downloads:'Video library',platforms:'Platform insights',recovery:'Recovery center'}[name];
   window.scrollTo(0,0);
   if (name === 'recovery' && typeof loadRecovery === 'function') loadRecovery();
 }
 document.querySelectorAll('.nav').forEach(el => el.onclick = () => view(el.dataset.view));
+$('home-discover').onclick = () => {view('discover');$('discovery-query').focus();};
 $('home-library').onclick = () => view('downloads');
 $('view-all').onclick = () => view('downloads'); $('see-platforms').onclick = () => view('platforms');
 function notice(message,retryAfter = 0) {
@@ -203,24 +204,26 @@ $('bulk-form').onsubmit = async event => {
   } catch(e) { box.textContent = e.message; }
   finally { $('bulk-button').disabled = false; }
 };
+let playlistChecking = false, playlistCheckId = null;
 let playlist = null, playlistVersion = 0, playlistController = null, playlistQueuing = false;
 function playlistSelection() {
   const boxes = [...$('playlist-videos').querySelectorAll('input[type=checkbox]')];
-  const selected = boxes.filter(box => box.checked);
-  $('playlist-selected').textContent = selected.length+' / '+boxes.length+' selected';
-  $('playlist-select-all').checked = boxes.length > 0 && selected.length === boxes.length;
-  $('playlist-select-all').indeterminate = selected.length > 0 && selected.length < boxes.length;
-  $('playlist-queue').textContent = selected.length === boxes.length ? '↓ Queue entire playlist' : '↓ Queue '+selected.length+' selected videos';
-  $('playlist-queue').disabled = !selected.length || playlistQueuing;
+  const eligible = boxes.filter(box => !box.disabled);
+  const selected = eligible.filter(box => box.checked);
+  $('playlist-selected').textContent = selected.length+' / '+eligible.length+' selectable videos · '+(boxes.length-eligible.length)+' disabled';
+  $('playlist-select-all').checked = eligible.length > 0 && selected.length === eligible.length;
+  $('playlist-select-all').indeterminate = selected.length > 0 && selected.length < eligible.length;
+  $('playlist-queue').textContent = selected.length === eligible.length ? '↓ Queue all selectable videos' : '↓ Queue '+selected.length+' selected videos';
+  $('playlist-queue').disabled = !selected.length || playlistQueuing || playlistChecking;
   return selected.map(box => box.value);
 }
 $('playlist-select-all').onchange = () => {
-  $('playlist-videos').querySelectorAll('input[type=checkbox]').forEach(box => { box.checked = $('playlist-select-all').checked; });
+  $('playlist-videos').querySelectorAll('input[type=checkbox]').forEach(box => { box.checked = !box.disabled && $('playlist-select-all').checked; });
   playlistSelection();
 };
 $('playlist-format').onchange = () => { $('playlist-quality-label').hidden = audioFormats.includes($('playlist-format').value); };
 $('playlist-url').oninput = () => {
-  if (playlistQueuing) return;
+  if (playlistQueuing || playlistChecking) return;
   playlistVersion++; playlistController?.abort(); playlistController = null; playlist = null;
   $('playlist-result').hidden = true; $('playlist-message').hidden = true; $('playlist-load').disabled = false; $('playlist-cancel').hidden = true;
 };
@@ -237,7 +240,7 @@ function playlistPause(signal) {
   });
 }
 $('playlist-form').onsubmit = async event => {
-  event.preventDefault(); if (playlistQueuing) return;
+  event.preventDefault(); if (playlistQueuing || playlistChecking) return;
   const version = ++playlistVersion, box = $('playlist-message');
   playlistController?.abort(); const controller = new AbortController(); playlistController = controller; playlist = null;
   let loadId = null, finished = false;
@@ -259,17 +262,9 @@ $('playlist-form').onsubmit = async event => {
       box.textContent = state.status === 'queued' ? 'Playlist analysis queued. Video downloads continue independently.' : state.phase === 'waiting_metadata' ? 'Another YouTube analysis is running. Waiting for a metadata slot'+elapsed : state.entries > 0 ? 'Reading playlist · '+state.entries+' entries found'+elapsed : 'Loading playlist from YouTube'+elapsed+'. Video downloads continue independently.';
       await playlistPause(controller.signal);
     }
-    playlist = result; $('playlist-title').textContent = result.title;
-    $('playlist-summary').textContent = result.videos.length+' available videos'+(result.unavailable?' · '+result.unavailable+' unavailable/live entries skipped':'')+(result.unlisted?' · '+result.unlisted+' entries not listed by YouTube (may be hidden or unavailable)':'')+(result.duplicates_removed?' · '+result.duplicates_removed+' duplicates skipped':'')+'.';
-    const fragment = document.createDocumentFragment();
-    for (const video of result.videos) {
-      const row = document.createElement('label'); row.className = 'playlist-video';
-      const check = document.createElement('input'); check.type = 'checkbox'; check.value = video.id; check.checked = true; check.onchange = playlistSelection;
-      const title = document.createElement('span'); title.textContent = video.position+'. '+video.title;
-      const meta = document.createElement('small'); meta.textContent = video.duration ? duration(video.duration) : '';
-      row.append(check,title,meta); fragment.append(row);
-    }
-    $('playlist-videos').replaceChildren(fragment); $('playlist-result').hidden = false;
+    playlist = result; $('playlist-check-status').textContent = ''; $('playlist-title').textContent = result.title;
+    $('playlist-summary').textContent = result.videos.length+' selectable entries'+(result.unavailable?' · '+result.unavailable+' unavailable/live entries skipped':'')+(result.unlisted?' · '+result.unlisted+' entries not listed by YouTube (may be hidden or unavailable)':'')+(result.duplicates_removed?' · '+result.duplicates_removed+' duplicates skipped':'')+'.';
+    renderPlaylistRows(false); $('playlist-result').hidden = false;
     playlistSelection(); box.textContent = 'Choose your format and queue the whole playlist, or select individual videos.';
   } catch(e) { if (version === playlistVersion && e.name !== 'AbortError') box.textContent = e.message; }
   finally {
@@ -278,7 +273,7 @@ $('playlist-form').onsubmit = async event => {
   }
 };
 $('playlist-queue').onclick = async () => {
-  if (!playlist || playlistQueuing) return;
+  if (!playlist || playlistQueuing || playlistChecking) return;
   const video_ids = playlistSelection(); if (!video_ids.length) return;
   playlistQueuing = true; $('playlist-queue').disabled = true; $('playlist-load').disabled = true; $('playlist-url').disabled = true;
   $('playlist-message').hidden = false; $('playlist-message').textContent = 'Adding selected playlist videos…';

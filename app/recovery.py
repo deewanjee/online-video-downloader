@@ -9,7 +9,7 @@ def classify(error):
     text = str(error).lower().replace('unavailable or has been removed', 'unavailable')
     rules = [
         ('rate_limit', True, ('http 429','http error 429','too many requests','youtube is limiting'), 'Wait for the source cooldown. Recovery will retry after the current queue.'),
-        ('access', False, ('private video','requires sign-in','sign in','login required','age verification','bot verification','confirm your age','confirm you'), 'Open the source link and check your authorized access. See Troubleshooting.'),
+        ('access', False, ('private video', 'video is private','requires sign-in','sign in','login required','age verification','bot verification','confirm your age','confirm you'), 'Open the source link and check your authorized access. See Troubleshooting.'),
         ('restricted', False, ('drm','region','country','geo-restricted'), 'Check source availability and permissions. Automatic recovery cannot remove source restrictions.'),
         ('removed', False, ('has been removed','has been deleted','http error 404'), 'Check the source link. Removed videos need an available replacement link.'),
         ('storage', False, ('disk space','not writable','folder is unavailable','permissions','cookie file','certificate'), 'Check the selected folder, free disk space or local setup, then retry manually.'),
