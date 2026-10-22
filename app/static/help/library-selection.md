@@ -18,4 +18,4 @@ Find completed videos, select across pages and remove unwanted entries.
 
 1. Direct-save originals in your selected folder are kept when removed from the library. Project-owned legacy/server media and cache are deleted. Lifetime download counters stay intact.
 2. Queued work can be removed before it starts. Running downloads and active previews are protected; a partial removal result explains entries that could not be removed.
-3. Again creates a fresh job without deleting an existing original.
+3. Again asks for confirmation before creating a fresh job; an existing original is kept.

@@ -3,7 +3,7 @@ let discoveryResults = new Map(), discoverySelected = new Set(), discoverySearch
 let discoveryController = null, discoveryVersion = 0, discoveryPage = 1, discoveryMore = false, discoveryBusy = false;
 function discoverySelection() {
   const index=discoveryJobIndex();
-  const ready=[...discoverySelected].map(url=>discoveryResults.get(url)).filter(Boolean).filter(row=>{const state=discoveryState(row,index);return !state.active && !state.pending;}).length;
+  const ready=[...discoverySelected].map(url=>discoveryResults.get(url)).filter(Boolean).filter(row=>{const state=discoveryState(row,index);return !state.active && !state.pending && (repeatAllowed() || !state.count);}).length;
   $('discovery-selected').textContent=discoverySelected.size+' selected'+(ready<discoverySelected.size?' · '+(discoverySelected.size-ready)+' already in progress':'');
   $('discovery-queue').disabled=!ready || discoveryBusy;
   for(const checkbox of $('discovery-results').querySelectorAll('input[type=checkbox]')) checkbox.checked=discoverySelected.has(checkbox.value);
@@ -11,9 +11,11 @@ function discoverySelection() {
 function discoveryReset() {
   discoveryVersion++;discoveryController?.abort();discoveryController=null;
   discoverySelected.clear();discoveryResults.clear();discoverySearch=null;
+  if(typeof syncDiscoveryFilters==='function')discoveryFilter='new';
   $('discovery-download-controls').hidden=true;$('discovery-pagination').replaceChildren();
   $('discovery-results').replaceChildren();$('discovery-message').hidden=true;
   $('discovery-submit').disabled=false;$('discovery-cancel').hidden=true;
+  if(typeof syncDiscoveryFilters==='function')syncDiscoveryFilters();
 }
 $('discovery-provider').onchange=()=>{if($('discovery-provider').value==='dailymotion')$('discovery-kind').value='videos';$('discovery-kind').disabled=$('discovery-provider').value==='dailymotion';discoveryReset();};
 $('discovery-kind').onchange=discoveryReset;
@@ -65,29 +67,30 @@ function syncDiscoveryJobs() {
     detail.textContent=state.detail;detail.title=state.detail;
     progress.hidden=!state.active;
     if(state.active){progress.value=state.progress;progress.setAttribute('aria-valuetext',state.label);}
-    download.disabled=discoveryBusy || !!state.active || state.pending;
-    download.textContent=state.active?({queued:'Queued',downloading:'Downloading…',processing:'Finishing…'}[state.active.status]):state.pending?'Adding…':state.kind==='failed'?'Retry download':state.count?'Download again':'Download';
+    download.disabled=discoveryBusy || !!state.active || state.pending || (!!state.count && !repeatAllowed());
+    download.textContent=state.active?({queued:'Queued',downloading:'Downloading…',processing:'Finishing…'}[state.active.status]):state.pending?'Adding…':state.count && !repeatAllowed()?'Already downloaded':state.kind==='failed'?'Retry download':state.count?'Download again':'Download';
     preview.textContent=state.saved?'Play saved':'Preview';
     coverPlay.setAttribute('aria-label',(state.saved?'Play saved video: ':'Preview video: ')+row.title);
     coverPlay.title=state.saved?'Play saved video':'Preview on '+row.platform;
   }
   discoverySelection();syncSourcePreview(index);
+  if(typeof syncDiscoveryFilters==='function')syncDiscoveryFilters();
 }
 async function queueDiscovered(rows) {
   if(discoveryBusy || !rows.length)return;
-  rows=rows.filter(row=>{const state=discoveryState(row);return !state.active && !state.pending;});
-  if(!rows.length){searchMessage('These videos are already in your queue. Progress is shown on each thumbnail.');return;}
+  rows=rows.filter(row=>{const state=discoveryState(row);return !state.active && !state.pending && (repeatAllowed() || !state.count);});
+  if(!rows.length){searchMessage('These videos are already queued or downloaded. Open Completed to play saved files; enable Allow repeat downloads only for another copy.');return;}
   discoveryBusy=true;rows.forEach(row=>discoveryPending.add(discoveryKey(row)));discoverySelection();syncDiscoveryJobs();
   try {
     await ensureDownloadLocation();
-    const result=await api('/api/download/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls:rows.map(row=>row.url),format:$('discovery-format').value,quality:$('discovery-quality').value,youtube_concurrency:1})});
+    const result=await api('/api/download/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls:rows.map(row=>row.url),format:$('discovery-format').value,quality:$('discovery-quality').value,youtube_concurrency:1,allow_repeat:repeatAllowed()})});
     // Show returned jobs immediately, then reconcile with the shared two-second poll.
     const incoming=result.jobs || [],ids=new Set(incoming.map(job=>job.id));
     jobs=[...incoming,...jobs.filter(job=>!ids.has(job.id))];
     // Older servers omit source keys on submission; the canonical search URL still matches.
     for(const job of incoming){const row=rows.find(row=>row.url===job.url);if(row && !job.source_key)job.source_key=discoveryKey(row);}
     rows.forEach(row=>discoverySelected.delete(row.url));syncDiscoveryJobs();
-    searchMessage(result.added+(result.added===1?' video':' videos')+' added to your download queue. Live progress appears on the thumbnails below.');await refresh();
+    searchMessage(result.added+(result.added===1?' video':' videos')+' added to your download queue.'+(result.duplicates_removed?' '+result.duplicates_removed+' duplicates skipped.':'')+' Live progress appears on the thumbnails below.');await refresh();
   }catch(e){searchMessage(e.message);}finally{rows.forEach(row=>discoveryPending.delete(discoveryKey(row)));discoveryBusy=false;discoverySelection();syncDiscoveryJobs();}
 }
 $('discovery-queue').onclick=()=>queueDiscovered([...discoverySelected].map(url=>discoveryResults.get(url)).filter(Boolean));
@@ -95,7 +98,7 @@ function renderDiscovery(rows) {
   const box=$('discovery-results');box.replaceChildren();
   if(!rows.length){const empty=document.createElement('div');empty.className='empty';empty.textContent='No matching results. Try a different title, topic or platform.';box.append(empty);return;}
   for(const row of rows) {
-    const card=document.createElement('article');card.className='discovery-card';card.dataset.sourceId=row.id;
+    const card=document.createElement('article');card.className='discovery-card';card.dataset.sourceId=row.id;card.dataset.resultKind=row.kind;
     const cover=document.createElement('div');cover.className='discovery-cover';placeholder(cover,row.platform);image(cover,row.thumbnail,'Thumbnail for '+row.title);
     if(row.kind==='videos') {
       const label=document.createElement('label');label.className='card-select';
@@ -145,8 +148,8 @@ function syncSourcePreview(index=discoveryJobIndex()) {
   $('source-preview-saved').hidden=!state.saved;
   const status=state.kind==='idle'?'':state.label+' · '+state.detail;
   if($('source-preview-download-status').textContent!==status)$('source-preview-download-status').textContent=status;
-  $('source-preview-download').disabled=discoveryBusy || !!state.active || state.pending;
-  $('source-preview-download').textContent=state.active?state.label:state.pending?'Adding…':state.count?'Download again':'Download this video';
+  $('source-preview-download').disabled=discoveryBusy || !!state.active || state.pending || (!!state.count && !repeatAllowed());
+  $('source-preview-download').textContent=state.active?state.label:state.pending?'Adding…':state.count && !repeatAllowed()?'Already downloaded':state.count?'Download again':'Download this video';
 }
 function playDiscovered(row) {
   const state=discoveryState(row);
@@ -189,15 +192,15 @@ $('discovery-form').onsubmit=event=>{event.preventDefault();runDiscovery();};
 function renderPlaylistRows(preserve=true) {
   const before=new Set([...$('playlist-videos').querySelectorAll('input:checked')].map(input=>input.value));
   const rows=playlist.entries || playlist.videos;
-  const selectable=rows.filter(row=>row.selectable!==false).length;
-  $('playlist-summary').textContent=selectable+' selectable entries · '+(rows.length-selectable)+' unavailable or duplicate entries excluded'+(playlist.unlisted?' · '+playlist.unlisted+' entries not listed by YouTube':'')+'.';
+  const selectable=rows.filter(row=>row.selectable!==false && !row.already_queued && (repeatAllowed() || !row.previous_downloads)).length;
+  $('playlist-summary').textContent=selectable+' selectable entries · '+(rows.length-selectable)+' excluded · '+rows.filter(row=>row.previous_downloads>0).length+' already downloaded'+(playlist.unlisted?' · '+playlist.unlisted+' entries not listed by YouTube':'')+'.';
   const fragment=document.createDocumentFragment();
   for(const video of rows) {
     const row=document.createElement('label');row.className='playlist-video availability-'+(video.status || 'unknown');
-    const input=document.createElement('input');input.type='checkbox';input.value=video.id;input.disabled=video.selectable===false;
+    const input=document.createElement('input');input.type='checkbox';input.value=video.id;input.disabled=video.selectable===false || video.already_queued || (video.previous_downloads>0 && !repeatAllowed());
     input.checked=!input.disabled && (!preserve || before.has(video.id));input.onchange=playlistSelection;
     const title=document.createElement('span');title.textContent=video.position+'. '+video.title;
-    const status=document.createElement('small');status.className='playlist-availability';status.textContent=video.status_label || 'Not verified';status.title=video.detail || 'Flat listing information; choose Check selected for a live access check.';
+    const status=document.createElement('small');status.className='playlist-availability';status.textContent=(video.previous_downloads?'✓ Already downloaded · ':'')+(video.already_queued?'In queue · ':'')+(video.status_label || 'Not verified');status.title=video.detail || 'Flat listing information; choose Check selected for a live access check.';
     row.append(input,title,status);fragment.append(row);
   }
   $('playlist-videos').replaceChildren(fragment);playlistSelection();

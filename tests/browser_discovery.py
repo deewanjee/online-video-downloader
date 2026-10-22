@@ -35,7 +35,10 @@ def serve(port):
 
     def extracted(dl, url, download=False):
         if not download:
+            if 'list=' in url:
+                return {'_type':'playlist','title':'Playlist with previous downloads','entries':[{'id':f'clip{i:07d}','title':'[Private video]' if i==3 else f'Playlist video {i}','availability':'private' if i==3 else 'public'} for i in range(1,6)]}
             if '/results?' in url:
+                if 'sp=EgIQAw' in url:return {'entries':[{'id':'PLhistory123456','title':'Playlist result','playlist_count':5}]}
                 start = dl.params.get('playliststart', 1)
                 return {'entries': [{'id': f'clip{i:07d}', 'title': f'Journey {i}: a new perspective',
                                      'channel': 'AAASoft test creator', 'duration': 140+i}
@@ -104,6 +107,7 @@ def verify():
                     executable = os.environ.get('CHROMIUM_EXECUTABLE')
                     browser = p.chromium.launch(**({'executable_path': executable} if executable else {}), args=['--no-sandbox'])
                     page = browser.new_page(viewport={'width': 1440, 'height': 1050})
+                    page.emulate_media(reduced_motion='reduce')
                     errors, embeds = [], []
                     page.on('pageerror', lambda error: errors.append(str(error)))
                     page.route('https://i.ytimg.com/**', lambda route: route.fulfill(content_type='image/svg+xml', body='<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><rect width="640" height="360" fill="#49758a"/><path d="M0 350 180 120 360 300 470 160 640 360" fill="#254d62"/><circle cx="480" cy="80" r="35" fill="#e5d4a9"/></svg>'))
@@ -138,7 +142,7 @@ def verify():
                     first.locator('input').check()
                     assert page.locator('#discovery-queue').is_disabled()
                     page.evaluate("queueDiscovered([discoveryResults.get('https://www.youtube.com/watch?v=clip0000001')])")
-                    page.wait_for_function("document.querySelector('#discovery-message').textContent.includes('already in your queue')")
+                    page.wait_for_function("document.querySelector('#discovery-message').textContent.includes('already queued or downloaded')")
                     assert len(page.request.get(base+'/api/jobs').json()) == 3, 'No duplicate active jobs'
                     page.request.post(base+'/_test/merging')
                     page.wait_for_selector('.discovery-card[data-state=processing]')
@@ -154,7 +158,15 @@ def verify():
                     assert page.locator('#source-preview-saved').is_visible()
                     page.click('#source-preview-close')
                     page.wait_for_function("document.querySelector('#source-preview-frame').children.length===0")
+                    assert first.is_hidden()
+                    page.locator('[data-discovery-tab=downloaded]').click()
+                    assert first.is_visible()
+                    assert first.locator('.primary').inner_text() == 'Already downloaded'
+                    assert first.locator('.primary').is_disabled()
+                    page.check('#allow-repeat')
                     assert first.locator('.primary').inner_text() == 'Download again'
+                    assert first.locator('.primary').is_enabled()
+                    page.uncheck('#allow-repeat')
                     assert first.locator('.discovery-preview').inner_text() == 'Play saved'
                     assert first.locator('.discovery-progress').is_hidden()
                     failed = page.locator('.discovery-card[data-state=failed]')
@@ -171,6 +183,20 @@ def verify():
                     page.wait_for_function("document.querySelector('#discovery-message').textContent.includes('Page 2')")
                     page.get_by_role('button', name='Previous', exact=True).click()
                     page.wait_for_selector('.discovery-card[data-source-id=clip0000001][data-state=completed]')
+                    page.locator('[data-view=completed]').click()
+                    assert page.locator('#status-filter').input_value()=='completed'
+                    assert page.locator('#all-jobs .job.completed').count()==2
+                    if screenshot:
+                        page.locator('#all-jobs .job').first.focus()
+                        page.screenshot(path=str(Path(screenshot).with_name('completed-library-v33.png')),full_page=True)
+                    before_repeat=len(page.request.get(base+'/api/jobs').json())
+                    page.locator('#all-jobs .job').first.locator('.redownload-button').click()
+                    page.wait_for_selector('#repeat-dialog[open]')
+                    page.click('#repeat-cancel')
+                    assert len(page.request.get(base+'/api/jobs').json())==before_repeat
+                    page.locator('[data-library-tab=pending]').click()
+                    assert page.locator('#all-jobs .job.completed').count()==0
+                    page.locator('[data-view=discover]').click()
                     # Re-fetch search metadata and confirm status survives a new search/cache hit.
                     page.click('#discovery-submit')
                     page.wait_for_selector('.discovery-card[data-source-id=clip0000001][data-state=completed]')
@@ -199,6 +225,48 @@ def verify():
                     assert page.request.delete(base+'/api/jobs/'+item['id']).ok
                     page.wait_for_selector('.discovery-card[data-source-id=clip0000001][data-state=history]')
                     assert first.locator('.discovery-preview').inner_text() == 'Preview'
+                    # Playlist history remains visible after library deletion and excludes old copies.
+                    page.locator('[data-view=home]').click()
+                    page.locator('#playlist-panel summary').click()
+                    page.fill('#playlist-url','https://www.youtube.com/playlist?list=PLhistory123456')
+                    page.click('#playlist-load')
+                    page.wait_for_selector('#playlist-result:not([hidden])')
+                    assert page.locator('#playlist-videos input:checked').count()==2
+                    for video_id in ('clip0000001','clip0000002'):
+                        box=page.locator('#playlist-videos input[value='+video_id+']')
+                        assert box.is_disabled()
+                        assert 'Already downloaded' in box.locator('..').inner_text()
+                    if screenshot:page.screenshot(path=str(Path(screenshot).with_name('playlist-history-v33.png')),full_page=True)
+                    page.check('#allow-repeat')
+                    assert page.locator('#playlist-videos input[value=clip0000001]').is_enabled()
+                    assert page.locator('#playlist-videos input[value=clip0000003]').is_disabled()
+                    page.uncheck('#allow-repeat')
+                    page.fill('#url','https://www.youtube.com/watch?v=clip0000001')
+                    page.click('#analyze-button')
+                    page.wait_for_selector('#video-result:not([hidden])')
+                    assert page.locator('#download-button').is_disabled()
+                    assert page.locator('#download-button').inner_text()=='Already downloaded'
+                    page.check('#allow-repeat')
+                    assert page.locator('#download-button').is_enabled()
+                    page.uncheck('#allow-repeat')
+                    response=page.request.post(base+'/api/download',data={'url':'https://youtu.be/clip0000001?si=tracking'})
+                    assert response.status==409
+                    page.locator('[data-view=activity]').click()
+                    page.wait_for_selector('#activity-rows tr a')
+                    assert 'clip0000001' in page.locator('#activity-rows').inner_text()
+                    if screenshot:page.screenshot(path=str(Path(screenshot).with_name('activity-log-v33.png')),full_page=True)
+                    records=page.request.get(base+'/api/activity/export?format=json').json()
+                    assert any(item['event']=='completed' for item in records)
+                    assert any(item['event']=='duplicate_skipped' and 'clip0000001' in item['url'] for item in records)
+                    assert any(item['event']=='removed' for item in records)
+                    assert page.request.get(base+'/api/activity/export?format=csv').headers['content-type'].startswith('text/csv')
+                    assert page.evaluate("parseFloat(getComputedStyle(document.getElementById('activity-search')).fontSize)>=14")
+                    page.locator('[data-view=discover]').click()
+                    page.select_option('#discovery-kind','playlists')
+                    page.click('#discovery-submit')
+                    page.wait_for_selector('.discovery-card[data-result-kind=playlists]')
+                    assert page.locator('.discovery-card[data-result-kind=playlists]').is_visible()
+                    assert page.locator('[data-discovery-tab=downloaded]').is_hidden()
                     # Validate provider allowlist and Dailymotion embed construction.
                     assert page.evaluate("discoveryEmbedURL({provider:'youtube',id:'../bad'})") is None
                     assert page.evaluate("discoveryEmbedURL({provider:'other',id:'clip0000001'})") is None
@@ -207,11 +275,12 @@ def verify():
                     assert 'https://www.dailymotion.com/embed/video/x123abc?autoplay=1' in embeds
                     page.keyboard.press('Escape')
                     page.wait_for_function("document.querySelector('#source-preview-frame').children.length===0")
+                    page.locator('[data-view=discover]').click()
                     page.set_viewport_size({'width': 390, 'height': 844})
                     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
                     assert not errors, errors
                     browser.close()
-                    print('PASS: preview without queueing, frame teardown, individual queues, live progress, duplicate guard, merging, completion, failure, saved playback, paging/search reconciliation, history-only badge, embed allowlist and responsive width; no JavaScript errors.')
+                    print('PASS: archive, persistent duplicate prevention, playlist history, retained/exportable activity, readable fonts, preview without queueing, frame teardown, individual queues, live progress, duplicate guard, merging, completion, failure, saved playback, paging/search reconciliation, history-only badge, embed allowlist and responsive width; no JavaScript errors.')
             finally:
                 process.terminate()
                 try:

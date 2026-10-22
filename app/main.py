@@ -18,7 +18,7 @@ from itertools import islice
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from app import storage
@@ -75,11 +75,13 @@ class VideoRequest(BaseModel):
     url: str = Field(max_length=2048)
 
 class DownloadRequest(VideoRequest):
+    allow_repeat: bool = False
     format: str = 'mp4'
     quality: str = '1080'
 
 
 class BulkDownloadRequest(BaseModel):
+    allow_repeat: bool = False
     urls: list[Annotated[str, Field(max_length=2048)]] = Field(min_length=1, max_length=50)
     format: str = 'mp4'
     quality: str = '1080'
@@ -87,6 +89,7 @@ class BulkDownloadRequest(BaseModel):
 
 
 class PlaylistDownloadRequest(BaseModel):
+    allow_repeat: bool = False
     token: str = Field(min_length=1, max_length=64)
     video_ids: list[Annotated[str, Field(max_length=11)]] | None = Field(default=None, max_length=1000)
     format: str = 'mp4'
@@ -502,6 +505,7 @@ def analyze(req: VideoRequest):
             raise HTTPException(400, 'Please choose a single, non-live video.')
         heights = sorted({f['height'] for f in info.get('formats', []) if f.get('height') and f.get('vcodec') != 'none'}, reverse=True)
         result = {'title': info.get('title', 'Untitled video'), 'author': info.get('uploader', 'Unknown creator'), 'duration': info.get('duration'), 'thumbnail': info.get('thumbnail'), 'platform': info.get('extractor_key'), 'qualities': heights, 'url': req.url}
+        result['source_key']=storage.video_key(req.url)
         result['previous_downloads'] = storage.downloaded_count(DATA, req.url)
         with lock:
             if len(analysis_cache) >= 100:
@@ -575,6 +579,14 @@ def build_playlist(req, cancel=None, phase=None):
                            'https://i.ytimg.com/vi/' + video_id + '/hqdefault.jpg'})
         if not review:
             raise HTTPException(422, 'No playlist entries were listed. Check its visibility and source access.')
+        counts=storage.video_counts(DATA)
+        with lock:
+            active_keys={storage.video_key(j.get('url','')) for j in jobs.values() if j['status'] in ('queued','downloading','processing')}
+        for row in review+videos:
+            key=storage.video_key(row['url']) if row.get('url') else ''
+            row['source_key']=key
+            row['previous_downloads']=counts.get(key,0)
+            row['already_queued']=key in active_keys
         token = uuid.uuid4().hex
         result = {'token': token, 'title': str(info.get('title') or 'YouTube playlist')[:500], 'url': url, 'videos': videos, 'entries':review,
                   'unavailable': unavailable, 'duplicates_removed': duplicates, 'entries_found': len(entries),
@@ -926,6 +938,18 @@ def run_download(job_id, req):
     guard = media_lock(job_id)
     with guard:
         if job_id in jobs:
+            job=jobs[job_id];reason=None
+            if job.get('url'):
+                with lock:
+                    key=storage.video_key(job['url'])
+                    older=[other for other in jobs.values() if other['id']!=job_id and other['status'] in ('queued','downloading','processing') and storage.video_key(other.get('url',''))==key and (other.get('created',0),other['id'])<(job.get('created',0),job_id)]
+                    completed=storage.video_counts(DATA).get(key,0)
+                    if older:reason='An earlier copy is already queued or running.'
+                    elif completed and not (job.get('allow_repeat') or job.get('completion_id')):reason='This video was already downloaded. Open Completed or request an explicit repeat.'
+            if reason:
+                update(job_id,status='failed',stage='duplicate_skipped',progress=0,error=reason,error_code='duplicate',recovery_pending=False,next_action='Open Completed or explicitly allow a repeat download.')
+                storage.audit_many(DATA,[(job,'duplicate_skipped',reason)])
+                return
             perform_download(job_id, req)
 
 
@@ -1116,22 +1140,36 @@ def save_queued(job):
         raise HTTPException(503, 'Download history could not be saved. Check free disk space and folder permissions.')
 
 
+def duplicate_reason(url,counts,allow_repeat=False,exclude=None):
+    key=storage.video_key(url)
+    if any(j['id']!=exclude and storage.video_key(j.get('url',''))==key and j['status'] in ('queued','downloading','processing') for j in jobs.values()):
+        return 'active','This video is already queued or downloading. Open Work queue to follow progress.'
+    if not allow_repeat and (counts.get(key,0) or any(j['id']!=exclude and j['status']=='completed' and storage.video_key(j.get('url',''))==key for j in jobs.values())):
+        return 'completed','This video was already downloaded. Open Completed, or explicitly enable Allow repeat downloads for another copy.'
+    return None
+
+
 @app.post('/api/download', status_code=202)
 def download(req: DownloadRequest):
     validate_url(req.url)
-    check_source_cooldown(req.url)
     if req.format not in ('mp4', 'webm', 'mkv', 'mp3', 'm4a', 'wav') or req.quality not in ('2160', '1440', '1080', '720', '480', '360'):
         raise HTTPException(400, 'Unsupported format or quality.')
     if not all(shutil.which(tool) for tool in ('ffmpeg', 'ffprobe')):
         raise HTTPException(503, 'Install FFmpeg and FFprobe to enable verified downloads and conversion.')
     destination = destination_snapshot()
     with lock:
+        reason=duplicate_reason(req.url,storage.video_counts(DATA),req.allow_repeat)
+        if reason:
+            try:storage.audit_many(DATA,[({'url':req.url,'title':'Duplicate prevented','format':req.format,'quality':req.quality},'duplicate_skipped',reason[1])])
+            except (OSError,storage.sqlite3.Error):raise HTTPException(503,'Activity log could not be saved. Check disk space and folder permissions.')
+            raise HTTPException(409,reason[1])
+        check_source_cooldown(req.url)
         if sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values()) >= MAX_ACTIVE:
             raise HTTPException(429, 'Queue is full. Wait for a download to finish.')
         if len(jobs) >= MAX_HISTORY:
             raise HTTPException(429, 'History is full. Remove older downloads first.')
         job_id = uuid.uuid4().hex
-        job = {'id': job_id, 'url': req.url, 'title': 'Preparing download', 'format': req.format, 'quality': req.quality, 'status': 'queued', 'progress': 0, 'created': time.time()}
+        job = {'id': job_id, 'url': req.url, 'title': 'Preparing download', 'format': req.format, 'quality': req.quality, 'status': 'queued', 'progress': 0, 'created': time.time(), 'allow_repeat':req.allow_repeat}
         job.update(destination)
         cached = analysis_cache.get(req.url)
         if cached and time.monotonic() - cached[0] < 900:
@@ -1149,45 +1187,50 @@ def bulk_download(req: BulkDownloadRequest):
 
 
 def queue_batch(input_urls, req, active_limit=MAX_ACTIVE, metadata=None):
-    urls = list(dict.fromkeys(url.strip() for url in input_urls))
-    requests = [DownloadRequest(url=url, format=req.format, quality=req.quality) for url in urls]
-    for item in requests:
-        validate_url(item.url)
-        if source_access.youtube_url(item.url) and (urlparse(item.url).path == '/playlist' or urlparse(item.url).path.startswith(('/@', '/channel/', '/user/', '/c/'))):
-            raise HTTPException(400, 'Use the YouTube playlist panel for playlists. Bulk download accepts individual video links, not channels.')
-        check_source_cooldown(item.url)
-    if req.format not in ('mp4', 'webm', 'mkv', 'mp3', 'm4a', 'wav') or req.quality not in ('2160', '1440', '1080', '720', '480', '360'):
-        raise HTTPException(400, 'Unsupported format or quality.')
-    if not all(shutil.which(tool) for tool in ('ffmpeg', 'ffprobe')):
-        raise HTTPException(503, 'Install FFmpeg and FFprobe to enable downloads.')
-    destination = destination_snapshot()
-    pending = []
+    urls=[url.strip() for url in input_urls]
+    for url in urls:
+        validate_url(url)
+        if source_access.youtube_url(url) and (urlparse(url).path=='/playlist' or urlparse(url).path.startswith(('/@','/channel/','/user/','/c/'))):
+            raise HTTPException(400,'Use the YouTube playlist panel for playlists. Bulk download accepts individual video links, not channels.')
+    if req.format not in ('mp4','webm','mkv','mp3','m4a','wav') or req.quality not in ('2160','1440','1080','720','480','360'):
+        raise HTTPException(400,'Unsupported format or quality.')
+    pending=[];requests=[];skipped=[];seen=set()
     with lock:
-        available = min(active_limit - sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values()), MAX_HISTORY - len(jobs))
-        if len(requests) > available:
-            raise HTTPException(429, f'Only {max(0, available)} queue/history slots are available. Submit fewer links or remove old history.')
-        for item in requests:
-            job = {'id': uuid.uuid4().hex, 'url': item.url, 'title': 'Queued video', 'format': item.format, 'quality': item.quality, 'created': time.time(), 'status': 'queued', 'stage': 'queued', 'progress': 0}
-            job.update(destination)
-            cached = analysis_cache.get(item.url)
-            if cached and time.monotonic() - cached[0] < 900:
-                job.update(cached[1])
-            if metadata:
-                job.update(metadata.get(item.url, {}))
-            pending.append(job)
-        try:
-            storage.save_many(DATA, pending)
-        except (OSError, storage.sqlite3.Error):
-            raise HTTPException(503, 'Bulk queue could not be saved. Check free disk space and folder permissions.')
-        jobs.update({job['id']: job for job in pending})
-        source_access.youtube.slot.set_limit(req.youtube_concurrency)
-    failures = 0
-    for job, item in zip(pending, requests):
-        try:
-            submit_job(job['id'], item)
-        except HTTPException:
-            failures += 1
-    return {'jobs': [job.copy() for job in pending], 'added': len(pending), 'duplicates_removed': len(input_urls) - len(urls), 'submission_failures': failures}
+        counts=storage.video_counts(DATA)
+        for url in urls:
+            key=storage.video_key(url)
+            reason=('batch','Repeated link within this batch.') if key in seen else duplicate_reason(url,counts,req.allow_repeat)
+            seen.add(key)
+            if reason:skipped.append({'url':url,'reason':reason[0],'detail':reason[1]})
+            else:requests.append(DownloadRequest(url=url,format=req.format,quality=req.quality,allow_repeat=req.allow_repeat))
+        available=min(active_limit-sum(j['status'] in ('queued','downloading','processing') for j in jobs.values()),MAX_HISTORY-len(jobs))
+        if requests and len(requests)>available:
+            raise HTTPException(429,f'Only {max(0,available)} queue/history slots are available. Submit fewer links or remove old history.')
+        if requests:
+            if not all(shutil.which(tool) for tool in ('ffmpeg','ffprobe')):
+                raise HTTPException(503,'Install FFmpeg and FFprobe to enable verified downloads and conversion.')
+            for item in requests:check_source_cooldown(item.url)
+            destination=destination_snapshot()
+            for item in requests:
+                job={'id':uuid.uuid4().hex,'url':item.url,'title':'Queued video','format':item.format,'quality':item.quality,'allow_repeat':item.allow_repeat,'created':time.time(),'status':'queued','stage':'queued','progress':0}
+                job.update(destination)
+                cached=analysis_cache.get(item.url)
+                if cached and time.monotonic()-cached[0]<900:job.update(cached[1])
+                if metadata:job.update(metadata.get(item.url,{}))
+                pending.append(job)
+            try:storage.save_many(DATA,pending,[({'url':row['url'],'title':'Duplicate prevented','format':req.format,'quality':req.quality},'duplicate_skipped',row['detail']) for row in skipped])
+            except (OSError,storage.sqlite3.Error):
+                raise HTTPException(503,'Bulk queue could not be saved. Check free disk space and folder permissions.')
+            jobs.update({job['id']:job for job in pending})
+            source_access.youtube.slot.set_limit(getattr(req,'youtube_concurrency',1))
+        if skipped and not requests:
+            try:storage.audit_many(DATA,[({'url':row['url'],'title':'Duplicate prevented','format':req.format,'quality':req.quality},'duplicate_skipped',row['detail']) for row in skipped])
+            except (OSError,storage.sqlite3.Error):raise HTTPException(503,'Activity log could not be saved. Check disk space and folder permissions.')
+    failures=0
+    for job,item in zip(pending,requests):
+        try:submit_job(job['id'],item)
+        except HTTPException:failures+=1
+    return {'jobs':[job.copy() for job in pending],'added':len(pending),'duplicates_removed':len(skipped),'skipped':skipped,'submission_failures':failures}
 
 
 @app.post('/api/jobs/{job_id}/retry', status_code=202)
@@ -1198,6 +1241,8 @@ def retry_job(job_id: str):
             raise HTTPException(404, 'Download not found.')
         if job['status'] != 'failed':
             raise HTTPException(409, 'Only failed downloads can be retried.')
+        reason=duplicate_reason(job['url'],storage.video_counts(DATA),bool(job.get('allow_repeat') or job.get('completion_id')),exclude=job_id)
+        if reason:raise HTTPException(409,reason[1])
         if sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values()) >= MAX_ACTIVE:
             raise HTTPException(429, 'Queue is full. Wait for a download to finish.')
         req = DownloadRequest(url=job['url'], format=job['format'], quality=job['quality'])
@@ -1243,7 +1288,7 @@ def redownload(job_id: str):
             raise HTTPException(404, 'Download not found.')
         if job['status'] not in ('completed', 'failed'):
             raise HTTPException(409, 'This video is already queued or downloading.')
-        req = DownloadRequest(url=job['url'], format=job['format'], quality=job['quality'])
+        req = DownloadRequest(url=job['url'], format=job['format'], quality=job['quality'],allow_repeat=True)
     return download(req)
 
 
@@ -1419,3 +1464,33 @@ def remove_jobs(req: RemoveJobsRequest):
         except HTTPException as exc:
             failed.append({'id': job_id, 'status': exc.status_code, 'detail': exc.detail})
     return {'removed': removed, 'failed': failed}
+
+
+@app.get('/api/activity')
+def activity_log(page:int=1,size:int=50,q:str='',event:str=''):
+    if page<1 or size not in (25,50,100) or len(q)>200 or len(event)>40:
+        raise HTTPException(400,'Invalid activity page or search.')
+    return storage.activity(DATA,page,size,q,event)
+
+
+@app.get('/api/activity/export')
+def export_activity(format:Literal['csv','json']='csv'):
+    def generate():
+        if format=='json':
+            yield '['
+            first=True
+            for row in storage.export_activity(DATA):
+                yield ('' if first else ',')+json.dumps(row,ensure_ascii=False)
+                first=False
+            yield ']'
+        else:
+            import csv,io
+            buffer=io.StringIO();writer=csv.writer(buffer)
+            fields=['id','created_at','event','job_id','url','title','format','quality','detail']
+            yield '\ufeff'
+            writer.writerow(fields);yield buffer.getvalue();buffer.seek(0);buffer.truncate(0)
+            for row in storage.export_activity(DATA):
+                cells=[row.get(key,'') for key in fields]
+                cells=["'"+value if isinstance(value,str) and value.lstrip().startswith(('=','+','-','@')) else value for value in cells]
+                writer.writerow(cells);yield buffer.getvalue();buffer.seek(0);buffer.truncate(0)
+    return StreamingResponse(generate(),media_type='application/json' if format=='json' else 'text/csv',headers={'Content-Disposition':'attachment; filename="aaasoft-activity.'+format+'"','Cache-Control':'no-store'})

@@ -60,6 +60,13 @@ def connect(directory: Path):
         connection.execute('CREATE TABLE IF NOT EXISTS download_events (event_id TEXT PRIMARY KEY, platform TEXT NOT NULL, video_key TEXT NOT NULL, completed_at REAL NOT NULL)')
         connection.execute('CREATE INDEX IF NOT EXISTS events_video_key ON download_events(video_key)')
         connection.execute('CREATE INDEX IF NOT EXISTS events_platform ON download_events(platform)')
+        has_log=connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='activity_log'").fetchone()
+        connection.execute('CREATE TABLE IF NOT EXISTS activity_log (id INTEGER PRIMARY KEY AUTOINCREMENT, created REAL NOT NULL, event TEXT NOT NULL, job_id TEXT, url TEXT NOT NULL, title TEXT NOT NULL, format TEXT, quality TEXT, detail TEXT)')
+        connection.execute('CREATE INDEX IF NOT EXISTS activity_created ON activity_log(created)')
+        if not has_log:
+            for record in connection.execute('SELECT payload FROM jobs').fetchall():
+                job=json.loads(record[0])
+                log_row(connection,job,'imported','Imported existing history; earlier deleted links cannot be reconstructed.')
         yield connection
         connection.commit()
     finally:
@@ -68,20 +75,28 @@ def connect(directory: Path):
 
 def save(directory, job):
     with connect(directory) as connection:
+        old=connection.execute('SELECT payload FROM jobs WHERE id=?',(job['id'],)).fetchone()
+        record_state(connection,job,json.loads(old[0]).get('status') if old else None)
         connection.execute('INSERT OR REPLACE INTO jobs VALUES (?, ?)', (job['id'], json.dumps(job)))
         record_completion(connection, job)
 
 
-def save_many(directory, jobs):
+def save_many(directory, jobs, audit_rows=()):
     records = [(job['id'], json.dumps(job)) for job in jobs]
     with connect(directory) as connection:
+        for job in jobs:
+            old=connection.execute('SELECT payload FROM jobs WHERE id=?',(job['id'],)).fetchone()
+            record_state(connection,job,json.loads(old[0]).get('status') if old else None)
         connection.executemany('INSERT OR REPLACE INTO jobs VALUES (?, ?)', records)
         for job in jobs:
             record_completion(connection, job)
+        for job,event,detail in audit_rows:log_row(connection,job,event,detail)
 
 
 def delete(directory, job_id):
     with connect(directory) as connection:
+        record=connection.execute('SELECT payload FROM jobs WHERE id=?',(job_id,)).fetchone()
+        if record:log_row(connection,json.loads(record[0]),'removed','Removed from library; activity and lifetime counts retained.')
         connection.execute('DELETE FROM jobs WHERE id = ?', (job_id,))
 
 
@@ -92,9 +107,11 @@ def restore(directory):
         for job in jobs.values():
             record_completion(connection, job)
             if job['status'] in ('queued', 'downloading', 'processing'):
+                old_status=job['status']
                 job['recoverable'] = job['status'] == 'processing'
                 job.update(status='failed', progress=0, speed=None, eta=None,
                            error='Interrupted by a server restart. Use Retry to download again.')
+                record_state(connection,job,old_status)
                 connection.execute('UPDATE jobs SET payload = ? WHERE id = ?', (json.dumps(job), job['id']))
             if job.get('preview_status') in ('queued', 'processing'):
                 job.update(preview_status='not_requested', preview_available=False, preview_progress=0)
@@ -116,3 +133,47 @@ def video_counts(directory):
 def downloaded_count(directory, url):
     with connect(directory) as connection:
         return connection.execute('SELECT COUNT(*) FROM download_events WHERE video_key = ?', (video_key(url),)).fetchone()[0]
+
+
+def log_row(connection,job,event,detail=''):
+    connection.execute('INSERT INTO activity_log(created,event,job_id,url,title,format,quality,detail) VALUES (?,?,?,?,?,?,?,?)',
+                       (time.time(),event,job.get('id'),job.get('url',''),str(job.get('title') or 'Video'),job.get('format'),job.get('quality'),detail or job.get('error') or job.get('stage') or ''))
+
+
+def record_state(connection,job,previous):
+    if previous!=job.get('status'):
+        log_row(connection,job,job.get('status','updated'))
+
+
+def audit_many(directory,rows):
+    with connect(directory) as connection:
+        for job,event,detail in rows:log_row(connection,job,event,detail)
+
+
+def activity(directory,page=1,size=50,query='',event=''):
+    where=[];args=[]
+    if query:
+        where.append('(url LIKE ? OR title LIKE ? OR detail LIKE ?)')
+        args.extend(['%'+query+'%']*3)
+    if event:where.append('event=?');args.append(event)
+    clause=' WHERE '+' AND '.join(where) if where else ''
+    with connect(directory) as connection:
+        connection.row_factory=sqlite3.Row
+        total=connection.execute('SELECT COUNT(*) FROM activity_log'+clause,args).fetchone()[0]
+        rows=connection.execute('SELECT * FROM activity_log'+clause+' ORDER BY id DESC LIMIT ? OFFSET ?',args+[size,(page-1)*size]).fetchall()
+    return {'items':[dict(row) for row in rows],'total':total,'page':page,'size':size}
+
+
+def export_activity(directory):
+    # Append-only IDs give a stable export cutoff without a long-running read lock.
+    with connect(directory) as connection:
+        cutoff=connection.execute('SELECT COALESCE(MAX(id),0) FROM activity_log').fetchone()[0]
+    after=0
+    while True:
+        with connect(directory) as connection:
+            connection.row_factory=sqlite3.Row
+            rows=connection.execute('SELECT * FROM activity_log WHERE id>? AND id<=? ORDER BY id LIMIT 500',(after,cutoff)).fetchall()
+        if not rows:return
+        from datetime import datetime,timezone
+        for row in rows:yield dict(row)|{'created_at':datetime.fromtimestamp(row['created'],timezone.utc).isoformat()}
+        after=rows[-1]['id']

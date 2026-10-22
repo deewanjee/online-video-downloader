@@ -178,7 +178,7 @@ def test_history_survives_restart_and_interrupted_jobs_can_retry(tmp_path, monke
     folder = tmp_path / completed['id']
     folder.mkdir()
     (folder / completed['filename']).write_bytes(b'saved-media')
-    interrupted = completed | {'id': 'interrupted', 'status': 'downloading', 'progress': 45}
+    interrupted = completed | {'id': 'interrupted', 'url':'https://youtu.be/interrupted', 'status': 'downloading', 'progress': 45}
     main.storage.save(tmp_path, completed)
     main.storage.save(tmp_path, interrupted)
     restored = main.storage.restore(tmp_path)
@@ -739,7 +739,7 @@ def test_background_preview_does_not_block_download_completion(tmp_path, monkeyp
     monkeypatch.setattr(main,'extract_video',extracted)
     monkeypatch.setattr(main,'playable_file',slow_preview)
     for job_id in ('first','second','third'):
-        main.jobs[job_id]=failed_job(job_id)|{'status':'queued'}
+        main.jobs[job_id]=failed_job(job_id)|{'url':'https://youtu.be/'+job_id,'status':'queued'}
     with ThreadPoolExecutor(max_workers=1) as previews, ThreadPoolExecutor(max_workers=2) as downloads:
         monkeypatch.setattr(main,'preview_pool',previews)
         try:
@@ -1626,7 +1626,7 @@ def test_waiting_youtube_jobs_keep_queue_without_another_source_request(monkeypa
     main.source_access.youtube.limited()
     monkeypatch.setattr(main,'extract_video',lambda *args:pytest.fail('Source contacted during cooldown'))
     for id in ['wait1','wait2','wait3']:
-        job=failed_job(id)|{'status':'queued','stage':'queued'}
+        job=failed_job(id)|{'url':'https://youtu.be/'+id,'status':'queued','stage':'queued'}
         main.jobs[id]=job
         main.run_download(id,main.DownloadRequest(url=job['url']))
     assert len(main.deferred_downloads.pending)==3
@@ -1643,7 +1643,7 @@ def test_source_429_holds_current_job_and_other_queued_jobs(monkeypatch):
         raise main.source_access.SourceRateLimited(main.source_access.youtube.remaining())
     monkeypatch.setattr(main,'extract_video',rejected)
     for id in ['first','second']:
-        job=failed_job(id)|{'status':'queued'};main.jobs[id]=job
+        job=failed_job(id)|{'url':'https://youtu.be/'+id,'status':'queued'};main.jobs[id]=job
         main.run_download(id,main.DownloadRequest(url=job['url']))
     assert len(calls)==1
     assert main.jobs['first']['stage']=='retry_wait' and main.jobs['first']['auto_attempts']==1
@@ -2044,3 +2044,155 @@ def test_discovery_source_identity_survives_cache_hits(monkeypatch):
     cached=client.post('/api/search',json={'query':'canonical'}).json()
     assert cached['cached']
     assert cached['results'][0]['source_key']==first['results'][0]['source_key']
+
+
+def test_default_duplicate_protection_is_atomic_across_canonical_links(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(main.pool,'submit',lambda *a:None)
+    urls=['https://youtu.be/abcDEFG1234?si=one','https://www.youtube.com/watch?v=abcDEFG1234&feature=share']
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses=list(executor.map(lambda url:client.post('/api/download',json={'url':url}),urls))
+    assert sorted(response.status_code for response in responses)==[202,409]
+    assert len(main.jobs)==1
+    assert any(row['event']=='duplicate_skipped' for row in main.storage.activity(main.DATA)['items'])
+
+
+def test_completed_duplicate_is_remembered_after_library_removal_and_restart(monkeypatch):
+    monkeypatch.setattr(main.pool,'submit',lambda *a:None)
+    url='https://youtu.be/abcDEFG1234'
+    main.storage.save(main.DATA,{'id':'past','url':url,'title':'Saved before','status':'completed','created':1})
+    main.storage.delete(main.DATA,'past')
+    monkeypatch.setattr(main,'jobs',main.storage.restore(main.DATA))
+    response=client.post('/api/download',json={'url':'https://youtube.com/shorts/abcDEFG1234'})
+    assert response.status_code==409 and 'already downloaded' in response.json()['detail']
+    repeat=client.post('/api/download',json={'url':url,'allow_repeat':True})
+    assert repeat.status_code==202 and repeat.json()['allow_repeat'] is True
+    assert client.post('/api/download',json={'url':url,'allow_repeat':True}).status_code==409
+
+
+def test_bulk_skips_prior_active_and_canonical_batch_duplicates(monkeypatch):
+    monkeypatch.setattr(main.pool,'submit',lambda *a:None)
+    main.storage.save(main.DATA,{'id':'past','url':'https://youtu.be/abcDEFG1234','title':'Saved','status':'completed','created':1})
+    main.jobs['active']={'id':'active','url':'https://youtu.be/abcDEFG5678','title':'Running','status':'queued','created':2}
+    urls=['https://youtube.com/watch?v=abcDEFG1234','https://youtu.be/abcDEFG5678','https://youtu.be/newDEFG1234','https://youtube.com/shorts/newDEFG1234']
+    response=client.post('/api/download/bulk',json={'urls':urls})
+    assert response.status_code==202
+    assert response.json()['added']==1 and response.json()['duplicates_removed']==3
+    assert {row['reason'] for row in response.json()['skipped']}=={'completed','active','batch'}
+
+
+def test_playlist_preview_marks_downloaded_and_active_entries(monkeypatch):
+    completed=playlist_entry(1);active=playlist_entry(2)
+    main.storage.save(main.DATA,{'id':'past','url':'https://youtu.be/'+completed['id'],'title':'Saved','status':'completed','created':1})
+    main.storage.delete(main.DATA,'past')
+    main.jobs['active']={'id':'active','url':'https://youtu.be/'+active['id'],'status':'queued','created':2}
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'_type':'playlist','entries':[completed,active,playlist_entry(3)]})
+    data=client.post('/api/playlist/analyze',json={'url':'https://youtube.com/playlist?list=PLhistory'}).json()
+    assert data['videos'][0]['previous_downloads']==1
+    assert data['entries'][0]['previous_downloads']==1
+    assert data['videos'][1]['already_queued']
+    monkeypatch.setattr(main.pool,'submit',lambda *a:None)
+    queued=client.post('/api/playlist/download',json={'token':data['token']}).json()
+    assert queued['added']==1 and queued['duplicates_removed']==2
+
+
+def test_stale_playlist_preview_rechecks_history_at_queue_time(monkeypatch):
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'_type':'playlist','entries':[playlist_entry(1)]})
+    data=client.post('/api/playlist/analyze',json={'url':'https://youtube.com/playlist?list=PLrace'}).json()
+    assert not data['videos'][0]['previous_downloads']
+    main.storage.save(main.DATA,{'id':'newly-complete','url':data['videos'][0]['url'],'title':'Saved after listing','status':'completed','created':1})
+    result=client.post('/api/playlist/download',json={'token':data['token']}).json()
+    assert result['added']==0 and result['skipped'][0]['reason']=='completed'
+
+
+def test_old_queued_duplicate_is_suppressed_before_any_source_request(monkeypatch):
+    url='https://youtu.be/abcDEFG1234'
+    main.jobs.update({id:{'id':id,'url':url,'status':'queued','created':i} for i,id in enumerate(['older','later'])})
+    performed=[]
+    monkeypatch.setattr(main,'perform_download',lambda id,req:performed.append(id))
+    main.run_download('later',main.DownloadRequest(url=url))
+    assert not performed and main.jobs['later']['stage']=='duplicate_skipped'
+    main.run_download('older',main.DownloadRequest(url=url))
+    assert performed==['older']
+
+
+def test_retry_cannot_race_an_active_copy(monkeypatch):
+    main.jobs['failed']=failed_job()
+    main.jobs['active']=failed_job('active')|{'status':'queued'}
+    assert client.post('/api/jobs/failed/retry').status_code==409
+
+
+def test_activity_retains_links_and_transitions_after_deletion():
+    job={'id':'logged','url':'https://youtu.be/abcDEFG1234?si=original','title':'Full source link','format':'mp4','quality':'720','status':'queued','created':1}
+    main.storage.save(main.DATA,job)
+    main.storage.save(main.DATA,job|{'status':'completed'})
+    main.storage.save(main.DATA,job|{'status':'completed'})
+    main.storage.delete(main.DATA,job['id'])
+    data=client.get('/api/activity?q=abcDEFG1234&size=25').json()
+    assert data['total']==3
+    assert [row['event'] for row in reversed(data['items'])]==['queued','completed','removed']
+    assert all(row['url']==job['url'] for row in data['items'])
+    assert client.get('/api/activity?event=completed').json()['total']==1
+    exported=client.get('/api/activity/export?format=json')
+    assert len(exported.json())==3 and all('created_at' in row for row in exported.json())
+    assert exported.headers['cache-control']=='no-store'
+
+
+def test_activity_imports_legacy_history_only_once(tmp_path):
+    import sqlite3,json
+    with sqlite3.connect(tmp_path/'history.sqlite3') as connection:
+        connection.execute('CREATE TABLE jobs(id TEXT PRIMARY KEY,payload TEXT NOT NULL)')
+        connection.execute('INSERT INTO jobs VALUES (?,?)',('old',json.dumps({'id':'old','url':'https://youtu.be/legacy00001','title':'Legacy','status':'completed','created':1})))
+    assert main.storage.activity(tmp_path)['total']==1
+    assert main.storage.activity(tmp_path)['items'][0]['event']=='imported'
+    assert main.storage.activity(tmp_path)['total']==1
+
+
+def test_activity_csv_escapes_spreadsheet_formulas_and_preserves_source_urls():
+    import csv,io
+    main.storage.save(main.DATA,{'id':'csv','url':'https://youtu.be/abcDEFG1234','title':'=HYPERLINK("bad")','status':'queued','created':1})
+    response=client.get('/api/activity/export?format=csv')
+    records=list(csv.DictReader(io.StringIO(response.content.decode('utf-8-sig'))))
+    assert records[0]['title'].startswith("'=")
+    assert records[0]['url']=='https://youtu.be/abcDEFG1234'
+    assert records[0]['created_at'].endswith('+00:00')
+
+
+def test_activity_and_exports_require_existing_owner_auth(monkeypatch):
+    monkeypatch.setenv('STREAMVAULT_PASSWORD','owner-secret')
+    for path in ['/api/activity','/api/activity/export?format=csv','/api/activity/export?format=json']:
+        assert client.get(path).status_code==401
+        assert client.get(path,auth=('admin','owner-secret')).status_code==200
+
+
+def test_batch_audit_failure_rolls_back_jobs_and_activity(monkeypatch):
+    real=main.storage.log_row
+    def fail(connection,job,event,detail=''):
+        if event=='duplicate_skipped':raise main.storage.sqlite3.OperationalError('disk full')
+        return real(connection,job,event,detail)
+    monkeypatch.setattr(main.storage,'log_row',fail)
+    response=client.post('/api/download/bulk',json={'urls':['https://youtu.be/abcDEFG1234']*2})
+    assert response.status_code==503
+    assert not main.jobs and not main.storage.restore(main.DATA)
+    assert main.storage.activity(main.DATA)['total']==0
+
+
+def test_activity_export_is_complete_and_uses_stable_cutoff():
+    main.storage.audit_many(main.DATA,[({'url':f'https://youtu.be/clip{i:07d}','title':f'Video {i}'},'queued','') for i in range(601)])
+    stream=main.storage.export_activity(main.DATA)
+    first=next(stream)
+    main.storage.audit_many(main.DATA,[({'url':'https://youtu.be/new00000001','title':'Added during export'},'queued','')])
+    snapshot=[first,*stream]
+    assert len(snapshot)==601 and all(row['title']!='Added during export' for row in snapshot)
+    assert len(client.get('/api/activity/export?format=json').json())==602
+    page1=client.get('/api/activity?size=25').json()
+    page2=client.get('/api/activity?size=25&page=2').json()
+    assert page1['total']==602 and len(page1['items'])==len(page2['items'])==25
+    assert not {row['id'] for row in page1['items']} & {row['id'] for row in page2['items']}
+
+
+def test_activity_exports_only_public_log_fields_not_job_credentials():
+    main.storage.save(main.DATA,{'id':'credential-test','status':'queued','url':'https://youtu.be/abcDEFG1234','created':1,'cookiefile':'secret-cookie-path','proxy':'private-proxy-password'})
+    text=client.get('/api/activity/export?format=json').text
+    assert 'secret-cookie' not in text and 'private-proxy' not in text
+    assert 'abcDEFG1234' in text

@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const UI_VERSION = '3.2.0';
+const UI_VERSION = '3.3.0';
 const audioFormats = ['mp3', 'm4a', 'wav'];
 function icon(name) {
   const paths = {play:'<path d="m8 5 11 7-11 7z"/>',arrow:'<path d="M6 18 18 6M6 6h12v12"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>'};
@@ -23,18 +23,23 @@ for (const id of ['platform-grid','all-platforms']) {
     $(id).append(el);
   }
 }
-let analyzed = null, jobs = [], busy = false, playingId = null;
+let analyzed = null, jobs = [], busy = false, playingId = null, singleQueuing=false;
 let analysisVersion = 0, analysisController = null, refreshing = null, refreshAgain = false;
 let noticeTimer = null, toastTimer = null;
 let locationSettings = null, destinationPromise = null, locationInputDirty = false;
 let playerVersion = 0, previewTimer = null, previewController = null;
 let originalFallback = null, originalTimer = null;
 const rendered = new Map();
-function view(name) {
-  for (const n of ['home','discover','downloads','platforms','recovery']) $(n).hidden = n !== name;
-  document.querySelectorAll('.nav').forEach(el => { el.classList.toggle('active',el.dataset.view === name); el.setAttribute('aria-current', el.dataset.view === name ? 'page' : 'false'); });
-  $('page-label').textContent = {home:'Dashboard',discover:'Discover',downloads:'Video library',platforms:'Platform insights',recovery:'Recovery center'}[name];
+function view(name,tab='pending') {
+  const requested=name;
+  if(name==='completed'){name='downloads';tab='completed';}
+  if(name==='downloads')$('status-filter').value=tab;
+  for (const n of ['home','discover','downloads','platforms','recovery','activity']) $(n).hidden = n !== name;
+  document.querySelectorAll('.nav').forEach(el => { el.classList.toggle('active',el.dataset.view === requested); el.setAttribute('aria-current', el.dataset.view === requested ? 'page' : 'false'); });
+  $('page-label').textContent = {home:'Dashboard',discover:'Discover',downloads:'Video library',platforms:'Platform insights',recovery:'Recovery center',activity:'Activity log'}[name];
   window.scrollTo(0,0);
+  if (name==='downloads')renderAll();
+  if (name==='activity' && typeof loadActivity==='function')loadActivity();
   if (name === 'recovery' && typeof loadRecovery === 'function') loadRecovery();
 }
 document.querySelectorAll('.nav').forEach(el => el.onclick = () => view(el.dataset.view));
@@ -175,19 +180,19 @@ $('analyze-form').onsubmit = async event => {
     $('quality').replaceChildren();
     const qualities = [2160,1440,1080,720,480,360].filter(h => !analyzed.qualities.length || h <= Math.max(...analyzed.qualities));
     for (const q of qualities.length ? qualities : [360]) $('quality').add(new Option(q+'p'+(q === 2160 ? ' · 4K' : q === 1080 ? ' · Full HD' : ''),q));
-    $('quality').value = qualities.includes(1080) ? '1080' : String(qualities[0] || 360); $('video-result').hidden = false;
+    $('quality').value = qualities.includes(1080) ? '1080' : String(qualities[0] || 360); $('video-result').hidden = false; if(typeof syncSingleDownload==='function')syncSingleDownload();
   } catch(e) { if (version === analysisVersion && e.name !== 'AbortError') notice(e.message,e.retryAfter); }
   finally { if (version === analysisVersion) { busy = false; analysisController = null; $('analyze-button').disabled = false; analyzeLabel(); } }
 };
 $('url').oninput = () => { analysisVersion++; analysisController?.abort(); analysisController = null; busy = false; analyzed = null; $('video-result').hidden = true; $('analyze-button').disabled = false; analyzeLabel(); notice(''); };
 $('format').onchange = () => { $('quality-label').hidden = audioFormats.includes($('format').value); };
 $('download-button').onclick = async () => {
-  if (!analyzed) return; $('download-button').disabled = true;
+  if (!analyzed || singleQueuing) return; singleQueuing=true; $('download-button').disabled = true;
   try {
     await ensureDownloadLocation();
-    await api('/api/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:analyzed.url,format:$('format').value,quality:$('quality').value})});
+    await api('/api/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:analyzed.url,format:$('format').value,quality:$('quality').value,allow_repeat:repeatAllowed()})});
     notice(locationSettings?.direct_enabled ? 'Added to your collection. The file will save automatically in your selected folder.' : 'Added to your collection. Play or save it when processing is complete.'); await refresh();
-  } catch(e) { notice(e.message,e.retryAfter); } finally { $('download-button').disabled = false; }
+  } catch(e) { notice(e.message,e.retryAfter); } finally { singleQueuing=false; if(typeof syncSingleDownload==='function')syncSingleDownload(); else $('download-button').disabled = false; }
 };
 $('bulk-format').onchange = () => { $('bulk-quality-label').hidden = audioFormats.includes($('bulk-format').value); };
 $('bulk-form').onsubmit = async event => {
@@ -198,9 +203,9 @@ $('bulk-form').onsubmit = async event => {
   $('bulk-button').disabled = true; box.textContent = 'Adding your videos to the queue…';
   try {
     await ensureDownloadLocation();
-    const result = await api('/api/download/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls,format:$('bulk-format').value,quality:$('bulk-quality').value,youtube_concurrency:Number($('bulk-concurrency').value)})});
+    const result = await api('/api/download/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls,format:$('bulk-format').value,quality:$('bulk-quality').value,allow_repeat:repeatAllowed(),youtube_concurrency:Number($('bulk-concurrency').value)})});
     box.textContent = result.added+' videos added.'+(result.duplicates_removed?' '+result.duplicates_removed+' repeated links skipped.':'')+(result.submission_failures?' '+result.submission_failures+' jobs could not start; use Retry after restarting the app.':' Originals finish before optional preview encoding.');
-    $('bulk-urls').value = ''; await refresh();
+    $('bulk-urls').value = ''; if(result.duplicates_removed)notice(result.added+' queued · '+result.duplicates_removed+' duplicates skipped.'); await refresh();
   } catch(e) { box.textContent = e.message; }
   finally { $('bulk-button').disabled = false; }
 };
@@ -279,8 +284,8 @@ $('playlist-queue').onclick = async () => {
   $('playlist-message').hidden = false; $('playlist-message').textContent = 'Adding selected playlist videos…';
   try {
     await ensureDownloadLocation();
-    const result = await api('/api/playlist/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:playlist.token,video_ids,format:$('playlist-format').value,quality:$('playlist-quality').value,youtube_concurrency:Number($('playlist-concurrency').value)})});
-    $('playlist-message').textContent = result.added+' playlist videos added. Track each video in My library.'+(result.submission_failures?' '+result.submission_failures+' jobs need Retry after restarting the app.':'');
+    const result = await api('/api/playlist/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:playlist.token,video_ids,format:$('playlist-format').value,quality:$('playlist-quality').value,allow_repeat:repeatAllowed(),youtube_concurrency:Number($('playlist-concurrency').value)})});
+    $('playlist-message').textContent = result.added+' playlist videos added.'+(result.duplicates_removed?' '+result.duplicates_removed+' duplicates skipped.':'')+' Completed videos move to the Completed tab.'+(result.submission_failures?' '+result.submission_failures+' jobs need Retry after restarting the app.':'');
     playlist = null; $('playlist-result').hidden = true; await refresh();
   } catch(e) { $('playlist-message').textContent = e.message; }
   finally { playlistQueuing = false; $('playlist-load').disabled = false; $('playlist-url').disabled = false; playlistSelection(); }
@@ -348,11 +353,11 @@ $('player-dialog').onclick = event => { if (event.target !== $('player-dialog'))
 const cardCaches = new Map();
 const paginationState = {recent:{page:1,size:12},library:{page:1,size:24}};
 const selectedJobs = new Set();
-let recentFilter = 'all', deletingSelection = false, pendingRemoval = [];
+let recentFilter = 'pending', deletingSelection = false, pendingRemoval = [];
 const selectionLists = {};
 const removable = j => ['completed','failed','queued'].includes(j.status);
 function matchesStatus(j, filter) {
-  return filter === 'all' || (filter === 'downloading' ? ['queued','downloading','processing'].includes(j.status) : j.status === filter);
+  return filter === 'all' || (filter==='pending' && j.status!=='completed' && j.stage!=='duplicate_skipped') || (filter === 'downloading' ? ['queued','downloading','processing'].includes(j.status) : j.status === filter);
 }
 function eligiblePage(key) {
   const state = paginationState[key], start = (state.page-1)*state.size;
@@ -465,7 +470,7 @@ function createCard(j) {
     if (locationSettings?.direct_enabled) { const folder = document.createElement('button'); folder.className = 'open-folder-button'; folder.textContent = 'Folder'; folder.setAttribute('aria-label','Open folder for '+j.title); folder.onclick = () => openJobFolder(j); actions.append(folder); }
     else { const save = document.createElement('a'); save.href = endpoint(j,'file'); save.textContent = '↓ Save'; save.setAttribute('aria-label','Save to device '+j.title); actions.append(save); }
     const again = document.createElement('button'); again.className = 'redownload-button'; again.textContent = '↻ Again'; again.setAttribute('aria-label','Download again '+j.title);
-    again.onclick = async () => { again.disabled = true; try { await ensureDownloadLocation(); await api(endpoint(j,'redownload'),{method:'POST'}); notice('A fresh download was added. Your existing file is still available.'); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { again.disabled = false; } }; actions.append(again);
+    again.onclick = async () => { if(!await confirmRepeat(j.title))return; again.disabled = true; try { await ensureDownloadLocation(); await api(endpoint(j,'redownload'),{method:'POST'}); notice('A fresh download was added. Your existing file is still available.'); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { again.disabled = false; } }; actions.append(again);
   }
   if (j.status === 'failed') { const retry = document.createElement('button'); retry.className = 'retry-button'; retry.textContent = j.recoverable?'↻ Resume':'↻ Retry'; retry.onclick = async () => { retry.disabled = true; try { await ensureDownloadLocation(); await api(endpoint(j,'retry'),{method:'POST'}); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { retry.disabled = false; } }; actions.append(retry); }
   if (['failed','completed'].includes(j.status)) { const remove = document.createElement('button'); remove.className = 'remove-button'; remove.textContent = '×'; remove.setAttribute('aria-label','Remove '+j.title); remove.title = j.output_dir ? 'Remove from library; keep the saved file' : 'Remove video and history'; remove.onclick = async () => { try { await api('/api/jobs/'+encodeURIComponent(j.id),{method:'DELETE'}); if (playingId === j.id) $('player-dialog').close(); await refresh(); } catch(e) { notice(e.message); view('home'); } }; actions.append(remove); }
@@ -473,9 +478,13 @@ function createCard(j) {
   row.append(cover,detail,actions); return row;
 }
 function render(target,list) {
-  const signature = JSON.stringify([list,locationSettings?.direct_enabled]); if (rendered.get(target) === signature) return; rendered.set(target,signature);
+  const signature = JSON.stringify([list,locationSettings?.direct_enabled,target==='recent-jobs'?recentFilter:$('status-filter').value]); if (rendered.get(target) === signature) return; rendered.set(target,signature);
   const container = $(target), cache = cardCaches.get(target) || new Map(); cardCaches.set(target,cache);
-  if (!list.length) { cache.clear(); container.innerHTML = '<div class="empty"><span class="empty-icon">▻</span><h3>Your library starts here.</h3><p>Add a video link, or change your search and filters.</p></div>'; return; }
+  if (!list.length) {
+    cache.clear();const queue=target==='recent-jobs'?recentFilter==='pending':$('status-filter').value==='pending';
+    container.innerHTML=queue?'<div class="empty"><span class="empty-icon">✓</span><h3>Your work queue is clear.</h3><p>Finished videos are safe in Completed. Add more links when you are ready.</p></div>':'<div class="empty"><span class="empty-icon">▻</span><h3>No matching videos here.</h3><p>Change the search or filter, or add a new video link.</p></div>';
+    if(queue){const button=document.createElement('button');button.className='secondary';button.textContent='Open Completed';button.onclick=()=>view('completed');container.firstChild.append(button);}return;
+  }
   container.querySelector('.empty')?.remove();
   const ids = new Set(list.map(j => j.id));
   for (const [id,cached] of cache) if (!ids.has(id)) { cached.node.remove(); cache.delete(id); }
@@ -527,13 +536,15 @@ function renderAll() {
     button.querySelector('b').textContent = jobs.filter(j => matchesStatus(j,button.dataset.filter)).length;
   }
   const term = $('search').value.trim().toLowerCase(), filter = $('status-filter').value;
-  const filtered = jobs.filter(j => (j.title+' '+j.url+' '+sourceName(j)).toLowerCase().includes(term) && (filter === 'all' || filter === 'downloading' && ['queued','downloading','processing'].includes(j.status) || j.status === filter));
+  const filtered = jobs.filter(j => (j.title+' '+j.url+' '+sourceName(j)).toLowerCase().includes(term) && matchesStatus(j,filter));
   const sort = $('sort-order').value;
   filtered.sort((a,b) => sort === 'oldest' ? a.created-b.created : sort === 'title' ? a.title.localeCompare(b.title) : sort === 'completed' ? Number(b.status==='completed')-Number(a.status==='completed') || b.created-a.created : b.created-a.created);
   selectionLists.library = filtered;
   paginate('library',filtered,'all-jobs','library-pagination');
   syncSelection();
   for (const id of ['total-count','recent-count','nav-count']) $(id).textContent = jobs.length;
+  $('recent-count').textContent=recent.length;
+  if (typeof syncWorkspaceTabs === 'function') syncWorkspaceTabs();
   if (typeof renderQueueOverview === 'function') renderQueueOverview();
   $('ready-count').textContent = jobs.filter(j => j.status === 'completed').length; $('active-count').textContent = jobs.filter(j => ['queued','downloading','processing'].includes(j.status)).length;
 }
@@ -566,6 +577,7 @@ function refresh() {
         }
         jobs = items; renderAll(); renderStats(stats);
         if (typeof syncDiscoveryJobs === 'function') syncDiscoveryJobs();
+        if (typeof refreshWorkspace === 'function') refreshWorkspace();
         if (typeof renderSystemChecks === 'function') renderSystemChecks(h);
         const status = h.version !== UI_VERSION ? 'Restart to apply update'
           : !h.ffmpeg ? 'FFmpeg missing' : h.ffprobe === false ? 'FFprobe missing'
