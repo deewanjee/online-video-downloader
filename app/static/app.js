@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const UI_VERSION = '2.2.0';
+const UI_VERSION = '2.3.0';
 const audioFormats = ['mp3', 'm4a', 'wav'];
 function icon(name) {
   const paths = {play:'<path d="m8 5 11 7-11 7z"/>',arrow:'<path d="M6 18 18 6M6 6h12v12"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>'};
@@ -351,6 +351,84 @@ $('close-player').onclick = () => $('player-dialog').close(); $('player-dialog')
 $('player-dialog').onclick = event => { if (event.target !== $('player-dialog')) return; const rect = $('player-dialog').getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) $('player-dialog').close(); };
 const cardCaches = new Map();
 const paginationState = {recent:{page:1,size:12},library:{page:1,size:24}};
+const selectedJobs = new Set();
+let recentFilter = 'all', deletingSelection = false, pendingRemoval = [];
+const selectionLists = {};
+const removable = j => ['completed','failed','queued'].includes(j.status);
+function matchesStatus(j, filter) {
+  return filter === 'all' || (filter === 'downloading' ? ['queued','downloading','processing'].includes(j.status) : j.status === filter);
+}
+function eligiblePage(key) {
+  const state = paginationState[key], start = (state.page-1)*state.size;
+  return (selectionLists[key] || []).slice(start,start+state.size).filter(removable);
+}
+for (const [key,id] of [['recent','recent-selection'],['library','library-selection']]) {
+  const bar = $(id);
+  bar.innerHTML = '<span class="selection-count" aria-live="polite">0 selected</span><button type="button" class="select-page secondary">Select this page</button><button type="button" class="select-matching text-button">Select all matching</button><button type="button" class="clear-selection text-button">Clear</button><button type="button" class="remove-selected danger-button">Remove selected</button><small>Selection stays across pages and filters · Completed, failed or queued videos</small>';
+  bar.querySelector('.select-page').onclick = () => {
+    const list = eligiblePage(key), all = list.length && list.every(j => selectedJobs.has(j.id));
+    for (const j of list) all ? selectedJobs.delete(j.id) : selectedJobs.add(j.id);
+    syncSelection();
+  };
+  bar.querySelector('.select-matching').onclick = () => { (selectionLists[key] || []).filter(removable).forEach(j => selectedJobs.add(j.id)); syncSelection(); };
+  bar.querySelector('.clear-selection').onclick = () => { selectedJobs.clear(); syncSelection(); };
+  bar.querySelector('.remove-selected').onclick = () => {
+    pendingRemoval = jobs.filter(j => selectedJobs.has(j.id) && removable(j)).map(j => j.id);
+    if (!pendingRemoval.length) return;
+    const entries = jobs.filter(j => pendingRemoval.includes(j.id));
+    const owned = entries.filter(j => !j.output_dir).length;
+    $('remove-summary').textContent = 'Remove '+pendingRemoval.length+' selected videos from your library?';
+    $('remove-file-policy').textContent = (entries.length-owned ? (entries.length-owned)+' originals in your selected download folders will be kept. ' : '') + (owned ? 'Project-owned media and cache for '+owned+' entries will be deleted.' : 'Only history entries and preview caches will be removed.');
+    $('remove-error').hidden = true;
+    $('remove-confirm').textContent = 'Remove '+pendingRemoval.length+' videos';
+    $('remove-dialog').showModal();
+  };
+}
+function syncSelection() {
+  for (const row of document.querySelectorAll('.job')) {
+    const checkbox = row.querySelector('.card-select input');
+    if (!checkbox) continue;
+    checkbox.checked = selectedJobs.has(row.dataset.jobId);
+    checkbox.disabled = deletingSelection || !['completed','failed','queued'].some(status => row.classList.contains(status));
+    row.classList.toggle('selected',checkbox.checked);
+  }
+  for (const [key,id] of [['recent','recent-selection'],['library','library-selection']]) {
+    const bar = $(id), page = eligiblePage(key), matches = (selectionLists[key] || []).filter(removable);
+    bar.querySelector('.selection-count').textContent = selectedJobs.size+' selected';
+    const all = page.length && page.every(j => selectedJobs.has(j.id));
+    bar.querySelector('.select-page').textContent = all ? 'Deselect this page' : 'Select this page';
+    bar.querySelector('.select-matching').textContent = 'Select all matching ('+matches.length+')';
+    for (const button of bar.querySelectorAll('button')) button.disabled = deletingSelection;
+    bar.querySelector('.select-page').disabled ||= !page.length;
+    bar.querySelector('.select-matching').disabled ||= !matches.length;
+    bar.querySelector('.remove-selected').disabled ||= !selectedJobs.size;
+    bar.querySelector('.clear-selection').disabled ||= !selectedJobs.size;
+  }
+}
+$('remove-cancel').onclick = () => $('remove-dialog').close();
+$('remove-dialog').addEventListener('cancel', event => { if (deletingSelection) event.preventDefault(); });
+$('remove-confirm').onclick = async () => {
+  if (deletingSelection || !pendingRemoval.length) return;
+  deletingSelection = true; syncSelection();
+  $('remove-confirm').disabled = true; $('remove-cancel').disabled = true;
+  $('remove-confirm').textContent = 'Removing…';
+  try {
+    const result = await api('/api/jobs/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_ids:pendingRemoval}),timeout:120000});
+    result.removed.forEach(id => selectedJobs.delete(id));
+    if (result.removed.includes(playingId)) $('player-dialog').close();
+    $('remove-dialog').close();
+    notice(result.removed.length+' videos removed.'+(result.failed.length ? ' '+result.failed.length+' could not be removed: '+result.failed[0].detail : ' Lifetime download counters are unchanged.'));
+    await refresh();
+  } catch(e) { $('remove-error').textContent = e.message; $('remove-error').hidden = false; }
+  finally {
+    deletingSelection = false; $('remove-confirm').disabled = false; $('remove-cancel').disabled = false;
+    $('remove-confirm').textContent = 'Remove '+pendingRemoval.length+' videos'; syncSelection();
+  }
+};
+for (const button of $('collection-filters').querySelectorAll('button')) button.onclick = () => {
+  recentFilter = button.dataset.filter; paginationState.recent.page = 1; renderAll();
+};
+
 function createCard(j) {
   const row = document.createElement('article'); row.className = 'job '+j.status;
   row.dataset.jobId = j.id; row.tabIndex = 0; row.setAttribute('aria-label',j.title+' · '+j.status+' · Focus for details');
@@ -359,10 +437,19 @@ function createCard(j) {
   image(cover,j.thumbnail || local,'Thumbnail for '+j.title,local);
   const stages = {extracting:'Getting video',downloading:'Downloading',merging:'Merging audio + video',converting:'Converting format',resizing:'Resizing video',verifying:'Checking file'};
   const badge = document.createElement('span');
-  const downloaded = j.status === 'completed' || j.previous_downloads > 0;
-  badge.className = 'status-badge'+(downloaded?' downloaded-before':j.status === 'failed'?' failed':'');
-  badge.textContent = j.status === 'completed' ? '✓ Downloaded' : downloaded ? '✓ Downloaded before' : {failed:'Needs attention',queued:'Queued',processing:stages[j.stage] || 'Finishing file',downloading:(stages[j.stage] || 'Downloading')+' · '+j.progress+'%'}[j.status] || j.status;
+  badge.className = 'status-badge'+(j.status === 'completed'?' downloaded-before':j.status === 'failed'?' failed':'');
+  badge.textContent = j.status === 'completed' ? '✓ Downloaded' : {failed:'Needs attention',queued:j.stage === 'source_wait' ? 'YouTube cooldown' : 'Queued',processing:stages[j.stage] || 'Finishing file',downloading:(stages[j.stage] || 'Downloading')+' · '+j.progress+'%'}[j.status] || j.status;
+  if (j.status !== 'completed' && j.previous_downloads > 0) badge.textContent += ' · Downloaded before';
   cover.append(badge);
+  if (j.status === 'completed') {
+    const ribbon = document.createElement('span'); ribbon.className = 'complete-ribbon'; ribbon.textContent = '✓ DOWNLOADED · READY TO PLAY'; cover.append(ribbon);
+  }
+  const choice = document.createElement('label'); choice.className = 'card-select';
+  choice.title = removable(j) ? 'Select video for removal' : 'This download is running; wait for it to finish';
+  const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.checked = selectedJobs.has(j.id); checkbox.disabled = !removable(j) || deletingSelection;
+  checkbox.setAttribute('aria-label','Select '+j.title);
+  checkbox.onchange = () => { checkbox.checked ? selectedJobs.add(j.id) : selectedJobs.delete(j.id); syncSelection(); };
+  choice.onclick = event => event.stopPropagation(); choice.append(checkbox); row.append(choice);
   if (j.duration) { const time = document.createElement('span'); time.className = 'cover-duration'; time.textContent = duration(j.duration); cover.append(time); }
   const toggle = document.createElement('button'); toggle.className = 'details-toggle'; toggle.textContent = 'ⓘ'; toggle.setAttribute('aria-label','Show details for '+j.title);
   toggle.onclick = () => { row.classList.toggle('details-open'); toggle.setAttribute('aria-expanded',String(row.classList.contains('details-open'))); }; cover.append(toggle);
@@ -372,7 +459,7 @@ function createCard(j) {
   const title = document.createElement('div'); title.className = 'job-title'; title.textContent = j.title; title.title = j.title;
   const meta = document.createElement('div'); meta.className = 'job-meta'; meta.textContent = sourceName(j)+' · '+j.format.toUpperCase()+' · '+(audioFormats.includes(j.format) ? 'Audio' : (j.actual_height || j.quality)+'p')+(j.size?' · '+(j.size/1024/1024).toFixed(1)+' MB':'')+(j.duration?' · '+duration(j.duration):''); meta.title = meta.textContent;
   const status = document.createElement('div'); status.className = 'status'+(j.status === 'failed'?' failed':'');
-  status.textContent = j.error || (j.status === 'completed' ? j.preview_status === 'processing'?'Preview encoding '+(j.preview_progress || 0)+'%':j.preview_status === 'queued'?'Original ready · Preview queued':j.preview_status === 'failed'?'Original ready · Preview can be retried':'Ready to play & save' : j.status === 'queued'?'Waiting for a download slot':(stages[j.stage] || 'Downloading')+(j.stage_started?' · '+duration(Math.max(0,Date.now()/1000-j.stage_started))+' elapsed':''));
+  status.textContent = j.error || (j.status === 'completed' ? j.preview_status === 'processing'?'Preview encoding '+(j.preview_progress || 0)+'%':j.preview_status === 'queued'?'Original ready · Preview queued':j.preview_status === 'failed'?'Original ready · Preview can be retried':'Ready to play & save' : j.status === 'queued'?(j.stage === 'source_wait' ? 'YouTube cooldown · Queue kept; resumes after the source wait' : 'Waiting for a download slot'):(stages[j.stage] || 'Downloading')+(j.stage_started?' · '+duration(Math.max(0,Date.now()/1000-j.stage_started))+' elapsed':''));
   status.title = status.textContent+(j.playlist_title?' · '+j.playlist_title+' #'+j.playlist_position:'');
   detail.append(title,meta,status);
   if (['queued','downloading','processing'].includes(j.status)) { const progress = document.createElement('progress'); progress.max = 100; progress.value = j.progress; progress.setAttribute('aria-label','Download progress'); row.append(progress); }
@@ -428,15 +515,25 @@ function paginate(key,list,target,controls) {
   button('›',state.page+1,'Next page',state.page === pages);
   const label = document.createElement('label'); label.className = 'page-size'; label.append(document.createTextNode('Per page'));
   const size = document.createElement('select'); size.setAttribute('aria-label','Videos per page');
-  for (const value of [12,24,48]) size.add(new Option(String(value),value)); size.value = String(state.size);
+  for (const value of [12,24,48,100]) size.add(new Option(String(value),value)); size.value = String(state.size);
   size.onchange = () => { state.size = Number(size.value); state.page = 1; renderAll(); }; label.append(size);
   nav.append(summary,buttons,label);
 }
 function renderAll() {
-  paginate('recent',jobs,'recent-jobs','recent-pagination');
+  const available = new Set(jobs.filter(removable).map(j => j.id));
+  for (const id of selectedJobs) if (!available.has(id)) selectedJobs.delete(id);
+  const recent = jobs.filter(j => matchesStatus(j,recentFilter));
+  selectionLists.recent = recent;
+  paginate('recent',recent,'recent-jobs','recent-pagination');
+  for (const button of $('collection-filters').querySelectorAll('button')) {
+    button.setAttribute('aria-pressed',String(recentFilter === button.dataset.filter));
+    button.querySelector('b').textContent = jobs.filter(j => matchesStatus(j,button.dataset.filter)).length;
+  }
   const term = $('search').value.trim().toLowerCase(), filter = $('status-filter').value;
   const filtered = jobs.filter(j => (j.title+' '+j.url+' '+sourceName(j)).toLowerCase().includes(term) && (filter === 'all' || filter === 'downloading' && ['queued','downloading','processing'].includes(j.status) || j.status === filter));
+  selectionLists.library = filtered;
   paginate('library',filtered,'all-jobs','library-pagination');
+  syncSelection();
   for (const id of ['total-count','recent-count','nav-count']) $(id).textContent = jobs.length;
   $('ready-count').textContent = jobs.filter(j => j.status === 'completed').length; $('active-count').textContent = jobs.filter(j => ['queued','downloading','processing'].includes(j.status)).length;
 }

@@ -165,6 +165,10 @@ def isolate_history(tmp_path, monkeypatch):
     monkeypatch.delenv('STREAMVAULT_SYSTEM_CERTS', raising=False)
     monkeypatch.delenv('STREAMVAULT_COOKIE_FILE', raising=False)
     monkeypatch.delenv('STREAMVAULT_DESKTOP', raising=False)
+    deferred = main.DeferredDownloads(lambda: main.source_access.youtube.remaining(), lambda job_id, req: main.resume_deferred(job_id, req))
+    monkeypatch.setattr(main, 'deferred_downloads', deferred)
+    yield
+    deferred.stop()
 
 
 def test_history_survives_restart_and_interrupted_jobs_can_retry(tmp_path, monkeypatch):
@@ -1549,3 +1553,163 @@ def test_playlist_missing_thumbnail_gets_youtube_poster(monkeypatch):
     result=load_test_playlist(monkeypatch,[playlist_entry(1),playlist_entry(2,thumbnails=[{'url':'https://i.ytimg.com/example.jpg'}])])
     assert result['videos'][0]['thumbnail']=='https://i.ytimg.com/vi/clip0000001/hqdefault.jpg'
     assert result['videos'][1]['thumbnail']=='https://i.ytimg.com/example.jpg'
+
+
+def test_bulk_removal_deduplicates_and_preserves_selected_folder_files_and_counts(tmp_path, monkeypatch):
+    local, data, chosen = local_desktop_client(tmp_path, monkeypatch)
+    external = failed_job('outside') | {'status':'completed','output_dir':str(chosen),'filename':'Keep.mp4'}
+    (chosen/'Keep.mp4').write_bytes(b'user-owned original')
+    legacy = failed_job('inside') | {'status':'completed'}
+    folder = data/legacy['id'];folder.mkdir();(folder/legacy['filename']).write_bytes(b'app-owned original')
+    active = failed_job('active') | {'status':'downloading'}
+    failed = failed_job('failed')
+    for job in (external,legacy,active,failed):
+        main.jobs[job['id']]=job;main.storage.save(data,job)
+    response=local.post('/api/jobs/remove',json={'job_ids':['outside','inside','failed','outside','active','missing']})
+    assert response.status_code==200
+    result=response.json()
+    assert result['removed']==['outside','inside','failed']
+    assert [(e['id'],e['status']) for e in result['failed']]==[('active',409),('missing',404)]
+    assert (chosen/'Keep.mp4').read_bytes()==b'user-owned original'
+    assert not folder.exists()
+    assert set(main.jobs)=={'active'}
+    assert main.storage.statistics(data)['total']==2
+    assert set(main.storage.restore(data))=={'active'}
+
+
+def test_bulk_removal_skips_preparing_preview_and_continues():
+    for id in ['locked','free']:main.jobs[id]=failed_job(id)
+    guard=main.media_lock('locked');guard.acquire()
+    try:
+        result=client.post('/api/jobs/remove',json={'job_ids':['locked','free']}).json()
+        assert result['removed']==['free'] and result['failed'][0]['status']==409
+        assert 'locked' in main.jobs
+    finally:guard.release()
+
+
+def test_bulk_removal_storage_failure_keeps_history_and_media(tmp_path, monkeypatch):
+    job=failed_job('keep')|{'status':'completed'}
+    main.jobs['keep']=job;main.storage.save(main.DATA,job)
+    folder=main.DATA/'keep';folder.mkdir();file=folder/job['filename'];file.write_bytes(b'keep')
+    def reject(*args):raise main.storage.sqlite3.OperationalError('private diagnostic')
+    monkeypatch.setattr(main.storage,'delete',reject)
+    result=client.post('/api/jobs/remove',json={'job_ids':['keep']}).json()
+    assert not result['removed'] and result['failed'][0]['status']==503
+    assert 'private' not in result['failed'][0]['detail']
+    assert main.jobs['keep']['status']=='completed' and file.read_bytes()==b'keep'
+
+
+@pytest.mark.parametrize('ids',[[],['x']*1101,['x'*65]])
+def test_bulk_removal_bounds(ids):
+    assert client.post('/api/jobs/remove',json={'job_ids':ids}).status_code==422
+
+
+def test_bulk_removal_keeps_authentication_and_same_origin_guards(monkeypatch):
+    main.jobs['keep']=failed_job('keep')
+    monkeypatch.setenv('STREAMVAULT_PASSWORD','local-owner')
+    assert client.post('/api/jobs/remove',json={'job_ids':['keep']}).status_code==401
+    assert client.post('/api/jobs/remove',json={'job_ids':['keep']},auth=('admin','local-owner'),headers={'Origin':'https://attacker.example'}).status_code==403
+    assert 'keep' in main.jobs
+
+
+def test_waiting_youtube_jobs_keep_queue_without_another_source_request(monkeypatch):
+    main.source_access.youtube.limited()
+    monkeypatch.setattr(main,'extract_video',lambda *args:pytest.fail('Source contacted during cooldown'))
+    for id in ['wait1','wait2','wait3']:
+        job=failed_job(id)|{'status':'queued','stage':'queued'}
+        main.jobs[id]=job
+        main.run_download(id,main.DownloadRequest(url=job['url']))
+    assert len(main.deferred_downloads.pending)==3
+    assert all(j['status']=='queued' and j['stage']=='source_wait' and j['retry_at']>main.time.time() and j['error'] is None for j in main.jobs.values())
+    restored = main.storage.restore(main.DATA)
+    assert all(j['status']=='failed' and 'restart' in j['error'] for j in restored.values())  # Restart still requires an explicit Retry.
+    assert all(j['status']=='queued' for j in main.jobs.values())
+
+
+def test_source_429_holds_current_job_and_other_queued_jobs(monkeypatch):
+    calls=[]
+    def rejected(*args):
+        calls.append(args);main.source_access.youtube.limited()
+        raise main.source_access.SourceRateLimited(main.source_access.youtube.remaining())
+    monkeypatch.setattr(main,'extract_video',rejected)
+    for id in ['first','second']:
+        job=failed_job(id)|{'status':'queued'};main.jobs[id]=job
+        main.run_download(id,main.DownloadRequest(url=job['url']))
+    assert len(calls)==1
+    assert all(j['status']=='queued' and j['stage']=='source_wait' for j in main.jobs.values())
+    assert main.storage.statistics(main.DATA)['total']==0
+
+
+def test_cooldown_dispatcher_deduplicates_and_releases_after_expiry():
+    remaining=[600];sent=[];finished=threading.Event()
+    def submit(id,req):
+        sent.append((id,req))
+        if len(sent)==2:finished.set()
+    deferred=main.DeferredDownloads(lambda:remaining[0],submit)
+    try:
+        deferred.defer('one','old');deferred.defer('one','new');deferred.defer('two','second')
+        assert not sent
+        with deferred.condition:
+            remaining[0]=0;deferred.condition.notify_all()
+        assert finished.wait(2)
+        assert sent==[('one','new'),('two','second')]
+        assert not deferred.pending
+    finally:deferred.stop()
+    assert not deferred.thread.is_alive()
+
+
+def test_cooldown_dispatcher_shutdown_does_not_submit_waiting_jobs():
+    sent=[]
+    deferred=main.DeferredDownloads(lambda:600,lambda *args:sent.append(args))
+    deferred.defer('one','request');deferred.stop()
+    assert not sent and not deferred.pending and not deferred.thread.is_alive()
+
+
+def test_cooldown_does_not_hold_other_platform_downloads(monkeypatch):
+    main.source_access.youtube.limited()
+    calls=[]
+    def rejected(*args):calls.append(args);raise RuntimeError('Source unavailable')
+    monkeypatch.setattr(main,'extract_video',rejected)
+    job=failed_job('other')|{'status':'queued','url':'https://www.tiktok.com/@public/video/123'};main.jobs['other']=job
+    main.run_download('other',main.DownloadRequest(url=job['url']))
+    assert len(calls)==1 and main.jobs['other']['status']=='failed'
+    assert not main.deferred_downloads.pending
+
+
+def test_expired_cooldown_resubmits_retained_job_only_once(monkeypatch):
+    job=failed_job('waiting')|{'status':'queued','stage':'source_wait'};main.jobs[job['id']]=job
+    request=main.DownloadRequest(url=job['url']);submitted=[];ready=threading.Event()
+    def submit(function,*args):submitted.append((function,args));ready.set()
+    monkeypatch.setattr(main.pool,'submit',submit)
+    main.source_access.youtube.limited()
+    main.deferred_downloads.defer(job['id'],request)
+    with main.source_access.youtube.state:main.source_access.youtube.until=0
+    with main.deferred_downloads.condition:main.deferred_downloads.condition.notify_all()
+    assert ready.wait(2) and len(submitted)==1
+    assert submitted[0][0] is main.run_download and submitted[0][1][0]==job['id']
+
+
+def test_removing_queued_job_cancels_deferred_and_executor_work(monkeypatch):
+    job=failed_job('queued_remove')|{'status':'queued','stage':'source_wait'};main.jobs[job['id']]=job
+    main.source_access.youtube.limited();request=main.DownloadRequest(url=job['url'])
+    main.deferred_downloads.defer(job['id'],request)
+    assert client.post('/api/jobs/remove',json={'job_ids':[job['id']]}).json()['removed']==[job['id']]
+    assert job['id'] not in main.deferred_downloads.pending
+    monkeypatch.setattr(main,'extract_video',lambda *args:pytest.fail('Removed queued job fetched'))
+    main.run_download(job['id'],request)  # An executor Future already queued before removal is harmless.
+    assert job['id'] not in main.jobs
+
+
+def test_queued_removal_race_cannot_delete_running_worker_files(monkeypatch):
+    job=failed_job('worker_lock')|{'status':'queued'};main.jobs[job['id']]=job
+    entered=threading.Event();release=threading.Event()
+    def paused(*args):entered.set();assert release.wait(2)
+    monkeypatch.setattr(main,'perform_download',paused)
+    worker=threading.Thread(target=main.run_download,args=(job['id'],main.DownloadRequest(url=job['url'])))
+    worker.start()
+    try:
+        assert entered.wait(2)
+        result=client.post('/api/jobs/remove',json={'job_ids':[job['id']]}).json()
+        assert not result['removed'] and result['failed'][0]['status']==409
+        assert job['id'] in main.jobs
+    finally:release.set();worker.join(timeout=2)

@@ -72,9 +72,9 @@ class YoutubeAccess:
         with self.state:
             return max(0, self.until - time.monotonic())
 
-    def limited(self):
+    def limited(self, seconds=600):
         with self.state:
-            self.until = max(self.until, time.monotonic() + 600)
+            self.until = max(self.until, time.monotonic() + seconds)
 
     @contextmanager
     def request(self, download, wait=False, cancel=None, metadata=False):

@@ -27,6 +27,7 @@ from app.auth import AccessControl
 from app.threads import ThreadsIE
 from app import source_access
 from app import destinations
+from app.deferred import DeferredDownloads
 
 ROOT = Path(__file__).parent
 DATA = Path(os.environ.get('DOWNLOAD_DIR', ROOT.parent / 'data')).resolve()
@@ -36,6 +37,7 @@ async def lifespan(application):
     try:
         yield
     finally:
+        deferred_downloads.stop()
         stop_playlist_loads()
         stop_previews()
 
@@ -62,6 +64,7 @@ playlist_loads = {}
 playlist_load_lock = threading.Lock()
 playlist_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='playlist')
 folder_dialog_lock = threading.Lock()
+deferred_downloads = DeferredDownloads(lambda: source_access.youtube.remaining(), lambda job_id, req: resume_deferred(job_id, req))
 
 class VideoRequest(BaseModel):
     url: str = Field(max_length=2048)
@@ -84,6 +87,10 @@ class PlaylistDownloadRequest(BaseModel):
     format: str = 'mp4'
     quality: str = '720'
     youtube_concurrency: int = Field(default=1, ge=1, le=2)
+
+
+class RemoveJobsRequest(BaseModel):
+    job_ids: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(min_length=1, max_length=1100)
 
 
 class FolderRequest(BaseModel):
@@ -428,7 +435,7 @@ def update(job_id, **values):
     with lock:
         previous_status = jobs[job_id]['status']
         jobs[job_id].update(values)
-        if jobs[job_id]['status'] != previous_status or jobs[job_id]['status'] in ('completed', 'failed') or 'planned_filename' in values:
+        if jobs[job_id]['status'] != previous_status or jobs[job_id]['status'] in ('completed', 'failed') or 'planned_filename' in values or 'retry_at' in values:
             storage.save(DATA, jobs[job_id])
 
 
@@ -595,7 +602,39 @@ def download_playlist(req: PlaylistDownloadRequest):
         return result
 
 
+def pause_for_source(job_id, req, seconds):
+    if not source_access.youtube.remaining():
+        source_access.youtube.limited(seconds)
+    update(job_id, status='queued', stage='source_wait', retry_at=time.time() + seconds,
+           progress=0, speed=None, eta=None, error=None)
+    deferred_downloads.defer(job_id, req)
+
+
+def resume_deferred(job_id, req):
+    with lock:
+        job = jobs.get(job_id)
+        if not job or job['status'] != 'queued' or job.get('stage') != 'source_wait':
+            return
+    try:
+        submit_job(job_id, req)
+    except (HTTPException, OSError, storage.sqlite3.Error):
+        pass  # submit_job persists a visible worker failure.
+
+
 def run_download(job_id, req):
+    # Deletion and worker startup share one guard: removed queued tasks never fetch.
+    if job_id not in jobs:
+        return
+    guard = media_lock(job_id)
+    with guard:
+        if job_id in jobs:
+            perform_download(job_id, req)
+
+
+def perform_download(job_id, req):
+    job = jobs.get(job_id)
+    if job is None:
+        return
     folder = None
     recovered = None
     verified = None
@@ -613,6 +652,11 @@ def run_download(job_id, req):
             update(job_id, status='processing', stage='merging' if 'Merger' in name else 'converting', stage_started=time.time(), progress=99)
     try:
         job = jobs[job_id]
+        if source_access.youtube_url(req.url) and not job.get('recoverable'):
+            remaining = source_access.youtube.remaining()
+            if remaining:
+                pause_for_source(job_id, req, remaining)
+                return
         folder = destinations.work_folder(DATA, job)
         if job.get('recoverable'):
             planned = job.get('planned_filename')
@@ -686,6 +730,9 @@ def run_download(job_id, req):
         # Finish cleanup before Retry can see a failed job and start a new attempt.
         if folder is not None and not recovered and not verified:
             shutil.rmtree(folder, ignore_errors=True)
+        if isinstance(exc, source_access.SourceRateLimited) and source_access.youtube_url(req.url):
+            pause_for_source(job_id, req, exc.retry_after)
+            return
         update(job_id, status='failed', error=message, recoverable=bool(recovered or verified))
 
 
@@ -857,7 +904,7 @@ def retry_job(job_id: str):
             pending.update(destination_snapshot())
             if pending.get('output_dir') and pending.get('recoverable'):
                 pending['legacy_recovery'] = True
-        pending.update(status='queued', progress=0, speed=None, eta=None)
+        pending.update(status='queued', stage='queued', retry_at=None, progress=0, speed=None, eta=None)
         save_queued(pending)
         jobs[job_id] = pending
         result = pending.copy()
@@ -1030,17 +1077,21 @@ def open_download_folder(job_id: str, request: Request):
 def remove_job(job_id: str):
     guard = media_lock(job_id)
     if not guard.acquire(blocking=False):
-        raise HTTPException(409, 'This file is being prepared. Save the original now, or remove it after preparation finishes.')
+        raise HTTPException(409, 'This download or preview is running. Wait for it to finish before removing it.')
     try:
         with lock:
             job = jobs.get(job_id)
             if not job:
                 raise HTTPException(404, 'Download not found.')
-            if job['status'] not in ('completed', 'failed'):
+            if job['status'] not in ('completed', 'failed', 'queued'):
                 raise HTTPException(409, 'Wait for the download to finish before removing it.')
-            storage.delete(DATA, job_id)
+            try:
+                storage.delete(DATA, job_id)
+            except (OSError, storage.sqlite3.Error):
+                raise HTTPException(503, 'History could not be updated. Check free disk space and folder permissions.') from None
             del jobs[job_id]
             preview_locks.pop(job_id, None)
+        deferred_downloads.discard(job_id)
         shutil.rmtree(DATA / job_id, ignore_errors=True)
         if job.get('output_dir'):
             try:
@@ -1050,3 +1101,15 @@ def remove_job(job_id: str):
     finally:
         guard.release()
     return {'removed': True}
+
+
+@app.post('/api/jobs/remove')
+def remove_jobs(req: RemoveJobsRequest):
+    removed, failed = [], []
+    for job_id in dict.fromkeys(req.job_ids):
+        try:
+            remove_job(job_id)
+            removed.append(job_id)
+        except HTTPException as exc:
+            failed.append({'id': job_id, 'status': exc.status_code, 'detail': exc.detail})
+    return {'removed': removed, 'failed': failed}
