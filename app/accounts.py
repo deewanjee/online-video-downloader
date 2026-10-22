@@ -105,6 +105,8 @@ def account_visibility(profile,error=None):
 
 def source_issue(error):
     text=str(error).lower()
+    if any(word in text for word in ('certificate verify failed','certificate_verify_failed')):return 'certificate'
+    if any(word in text for word in ('failed to parse json','expecting value','invalid json')):return 'invalid_response'
     if source_access.is_rate_limit(text):return 'rate_limit'
     if 'ip address is blocked' in text:return 'ip_block'
     if re.search(r'(?:http(?: error)?|status)[ :=]+403\b',text):return 'access_denied'
@@ -215,6 +217,7 @@ class AccountManager:
 
     def fail_message(self,error):
         text=str(error).lower()
+        if source_issue(error)=='invalid_response':return 'TikTok returned an empty or invalid JSON response from its account-list API. The video may be accessible while account enumeration is unavailable; this does not establish whether the account is private.'
         if 'ip address is blocked' in text:return 'TikTok is blocking access from this network/IP. Account/video availability could not be verified. Try again later.'
         if '403' in text and 'proxy' not in text:return 'TikTok rejected account access (HTTP 403). Its public account listing may be blocked even when individual video links work.'
         if any(x in text for x in ('account is private',"account is either private",'login required','log in','sign in')):return 'TikTok requires authorized access to this account/video. Try a public account; private videos cannot be listed here.'
@@ -250,24 +253,30 @@ class AccountManager:
             if not token:
                 logger=Logger()
                 settings=self.main.options()|{'logger':logger,'noplaylist':False,'extract_flat':'in_playlist','lazy_playlist':True,
-                    '_aaasoft_profile':receive_profile,'playliststart':offset+1,'playlistend':offset+BATCH+1,'ignoreerrors':False,'socket_timeout':20,'retries':1,'extractor_retries':1,'sleep_interval_requests':1}
+                    '_aaasoft_profile':receive_profile,'check_formats':False,'playliststart':offset+1,'playlistend':offset+BATCH+1,'ignoreerrors':False,'socket_timeout':20,'retries':1,'extractor_retries':1,'sleep_interval_requests':1}
                 entries=[]
                 extract_url=url
-                if seed_url:
-                    seed=self.main.extract_video(seed_url,False,self.main.options()|{'logger':logger,'socket_timeout':20,'retries':1,'extractor_retries':1}) or {}
-                    with self.lock:task['video_visibility']=video_visibility(seed)
-                    actual=video_username(seed)
-                    if not actual or (username and actual.casefold()!=username.casefold()):raise HTTPException(422,'The public video belongs to @'+actual+' rather than @'+username+'. Use a video from the same account.' if actual else 'TikTok did not expose a verifiable username for this video. The numeric user ID alone cannot confirm the account.')
-                    if not username:
-                        username=actual;url=profile_url(actual)
-                    with self.lock:task['account_url']=url
-                    receive_profile({'user':{'uniqueId':actual,'nickname':seed.get('uploader'),'id':seed.get('uploader_id'),'secUid':seed.get('channel_id')}})
-                    secondary=seed.get('channel_id')
-                    if not isinstance(secondary,str) or not re.fullmatch(r'MS4wLjABAAAA[A-Za-z0-9_-]{64}',secondary):raise HTTPException(422,'The public video did not provide a supported account ID. Account listing is unavailable from this source response.')
-                    extract_url='tiktokuser:'+secondary
                 with self.main.video_downloader(settings) as downloader:
+                    with self.lock:task['stage']='video_lookup' if seed_url else 'profile_lookup'
+                    if seed_url:
+                        seed=downloader.extract_info(seed_url,download=False) or {}
+                        with self.lock:task['video_visibility']=video_visibility(seed)
+                        actual=video_username(seed)
+                        if not actual or (username and actual.casefold()!=username.casefold()):raise HTTPException(422,'The public video belongs to @'+actual+' rather than @'+username+'. Use a video from the same account.' if actual else 'TikTok did not expose a verifiable username for this video. The numeric user ID alone cannot confirm the account.')
+                        if not username:
+                            username=actual;url=profile_url(actual)
+                        with self.lock:task['account_url']=url
+                        receive_profile({'user':{'uniqueId':actual,'nickname':seed.get('uploader'),'id':seed.get('uploader_id'),'secUid':seed.get('channel_id')}})
+                        secondary=seed.get('channel_id')
+                        if not isinstance(secondary,str) or not re.fullmatch(r'MS4wLjABAAAA[A-Za-z0-9_-]{64}',secondary):raise HTTPException(422,'The public video did not provide a supported account ID. Account listing is unavailable from this source response.')
+                        extract_url='tiktokuser:'+secondary
+                    # Keep the challenge/session cookie jar from the video request.
+                    # Successful seed metadata must not poison the subsequent listing.
+                    logger.saw_error=False
+                    with self.lock:task['stage']='account_listing' if seed_url else 'profile_lookup'
                     info=downloader.extract_info(extract_url,download=False)
                     if not info or info.get('_type')!='playlist':raise HTTPException(422,'TikTok did not return an account video list. Use a public account username.')
+                    with self.lock:task['stage']='account_listing'
                     for entry in islice(info.get('entries') or [],BATCH+1):
                         if event.is_set():raise source_access.SourceCancelled()
                         entries.append(entry)
@@ -285,7 +294,7 @@ class AccountManager:
                     if len(self.previews)>=10:self.previews.pop(next(iter(self.previews)))
                     cache={'created':time.monotonic(),'busy':True,'submissions':{},'url':url,'username':username,'title':str(info.get('title') or '@'+username)[:200],
                            'profile':task.get('profile'),'rows':rows,'offset':offset,'has_more':len(entries)>BATCH}
-                    self.previews[token]=cache;task.update(token=token,total=len(rows),phase='checking')
+                    self.previews[token]=cache;task.update(token=token,total=len(rows),phase='checking',stage='video_checks')
             else:
                 with self.lock:cache=self.preview(token);task['total']=len(cache['rows'])
             for row in cache['rows']:
@@ -310,6 +319,7 @@ class AccountManager:
         except source_access.SourceCancelled:terminal='cancelled';detail='Stopped. Checked entries remain reviewable; unverified entries cannot be selected.'
         except Exception as exc:
             issue_code=source_issue(exc);failure=exc
+            with self.lock:task['failed_stage']=task.get('stage');task['error_type']=type(exc).__name__
             terminal='cancelled' if event.is_set() else 'failed';detail='Stopped after the current source request.' if event.is_set() else exc.detail if isinstance(exc,HTTPException) else self.fail_message(exc)
             if source_access.is_rate_limit(str(exc)) or 'ip address is blocked' in str(exc).lower():
                 with self.lock:self.until=time.monotonic()+600
@@ -362,7 +372,7 @@ def register(main):
             item=manager.tasks.get(id)
             if not item:raise HTTPException(404,'TikTok account task expired.')
             item['account_visibility']=account_visibility(item.get('profile')) if item['status'] in ('running','queued') else item.get('account_visibility',account_visibility(item.get('profile')))
-            return {key:item[key] for key in ('id','status','phase','checked','total','entries','token','detail','profile','account_url','issue_code','account_visibility','video_visibility') if key in item}
+            return {key:item[key] for key in ('id','status','phase','checked','total','entries','token','detail','profile','account_url','issue_code','stage','failed_stage','error_type','account_visibility','video_visibility') if key in item}
 
     @app.delete('/api/tiktok/tasks/{id}',status_code=204)
     def cancel(id:str):

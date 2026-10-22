@@ -2675,3 +2675,45 @@ def test_single_tiktok_error_distinguishes_private_from_login(monkeypatch,messag
     monkeypatch.setattr(main,'extract_video',fail)
     response=client.post('/api/platform/tiktok/analyze',json={'url':'https://www.tiktok.com/@creator/video/'+tik_entry(1)['id']})
     assert response.status_code==422 and label in response.json()['detail']
+
+
+def test_tiktok_video_and_listing_share_session_and_no_media_probe(tiktok_accounts,monkeypatch):
+    import http.cookiejar
+    calls=[]
+    def extract(dl,url,download=False):
+        calls.append(dl)
+        assert download is False and dl.params['check_formats'] is False
+        if url.startswith('tiktokuser:'):
+            assert dl.cookiejar.get_cookie_header('https://www.tiktok.com/')=='session_test=fixture'
+            assert dl.params['logger'].saw_error is False
+            return {'_type':'playlist','entries':[tik_entry(1,formats=[{'vcodec':'h264'}])]}
+        dl.cookiejar.set_cookie(http.cookiejar.Cookie(0,'session_test','fixture',None,False,'.tiktok.com',True,True,'/',True,True,None,True,None,None,{},False))
+        # An extractor can log a recovered seed attempt before returning metadata.
+        dl.params['logger'].error('Recovered video metadata attempt')
+        return {'uploader_url':'https://www.tiktok.com/@creator','channel_id':'MS4wLjABAAAA'+'A'*64,'formats':[{'vcodec':'h264'}]}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    response=client.post('/api/tiktok/loads',json={'account':'https://vt.tiktok.com/Fixture123/'})
+    task=client.get('/api/tiktok/tasks/'+response.json()['id']).json()
+    assert task['status']=='ready' and len(calls)==2 and calls[0] is calls[1]
+
+
+def test_tiktok_empty_listing_reports_api_phase_without_leaking_details(tiktok_accounts,monkeypatch):
+    def extract(dl,url,download=False):
+        if url.startswith('tiktokuser:'):
+            def entries():
+                raise main.yt_dlp.utils.DownloadError('Failed to parse JSON: Expecting value in empty response https://source.test/?token=private_secret')
+                yield
+            return {'_type':'playlist','entries':entries()}
+        return {'uploader_url':'https://www.tiktok.com/@creator','channel_id':'MS4wLjABAAAA'+'A'*64,'formats':[{'vcodec':'h264'}]}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    response=client.post('/api/tiktok/loads',json={'account':'https://vt.tiktok.com/Fixture123/'})
+    task_response=client.get('/api/tiktok/tasks/'+response.json()['id']);task=task_response.json()
+    assert task['status']=='failed' and task['failed_stage']=='account_listing' and task['issue_code']=='invalid_response'
+    assert task['video_visibility']['visibility']=='accessible' and task['account_visibility']['status']=='unknown'
+    assert not task['token'] and 'empty or invalid JSON' in task['detail']
+    assert 'private_secret' not in task_response.text
+
+
+def test_tiktok_certificate_error_is_not_misclassified_as_sign_in():
+    from app.accounts import source_issue
+    assert source_issue('certificate verify failed: Confirm you are on the latest version')=='certificate'

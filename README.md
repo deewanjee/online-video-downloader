@@ -6,6 +6,14 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## TikTok listing session fix (3.6.2)
+
+Video-assisted account lookup now resolves the video and enumerates the account inside the **same downloader/session**, retaining the source's in-memory cookies. Previously a fresh downloader discarded that session between the two requests. Seed/list inspection disables format probing, avoiding the temporary media test shown in the supplied Windows log. Successful recovered seed attempts do not leave a stale logger-error flag that rejects a later listing.
+
+An empty/non-JSON account API response is now classified as **invalid_response**, with the failed stage recorded separately from video lookup. It does not imply private access or a confirmed rate/IP block. Certificate failures are classified before generic extractor text, including the upstream “Confirm you are on the latest version” footer.
+
+A bounded live check of the supplied `@asifcomputers01` post resolved its identity and retrieved **16 unique account entries across multiple source pages** with the shared session. This verifies a live metadata listing, not every historical entry or sixteen completed media downloads. Source access can change. See [verification](reports/tiktok-session-v362.md).
+
 ## Explicit TikTok privacy and access status (3.6.1)
 
 The TikTok section now separates **account privacy**, **individual video privacy/access** and **listing errors**. Account privacy is Public / Private only when TikTok explicitly confirms it; otherwise **Not verified** stays visible even if the username is confirmed. Returned videos expose source-confirmed public/private labels, restricted access, or accessible media with privacy not provided. Public/private/restricted filters and returned-entry counters are included; omitted private posts are not counted as known.
