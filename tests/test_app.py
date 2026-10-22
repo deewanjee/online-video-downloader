@@ -2312,6 +2312,7 @@ def test_account_rate_limit_cools_down_without_retry_storm(tiktok_accounts,monke
 def test_account_list_is_consumed_inside_open_downloader(tiktok_accounts,monkeypatch):
     alive=[False]
     class Downloader:
+        def __init__(self):self.params={}
         def __enter__(self):alive[0]=True;return self
         def __exit__(self,*args):alive[0]=False
         def extract_info(self,url,download=False):
@@ -2717,3 +2718,34 @@ def test_tiktok_empty_listing_reports_api_phase_without_leaking_details(tiktok_a
 def test_tiktok_certificate_error_is_not_misclassified_as_sign_in():
     from app.accounts import source_issue
     assert source_issue('certificate verify failed: Confirm you are on the latest version')=='certificate'
+
+
+def test_tiktok_account_api_uses_supported_browser_transport_and_profile_referer(monkeypatch):
+    from yt_dlp.extractor.tiktok import TikTokUserIE
+    captured=[]
+    def read(ie,url,*args,**kwargs):captured.append((url,kwargs));return {'itemList':[]}
+    monkeypatch.setattr(TikTokUserIE,'_download_json',read)
+    with main.video_downloader(main.options()|{'_aaasoft_account_url':'https://www.tiktok.com/@creator'}) as dl:
+        ie=dl.get_info_extractor('TikTokProfile')
+        ie._download_json(ie._API_BASE_URL,'creator',headers={'Accept':'application/json'})
+    opts=captured[0][1]
+    assert opts['impersonate'] is True and opts['require_impersonation'] is True
+    assert opts['headers']=={'Referer':'https://www.tiktok.com/@creator','Accept':'application/json'}
+    assert 'nocheckcertificate' not in opts
+
+
+def test_tiktok_browser_transport_does_not_change_other_requests(monkeypatch):
+    from yt_dlp.extractor.tiktok import TikTokUserIE
+    captured=[]
+    def read(ie,url,*args,**kwargs):captured.append(kwargs);return {}
+    monkeypatch.setattr(TikTokUserIE,'_download_json',read)
+    with main.video_downloader(main.options()) as dl:
+        dl.get_info_extractor('TikTokProfile')._download_json('https://www.tiktok.com/another-endpoint','creator')
+    assert not captured[0]
+
+
+def test_tiktok_missing_browser_transport_is_actionable_not_private(tiktok_accounts):
+    from app.accounts import source_issue
+    error=RuntimeError('The extractor specified impersonation but no impersonate target is available')
+    assert source_issue(error)=='transport_unavailable'
+    assert 'requirements.lock' in tiktok_accounts.fail_message(error)

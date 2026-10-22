@@ -29,8 +29,9 @@ List public account videos, review availability and download a selection.
 1. The next-step panel distinguishes a source block from an unavailable account listing. A failure is not evidence that the account has zero videos.
 2. Try a public video link changes the same input into the fallback path. Paste a real public post/share link; the system resolves its account automatically. It does not guarantee access to a blocked account API.
 3. Open supplied TikTok link lets you inspect the requested public link in your browser. Download one video instead focuses the existing single-video form, prefilling a supplied public video/share link when possible.
-4. An empty or non-JSON account API response is different from a private-account response. The video lookup and account list share a temporary source session. This can preserve source-issued cookies; it does not grant access to private posts or guarantee every listing response.
-5. For HTTP 429 or explicit IP blocks, wait before retrying. Repeated clicks do not remove source restrictions. Private, removed, omitted and blocked posts are not guaranteed to list or download.
+4. The account-list API uses the supported browser request dependency within its shared session. If the backend is unavailable, stop and restart with the Windows launcher so locked dependencies can be checked. This transport does not grant private access or guarantee source responses.
+5. An empty or non-JSON account API response is different from a private-account response. The video lookup and account list share a temporary source session. This can preserve source-issued cookies; it does not grant access to private posts or guarantee every listing response.
+6. For HTTP 429 or explicit IP blocks, wait before retrying. Repeated clicks do not remove source restrictions. Private, removed, omitted and blocked posts are not guaranteed to list or download.
 
 ## Review and select
 

@@ -10,3 +10,15 @@ class TikTokProfileIE(TikTokUserIE):
         if callback and isinstance(detail, dict):
             callback(detail.get('userInfo') or {})
         return data
+
+    def _download_json(self, url_or_request, *args, **kwargs):
+        # The upstream profile page already supports browser-compatible requests;
+        # carry that supported transport through to the account API as well.
+        if isinstance(url_or_request,str) and url_or_request.split('?',1)[0]==self._API_BASE_URL:
+            kwargs['impersonate']=True
+            kwargs['require_impersonation']=True
+            profile=self.get_param('_aaasoft_account_url')
+            if profile:
+                kwargs['headers']={'Referer':profile,**(kwargs.get('headers') or {})}
+            self.to_screen('Requesting account page with supported browser transport')
+        return super()._download_json(url_or_request,*args,**kwargs)

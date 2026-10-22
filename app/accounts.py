@@ -105,6 +105,7 @@ def account_visibility(profile,error=None):
 
 def source_issue(error):
     text=str(error).lower()
+    if any(word in text for word in ('no impersonate target is available','none of these impersonate targets are available')):return 'transport_unavailable'
     if any(word in text for word in ('certificate verify failed','certificate_verify_failed')):return 'certificate'
     if any(word in text for word in ('failed to parse json','expecting value','invalid json')):return 'invalid_response'
     if source_access.is_rate_limit(text):return 'rate_limit'
@@ -217,6 +218,7 @@ class AccountManager:
 
     def fail_message(self,error):
         text=str(error).lower()
+        if source_issue(error)=='transport_unavailable':return 'TikTok account listing requires the supported browser request dependency. Restart with the Windows launcher to repair dependencies from requirements.lock. Account privacy could not be verified.'
         if source_issue(error)=='invalid_response':return 'TikTok returned an empty or invalid JSON response from its account-list API. The video may be accessible while account enumeration is unavailable; this does not establish whether the account is private.'
         if 'ip address is blocked' in text:return 'TikTok is blocking access from this network/IP. Account/video availability could not be verified. Try again later.'
         if '403' in text and 'proxy' not in text:return 'TikTok rejected account access (HTTP 403). Its public account listing may be blocked even when individual video links work.'
@@ -273,6 +275,7 @@ class AccountManager:
                     # Keep the challenge/session cookie jar from the video request.
                     # Successful seed metadata must not poison the subsequent listing.
                     logger.saw_error=False
+                    downloader.params['_aaasoft_account_url']=url
                     with self.lock:task['stage']='account_listing' if seed_url else 'profile_lookup'
                     info=downloader.extract_info(extract_url,download=False)
                     if not info or info.get('_type')!='playlist':raise HTTPException(422,'TikTok did not return an account video list. Use a public account username.')

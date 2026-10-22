@@ -6,6 +6,12 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## TikTok account API browser transport (3.6.3)
+
+The creator-list API now uses yt-dlp's supported browser-compatible request transport, with the resolved public profile as Referer, within the existing shared session. The upstream profile page already supports this transport; the account JSON request previously used the default handler. The change is scoped to the exact TikTok creator-list endpoint. Certificate verification and private-access restrictions remain enabled, with no extra transport retry loop.
+
+If the browser request backend is unavailable, the portal gives a dependency-repair message rather than silently repeating plain requests. The locked dependency already includes curl_cffi; no new download service, proxy or credential collection is added. A bounded live check returned 16 unique entries across multiple pages, but the reported empty response on the user's Windows/network has not been reproduced locally. This is a concrete request-path change, not a guarantee that every network will receive a listing. See [verification](reports/tiktok-transport-v363.md).
+
 ## TikTok listing session fix (3.6.2)
 
 Video-assisted account lookup now resolves the video and enumerates the account inside the **same downloader/session**, retaining the source's in-memory cookies. Previously a fresh downloader discarded that session between the two requests. Seed/list inspection disables format probing, avoiding the temporary media test shown in the supplied Windows log. Successful recovered seed attempts do not leave a stale logger-error flag that rejects a later listing.
