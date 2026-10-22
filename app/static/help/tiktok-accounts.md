@@ -13,8 +13,9 @@ List public account videos, review availability and download a selection.
 1. Open Platform workspaces → TikTok. The three steps are Find account, Review videos and Download selection.
 2. Use the single Account username or TikTok link input. Paste @username, a public profile URL, a direct public video URL, or a vt.tiktok.com / vm.tiktok.com share link. Choose Find videos. No account ID or user ID is required.
 3. When given a video link, the source metadata identifies its owner automatically. The numeric uploader ID is not treated as a username. Missing or mismatching public identity is never guessed.
-4. Profile lookup and listing are metadata-only. The review appears while sequential access checks continue; only checked Available video posts can be selected.
-5. A confirmed account has a compact summary. Account details & copy options expands the public fields the source actually supplied. Missing fields and unconfirmed identities do not generate a large empty panel. Source counters do not guarantee that every historical post is downloadable.
+4. The browser initially loads 30 posts for faster review. Posts to load also offers 100, 250 and 1,000. Use Load next batch for more. Larger batches need more listing/checking time.
+5. Profile lookup and listing are metadata-only. The review appears while sequential access checks continue; only checked Available video posts can be selected.
+6. A confirmed account has a compact summary. Account details & copy options expands the public fields the source actually supplied. Missing fields and unconfirmed identities do not generate a large empty panel. Source counters do not guarantee that every historical post is downloadable.
 
 ## Understand public, private and access status
 
@@ -43,9 +44,10 @@ List public account videos, review availability and download a selection.
 ## Stop, retry and larger accounts
 
 1. Stop requests cancellation after the current source request. Checked entries stay reviewable; unverified entries remain disabled. Check unverified again resumes checks for unknown entries without relisting the account.
-2. The source is read in batches of up to 1,000 returned entries. Next profile batch requests the next source window; previous batches can be loaded again. Changing a batch clears that batch selection, after confirmation. The supported offset limit is 100,000 posts.
-3. A preview remains available for 30 minutes after checking ends; app restart clears previews. Checks have a 30-minute run limit. One account metadata task runs at a time to limit source requests. TikTok HTTP 429 or explicit IP blocking pauses new account tasks for ten minutes; access is not guaranteed when that pause ends.
-4. Reconnect resumes polling if the browser loses contact repeatedly. This does not create another download or account task.
+2. The source is read in selectable batches of up to 1,000 returned entries. The web default is 30. Next profile batch requests the next source window; previous batches can be loaded again. Changing a batch clears that batch selection, after confirmation. The supported offset limit is 100,000 posts.
+3. The found/scanned counters update while source entries arrive. The listing bar is indeterminate because its total is not yet known. Terminal Downloading item messages during metadata listing do not mean media files have been saved.
+4. A preview remains available for 30 minutes after checking ends; app restart clears previews. Checks have a 30-minute run limit. One account metadata task runs at a time to limit source requests. TikTok HTTP 429 or explicit IP blocking pauses new account tasks for ten minutes; access is not guaranteed when that pause ends.
+5. Reconnect resumes polling if the browser loses contact repeatedly. This does not create another download or account task.
 
 ## Understand limitations
 

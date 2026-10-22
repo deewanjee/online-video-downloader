@@ -2217,7 +2217,7 @@ def tik_entry(i,**extras):
 
 def fake_tiktok(monkeypatch,entries,checks=None):
     calls=[]
-    def extract(dl,url,download=False):
+    def extract(dl,url,download=False,process=True):
         calls.append((url,download,dl.params))
         if '/video/' not in url:return {'_type':'playlist','title':'Creator profile','entries':entries}
         id=url.rsplit('/',1)[-1]
@@ -2286,7 +2286,7 @@ def test_account_live_checks_are_required_and_foreign_ids_rejected(tiktok_accoun
 
 def test_account_cancellation_retains_checked_partial_list(tiktok_accounts,monkeypatch):
     checks=0
-    def extract(dl,url,download=False):
+    def extract(dl,url,download=False,process=True):
         nonlocal checks
         if '/video/' not in url:return {'_type':'playlist','entries':[tik_entry(1),tik_entry(2)]}
         checks+=1
@@ -2315,7 +2315,7 @@ def test_account_list_is_consumed_inside_open_downloader(tiktok_accounts,monkeyp
         def __init__(self):self.params={}
         def __enter__(self):alive[0]=True;return self
         def __exit__(self,*args):alive[0]=False
-        def extract_info(self,url,download=False):
+        def extract_info(self,url,download=False,process=True):
             def entries():
                 assert alive[0]
                 yield tik_entry(1,formats=[{'vcodec':'h264'}])
@@ -2326,7 +2326,7 @@ def test_account_list_is_consumed_inside_open_downloader(tiktok_accounts,monkeyp
 
 
 def test_tiktok_account_large_profile_exposes_next_batch(tiktok_accounts,monkeypatch):
-    entries=[tik_entry(i,formats=[{'vcodec':'h264'}]) for i in range(1001)]
+    entries=[tik_entry(i,formats=[{'vcodec':'h264'}]) for i in range(2001)]
     calls=fake_tiktok(monkeypatch,entries)
     task=account_load(offset=1000)
     data=client.get('/api/tiktok/previews/'+task['token']+'?page=2&size=30').json()
@@ -2410,7 +2410,7 @@ def test_account_checks_expire_after_run_not_while_worker_is_busy(tiktok_account
 
 
 def test_account_listing_page_failure_does_not_publish_a_partial_collection(tiktok_accounts,monkeypatch):
-    def extract(dl,url,download=False):
+    def extract(dl,url,download=False,process=True):
         def entries():
             yield tik_entry(1)
             raise RuntimeError('Unable to download webpage: connection reset')
@@ -2490,7 +2490,7 @@ def test_retained_tiktok_history_repairs_older_url_identity():
 ])
 def test_account_seed_share_links_are_resolved_before_same_account_check(tiktok_accounts,monkeypatch,url):
     calls=[]
-    def extract(dl,target,download=False):
+    def extract(dl,target,download=False,process=True):
         calls.append((target,download))
         if target.startswith('tiktokuser:'):
             return {'_type':'playlist','entries':[tik_entry(1,formats=[{'vcodec':'h264'}])]}
@@ -2506,7 +2506,7 @@ def test_account_seed_share_links_are_resolved_before_same_account_check(tiktok_
 
 def test_account_seed_share_link_actual_uploader_must_match(tiktok_accounts,monkeypatch):
     calls=[]
-    def extract(dl,url,download=False):
+    def extract(dl,url,download=False,process=True):
         calls.append(url)
         return {'uploader_id':'someone_else','channel_id':'MS4wLjABAAAA'+'A'*64}
     monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
@@ -2547,7 +2547,7 @@ def test_account_seed_numeric_user_id_uses_verified_profile_username(tiktok_acco
 
 
 def test_profile_collected_before_listing_failure_is_reviewable(tiktok_accounts,monkeypatch):
-    def extract(dl,url,download=False):
+    def extract(dl,url,download=False,process=True):
         dl.params['_aaasoft_profile']({'user':{'uniqueId':'creator','nickname':'Public name','signature':'Public bio',
             'id':'123456789','secUid':'MS4wLjABAAAA'+'A'*64,'verified':True,'privateAccount':False,
             'avatarLarger':'https://p16.tiktokcdn.com/avatar.jpg'},'stats':{'followerCount':'1234','followingCount':12,'videoCount':25,'heartCount':9000}})
@@ -2592,7 +2592,7 @@ def test_profile_extractor_reuses_existing_profile_page_without_extra_requests(m
 @pytest.mark.parametrize('link',['https://vt.tiktok.com/Fixture123/','https://vm.tiktok.com/Fixture123/','https://www.tiktok.com/@creator/video/7000000000000000001'])
 def test_one_input_video_identifies_account_without_manual_username(tiktok_accounts,monkeypatch,link):
     calls=[]
-    def extract(dl,url,download=False):
+    def extract(dl,url,download=False,process=True):
         calls.append(url)
         if url.startswith('tiktokuser:'):
             return {'_type':'playlist','entries':[tik_entry(1,formats=[{'vcodec':'h264'}])]}
@@ -2622,7 +2622,7 @@ def test_one_input_rejects_two_ambiguous_video_links(tiktok_accounts):
 
 @pytest.mark.parametrize('private,status',[(True,'private'),(False,'public'),(None,'unknown')])
 def test_account_privacy_is_independent_of_identity(tiktok_accounts,monkeypatch,private,status):
-    def extract(dl,url,download=False):
+    def extract(dl,url,download=False,process=True):
         dl.params['_aaasoft_profile']({'user':{'uniqueId':'creator','privateAccount':private}})
         raise main.yt_dlp.utils.DownloadError('Unable to extract secondary user ID')
     monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
@@ -2681,7 +2681,7 @@ def test_single_tiktok_error_distinguishes_private_from_login(monkeypatch,messag
 def test_tiktok_video_and_listing_share_session_and_no_media_probe(tiktok_accounts,monkeypatch):
     import http.cookiejar
     calls=[]
-    def extract(dl,url,download=False):
+    def extract(dl,url,download=False,process=True):
         calls.append(dl)
         assert download is False and dl.params['check_formats'] is False
         if url.startswith('tiktokuser:'):
@@ -2699,7 +2699,7 @@ def test_tiktok_video_and_listing_share_session_and_no_media_probe(tiktok_accoun
 
 
 def test_tiktok_empty_listing_reports_api_phase_without_leaking_details(tiktok_accounts,monkeypatch):
-    def extract(dl,url,download=False):
+    def extract(dl,url,download=False,process=True):
         if url.startswith('tiktokuser:'):
             def entries():
                 raise main.yt_dlp.utils.DownloadError('Failed to parse JSON: Expecting value in empty response https://source.test/?token=private_secret')
@@ -2749,3 +2749,49 @@ def test_tiktok_missing_browser_transport_is_actionable_not_private(tiktok_accou
     error=RuntimeError('The extractor specified impersonation but no impersonate target is available')
     assert source_issue(error)=='transport_unavailable'
     assert 'requirements.lock' in tiktok_accounts.fail_message(error)
+
+
+def test_tiktok_raw_listing_reports_progress_before_list_finishes(tiktok_accounts,monkeypatch):
+    import threading
+    pending=threading.Event();release=threading.Event();threads=[]
+    class Async:
+        def submit(self,fn,*args):
+            thread=threading.Thread(target=fn,args=args);threads.append(thread);thread.start()
+    monkeypatch.setattr(tiktok_accounts,'pool',Async())
+    def extract(dl,url,download=False,process=True):
+        assert download is False and process is False
+        def entries():
+            yield tik_entry(1,formats=[{'vcodec':'h264'}])
+            pending.set();assert release.wait(5)
+            yield tik_entry(2,formats=[{'vcodec':'h264'}])
+            yield tik_entry(3,formats=[{'vcodec':'h264'}])
+            pytest.fail('Listing read past its requested window and sentinel')
+        return {'_type':'playlist','entries':entries()}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    try:
+        response=client.post('/api/tiktok/loads',json={'account':'creator','batch_size':2})
+        assert pending.wait(5)
+        task=client.get('/api/tiktok/tasks/'+response.json()['id']).json()
+        assert task['status']=='running' and task['entries']==1 and task['scanned']==1 and not task['token']
+    finally:
+        release.set()
+        for thread in threads:thread.join(5)
+    task=client.get('/api/tiktok/tasks/'+response.json()['id']).json()
+    preview=client.get('/api/tiktok/previews/'+task['token']).json()
+    assert task['status']=='ready' and preview['batch_size']==2 and preview['has_more']
+    assert [row['id'] for row in preview['rows']]==[tik_entry(1)['id'],tik_entry(2)['id']]
+
+
+def test_tiktok_raw_listing_applies_offset_once(tiktok_accounts,monkeypatch):
+    fake_tiktok(monkeypatch,[tik_entry(i,formats=[{'vcodec':'h264'}]) for i in range(1,12)])
+    response=client.post('/api/tiktok/loads',json={'account':'creator','offset':3,'batch_size':3})
+    task=client.get('/api/tiktok/tasks/'+response.json()['id']).json()
+    preview=client.get('/api/tiktok/previews/'+task['token']).json()
+    assert [row['id'] for row in preview['rows']]==[tik_entry(i)['id'] for i in (4,5,6)]
+    assert task['scanned']==7 and task['entries']==3 and preview['has_more']
+
+
+@pytest.mark.parametrize('size',[0,-1,1001])
+def test_tiktok_source_window_size_is_bounded(tiktok_accounts,size):
+    assert client.post('/api/tiktok/loads',json={'account':'creator','batch_size':size}).status_code==422
+    assert not tiktok_accounts.tasks

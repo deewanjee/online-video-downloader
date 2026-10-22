@@ -33,7 +33,7 @@ def serve(port):
                     'sine=frequency=440:duration=4', '-c:v', 'libx264', '-c:a', 'aac',
                     '-pix_fmt', 'yuv420p', '-shortest', str(media)], check=True)
 
-    def extracted(dl, url, download=False):
+    def extracted(dl, url, download=False, process=True):
         if not download:
             if url=='https://vt.tiktok.com/Fixture123/':return {'uploader_url':'https://www.tiktok.com/@creator','uploader_id':'123456789','channel_id':'MS4wLjABAAAA'+'A'*64,'formats':[{'vcodec':'h264'}]}
             if 'tiktok.com/@blockedcreator' in url:raise main.yt_dlp.utils.DownloadError('Unable to extract secondary user ID')
@@ -317,7 +317,19 @@ def verify():
                     page.fill('#account-name','https://vt.tiktok.com/Fixture123/')
                     page.click('#account-load')
                     page.wait_for_function("document.querySelector('#account-status').textContent.includes('Checks complete')",timeout=30000)
-                    assert page.locator('#account-videos .account-card').count()==30
+                    page.wait_for_function("document.querySelectorAll('#account-videos .account-card').length===30")
+                    assert '30 listed' in page.locator('#account-counts').inner_text()
+                    assert not page.locator('#account-next-batch').is_disabled()
+                    page.click('#account-next-batch')
+                    page.wait_for_function("document.querySelector('#account-batch-label').textContent.includes('31–60')")
+                    page.wait_for_function("!document.querySelector('#account-load').disabled")
+                    page.click('#account-previous-batch')
+                    page.wait_for_function("document.querySelector('#account-batch-label').textContent.includes('1–30')")
+                    page.wait_for_function("!document.querySelector('#account-load').disabled")
+                    page.select_option('#account-size','1000')
+                    page.click('#account-load')
+                    page.wait_for_function("document.querySelector('#account-counts').textContent.includes('63 listed')")
+                    page.wait_for_function("!document.querySelector('#account-load').disabled")
                     assert page.locator('#account-profile').is_visible()
                     assert 'Account identity confirmed' in page.locator('#account-profile').inner_text()
                     assert 'Public account' in page.locator('#account-privacy').inner_text()

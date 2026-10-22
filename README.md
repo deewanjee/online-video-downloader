@@ -6,6 +6,14 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## Streaming TikTok listing progress and smaller batches (3.6.4)
+
+The supplied Windows log now shows successful account pagination through at least page 32 / item 465 after using a video link. The portal's zero counter was a progress problem: yt-dlp processed the flat playlist inside extract_info before the application could count the returned entries.
+
+Account listing now requests raw extraction (`process=False`) and consumes the source iterator inside the open shared session. The app updates entries/scanned counts as each post arrives and applies offsets/window limits exactly once. The listing progress bar is indeterminate while its total is unknown. No partial list is presented as a completed import after a source error.
+
+The browser starts with **30 posts** for faster review. Choose 100, 250 or 1,000 when needed, then use **Load next batch** / Previous. Existing API clients retain the 1,000 default unless they send batch_size. Availability checks still run before selection; this is not unlimited parallel downloading. yt-dlp's “Downloading item N” during listing refers to metadata processing, not completed media saves. Username-only ID resolution may still fail; the supplied video's successful listing does not fix every profile endpoint. See [verification](reports/tiktok-streaming-v364.md).
+
 ## TikTok account API browser transport (3.6.3)
 
 The creator-list API now uses yt-dlp's supported browser-compatible request transport, with the resolved public profile as Referer, within the existing shared session. The upstream profile page already supports this transport; the account JSON request previously used the default handler. The change is scoped to the exact TikTok creator-list endpoint. Certificate verification and private-access restrictions remain enabled, with no extra transport retry loop.
