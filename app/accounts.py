@@ -10,7 +10,7 @@ from typing import Annotated
 from urllib.parse import urlparse
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
-from app import availability, source_access, storage
+from app import availability, source_access, storage, recovery
 
 BATCH=1000
 PROVIDERS={'youtube':'YouTube','tiktok':'TikTok','instagram':'Instagram','facebook':'Facebook','x':'X / Twitter','dailymotion':'Dailymotion','threads':'Threads'}
@@ -93,11 +93,48 @@ def public_video_url(value,expected=None):
     raise HTTPException(400,'Enter a TikTok @username, profile URL, direct public video URL or supported vt.tiktok.com / vm.tiktok.com share link.')
 
 
-def video_state(info):
-    state=availability.checked(info)
+def account_visibility(profile,error=None):
+    value=profile.get('private') if isinstance(profile,dict) and profile.get('identity_verified') else None
+    text=str(error or '').lower()
+    if value is True:return {'status':'private','label':'Private account · source confirmed'}
+    if value is False:return {'status':'public','label':'Public account · source confirmed'}
+    if 'account is private' in text and not any(word in text for word in ('likely','either','may be','or all')):
+        return {'status':'private','label':'Private account · source confirmed'}
+    return {'status':'unknown','label':'Account privacy · Not verified'}
+
+
+def source_issue(error):
+    text=str(error).lower()
+    if source_access.is_rate_limit(text):return 'rate_limit'
+    if 'ip address is blocked' in text:return 'ip_block'
+    if re.search(r'(?:http(?: error)?|status)[ :=]+403\b',text):return 'access_denied'
+    if account_visibility(None,error)['status']=='private':return 'private_account'
+    if any(word in text for word in ('secondary user id','secuid','captcha','challenge','not a bot','verification')):return 'lookup_unavailable'
+    code=recovery.classify(error)['code']
+    return code if code in ('network','proxy','access','removed','restricted') else 'source_error'
+
+
+def video_visibility(info=None,error=None):
+    value=(info or {}).get('availability');text=str(error or '').lower()
+    if value=='private' or (any(word in text for word in ('private video','video is private')) and not any(word in text for word in ('likely','either','may be','or all'))):
+        return {'visibility':'private','visibility_label':'Private video · source confirmed'}
+    if value in ('needs_auth','premium_only','subscriber_only') or any(word in text for word in ('login required','sign in','sign-in','age verification')):
+        return {'visibility':'restricted','visibility_label':'Access restricted · privacy not verified'}
+    if value=='public':return {'visibility':'public','visibility_label':'Public video · source confirmed'}
+    if error is None and any(isinstance(f,dict) and f.get('vcodec') not in (None,'none') for f in (info or {}).get('formats',[]) or []):
+        return {'visibility':'accessible','visibility_label':'Accessible · checked; privacy not provided'}
+    return {'visibility':'unknown','visibility_label':'Video privacy · Not verified'}
+
+
+def video_state(info=None,error=None):
+    state=availability.checked(info,error)
+    visibility=video_visibility(info,error)
+    if visibility['visibility']=='private':state.update(status='private',status_label='Private video',selectable=False)
+    elif visibility['visibility']=='restricted':state.update(status='restricted',status_label='Access restricted',selectable=False)
+    elif error is not None and state['status']=='private':state.update(status='unknown',status_label='Not verified',selectable=False)
     if state['status']=='available' and not any(isinstance(f,dict) and f.get('vcodec') not in (None,'none') for f in (info or {}).get('formats',[]) or []):
         state={'status':'unsupported','status_label':'No video stream','selectable':False,'detail':'This post does not expose a playable video stream.'}
-    return state
+    return state|visibility
 
 
 def account_row(entry,username,position):
@@ -105,7 +142,6 @@ def account_row(entry,username,position):
     id=str(entry.get('id') or '')
     valid=bool(re.fullmatch(r'[0-9]{6,25}',id))
     state=video_state(entry)
-    if entry.get('availability') in ('private','needs_auth'):state={'status':'private','status_label':'Private / sign-in','selectable':False}
     if not valid:state={'status':'invalid','status_label':'Unavailable entry','selectable':False}
     # Full formats prove a usable listing now; flat public metadata does not.
     state['selectable']=state['status']=='available'
@@ -184,11 +220,13 @@ class AccountManager:
         if any(x in text for x in ('account is private',"account is either private",'login required','log in','sign in')):return 'TikTok requires authorized access to this account/video. Try a public account; private videos cannot be listed here.'
         if any(x in text for x in ('captcha','challenge','verify','secondary user id','secuid','impersonat','not a bot')):return 'TikTok could not provide a public account listing or requires browser verification. Paste a public video link in the same input to identify its account automatically. TikTok may still block account listing; individual video downloads can be tried separately.'
         if 'does not have any videos' in text:return 'TikTok reports no posted videos for this account.'
-        return self.main.download_error(error)
+        message=self.main.download_error(error)
+        return 'TikTok did not provide usable account/video metadata. Privacy and availability could not be verified. Open the source link and check access; this is not proof that the account is private.' if message.startswith('Download failed.') else message
 
     def run(self,id,url,offset,token,all_entries,seed_url=None):
         task=self.tasks[id];event=task['cancel'];cache=None;terminal='ready';detail=None
         manager=self
+        issue_code=None;failure=None
         username=url.rsplit('@',1)[-1] if url else None
         def receive_profile(data):
             profile=profile_details(data,username)
@@ -217,6 +255,7 @@ class AccountManager:
                 extract_url=url
                 if seed_url:
                     seed=self.main.extract_video(seed_url,False,self.main.options()|{'logger':logger,'socket_timeout':20,'retries':1,'extractor_retries':1}) or {}
+                    with self.lock:task['video_visibility']=video_visibility(seed)
                     actual=video_username(seed)
                     if not actual or (username and actual.casefold()!=username.casefold()):raise HTTPException(422,'The public video belongs to @'+actual+' rather than @'+username+'. Use a video from the same account.' if actual else 'TikTok did not expose a verifiable username for this video. The numeric user ID alone cannot confirm the account.')
                     if not username:
@@ -264,19 +303,20 @@ class AccountManager:
                     except Exception as exc:
                         issue=self.main.recovery.classify(exc)
                         if issue['code'] in ('rate_limit','network','proxy','storage') or any(x in str(exc).lower() for x in ('captcha','challenge','secondary user id','not a bot','ip address is blocked','http error 403')):raise
-                        state=availability.checked(error=exc);state['selectable']=state['status']=='available'
+                        state=video_state(error=exc);state['selectable']=state['status']=='available'
                         with self.lock:row.update(state,checked_at=time.time())
                 with self.lock:task['checked']+=1
             if not cache['rows']:detail='No public video entries were returned. The source may hide posts; this is not proof that the account has no videos.'
         except source_access.SourceCancelled:terminal='cancelled';detail='Stopped. Checked entries remain reviewable; unverified entries cannot be selected.'
         except Exception as exc:
+            issue_code=source_issue(exc);failure=exc
             terminal='cancelled' if event.is_set() else 'failed';detail='Stopped after the current source request.' if event.is_set() else exc.detail if isinstance(exc,HTTPException) else self.fail_message(exc)
             if source_access.is_rate_limit(str(exc)) or 'ip address is blocked' in str(exc).lower():
                 with self.lock:self.until=time.monotonic()+600
         finally:
             with self.lock:
                 if cache:cache['busy']=False;cache['created']=time.monotonic()
-                task.update(status=terminal,detail=detail)
+                task.update(status=terminal,detail=detail,issue_code=issue_code,account_visibility=account_visibility(task.get('profile'),failure))
 
     def annotated(self,cache):
         counts=storage.video_counts(self.main.DATA)
@@ -290,14 +330,16 @@ class AccountManager:
         return rows
 
     def filtered(self,cache,q='',status='all'):
-        rows=self.annotated(cache);counts={'all':len(rows),'available':0,'downloaded':0,'unavailable':0,'unknown':0}
+        rows=self.annotated(cache);counts={'all':len(rows),'available':0,'downloaded':0,'unavailable':0,'unknown':0,'public':0,'private':0,'restricted':0,'accessible':0,'privacy_unknown':0}
         for row in rows:
+            counts['privacy_unknown']+=row.get('visibility','unknown')=='unknown'
+            if row.get('visibility') in ('public','private','restricted','accessible'):counts[row['visibility']]+=1
             counts['available']+=row['status']=='available'
             counts['downloaded']+=row['previous_downloads']>0
             counts['unknown']+=row['status']=='unknown'
             counts['unavailable']+=row['status'] not in ('available','unknown')
         def matches(row):
-            return (not q or q.casefold() in (row['title']+' '+row['id']).casefold()) and (status=='all' or status=='downloaded' and row['previous_downloads']>0 or status=='available' and row['status']=='available' or status=='unknown' and row['status']=='unknown' or status=='unavailable' and row['status'] not in ('unknown','available'))
+            return (not q or q.casefold() in (row['title']+' '+row['id']).casefold()) and (status=='all' or status=='downloaded' and row['previous_downloads']>0 or status=='available' and row['status']=='available' or status in ('public','private','restricted') and row.get('visibility')==status or status=='unknown' and row['status']=='unknown' or status=='unavailable' and row['status'] not in ('unknown','available'))
         return [row for row in rows if matches(row)],counts
 
 
@@ -319,7 +361,8 @@ def register(main):
         with manager.lock:
             item=manager.tasks.get(id)
             if not item:raise HTTPException(404,'TikTok account task expired.')
-            return {key:item[key] for key in ('id','status','phase','checked','total','entries','token','detail','profile','account_url') if key in item}
+            item['account_visibility']=account_visibility(item.get('profile')) if item['status'] in ('running','queued') else item.get('account_visibility',account_visibility(item.get('profile')))
+            return {key:item[key] for key in ('id','status','phase','checked','total','entries','token','detail','profile','account_url','issue_code','account_visibility','video_visibility') if key in item}
 
     @app.delete('/api/tiktok/tasks/{id}',status_code=204)
     def cancel(id:str):
@@ -329,15 +372,15 @@ def register(main):
 
     @app.get('/api/tiktok/previews/{token}')
     def preview(token:str,page:int=1,size:int=30,q:str='',status:str='all'):
-        if page<1 or page>100000 or size not in (30,60,100) or len(q)>200 or status not in ('all','available','downloaded','unavailable','unknown'):raise HTTPException(400,'Invalid TikTok list filter or page.')
+        if page<1 or page>100000 or size not in (30,60,100) or len(q)>200 or status not in ('all','available','downloaded','unavailable','unknown','public','private','restricted'):raise HTTPException(400,'Invalid TikTok list filter or page.')
         with manager.lock:
             cache=manager.preview(token);rows,counts=manager.filtered(cache,q,status)
-            return {'profile':cache.get('profile'),'token':token,'title':cache['title'],'account':cache['username'],'offset':cache['offset'],'has_more':cache['has_more'],'busy':cache['busy'],'submitted':False,'submitted_batches':len(cache['submissions']),
+            return {'account_visibility':account_visibility(cache.get('profile')),'profile':cache.get('profile'),'token':token,'title':cache['title'],'account':cache['username'],'offset':cache['offset'],'has_more':cache['has_more'],'busy':cache['busy'],'submitted':False,'submitted_batches':len(cache['submissions']),
                     'rows':rows[(page-1)*size:page*size],'total':len(rows),'counts':counts,'page':page,'size':size}
 
     @app.get('/api/tiktok/previews/{token}/selection')
     def selection(token:str,q:str='',status:str='all',allow_repeat:bool=False):
-        if len(q)>200 or status not in ('all','available','downloaded','unavailable','unknown'):raise HTTPException(400,'Invalid TikTok selection filter.')
+        if len(q)>200 or status not in ('all','available','downloaded','unavailable','unknown','public','private','restricted'):raise HTTPException(400,'Invalid TikTok selection filter.')
         with manager.lock:
             rows,_=manager.filtered(manager.preview(token),q,status)
             return {'ids':[r['id'] for r in rows if r['selectable'] and not r['already_queued'] and (allow_repeat or not r['previous_downloads'])]}

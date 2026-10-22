@@ -510,6 +510,9 @@ def analyze(req: VideoRequest):
             raise HTTPException(400, 'Please choose a single, non-live video.')
         heights = sorted({f['height'] for f in info.get('formats', []) if f.get('height') and f.get('vcodec') != 'none'}, reverse=True)
         result = {'title': info.get('title', 'Untitled video'), 'author': info.get('uploader', 'Unknown creator'), 'duration': info.get('duration'), 'thumbnail': info.get('thumbnail'), 'platform': info.get('extractor_key'), 'qualities': heights, 'url': req.url}
+        if storage.platform_name(req.url)=='TikTok':
+            from app.accounts import video_visibility, video_state
+            result.update(video_visibility(info));result['can_download']=video_state(info)['status']=='available'
         result['source_key']=storage.video_key(req.url)
         result['previous_downloads'] = storage.downloaded_count(DATA, req.url)
         with lock:
@@ -522,7 +525,15 @@ def analyze(req: VideoRequest):
     except (source_access.SourceRateLimited, source_access.SourceBusy) as exc:
         raise HTTPException(429, str(exc), headers={'Retry-After': str(exc.retry_after)})
     except Exception as exc:
-        raise HTTPException(422, download_error(exc))
+        message=download_error(exc)
+        if storage.platform_name(req.url)=='TikTok':
+            from app.accounts import video_visibility
+            privacy=video_visibility(error=exc)['visibility']
+            if privacy=='private':message='TikTok reports that this video is private. Public access is unavailable.'
+            elif privacy=='restricted':message='TikTok requires authorized access to this video. Its privacy could not be verified.'
+            elif message.startswith('Download failed.'):
+                message='TikTok did not provide usable video metadata. Video privacy and availability could not be verified; check the source link in your browser.'
+        raise HTTPException(422, message)
 
 
 def update(job_id, **values):

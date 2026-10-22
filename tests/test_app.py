@@ -2617,3 +2617,61 @@ def test_one_input_video_with_numeric_identity_only_does_not_guess_account(tikto
 def test_one_input_rejects_two_ambiguous_video_links(tiktok_accounts):
     response=client.post('/api/tiktok/loads',json={'account':'https://vt.tiktok.com/Fixture123/','seed_url':'https://vm.tiktok.com/Other123/'})
     assert response.status_code==400 and not tiktok_accounts.tasks
+
+
+@pytest.mark.parametrize('private,status',[(True,'private'),(False,'public'),(None,'unknown')])
+def test_account_privacy_is_independent_of_identity(tiktok_accounts,monkeypatch,private,status):
+    def extract(dl,url,download=False):
+        dl.params['_aaasoft_profile']({'user':{'uniqueId':'creator','privateAccount':private}})
+        raise main.yt_dlp.utils.DownloadError('Unable to extract secondary user ID')
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    task=account_load()
+    assert task['profile']['identity_verified'] and task['account_visibility']['status']==status
+    assert task['issue_code']=='lookup_unavailable'
+
+
+@pytest.mark.parametrize('message,status,code',[
+    ("This user's account is private",'private','private_account'),
+    ('This account is likely either private or all videos are private','unknown','source_error'),
+    ('Sign in to view this account','unknown','access'),
+    ('HTTP Error 403: Forbidden','unknown','access_denied'),
+    ('Unable to extract secondary user ID','unknown','lookup_unavailable'),
+])
+def test_account_source_errors_do_not_guess_privacy(tiktok_accounts,monkeypatch,message,status,code):
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',lambda *args,**kwargs:(_ for _ in ()).throw(main.yt_dlp.utils.DownloadError(message)))
+    task=account_load()
+    assert task['account_visibility']['status']==status and task['issue_code']==code
+
+
+@pytest.mark.parametrize('availability,status,visibility',[
+    ('private','private','private'),('needs_auth','restricted','restricted'),
+    ('public','available','public'),(None,'available','accessible'),
+])
+def test_video_privacy_labels_do_not_confuse_playability_with_public(tiktok_accounts,availability,status,visibility):
+    from app.accounts import account_row
+    row=account_row(tik_entry(1,availability=availability,formats=[{'vcodec':'h264'}]),'creator',1)
+    assert row['status']==status and row['visibility']==visibility
+    assert row['selectable']==(status=='available')
+
+
+def test_account_private_filter_and_counts(tiktok_accounts,monkeypatch):
+    fake_tiktok(monkeypatch,[tik_entry(1,availability='private'),tik_entry(2,availability='needs_auth'),tik_entry(3,availability='public',formats=[{'vcodec':'h264'}])])
+    task=account_load();url='/api/tiktok/previews/'+task['token']
+    data=client.get(url).json()
+    assert data['counts']['private']==data['counts']['public']==data['counts']['restricted']==1
+    assert client.get(url+'?status=private').json()['rows'][0]['id']==tik_entry(1)['id']
+    assert client.get(url+'?status=public').json()['rows'][0]['id']==tik_entry(3)['id']
+
+
+def test_single_tiktok_analysis_reports_source_visibility(monkeypatch):
+    monkeypatch.setattr(main,'extract_video',lambda *args,**kwargs:{'availability':'public','formats':[{'vcodec':'h264','height':720}]})
+    data=client.post('/api/platform/tiktok/analyze',json={'url':'https://www.tiktok.com/@creator/video/'+tik_entry(1)['id']}).json()
+    assert data['visibility']=='public'
+
+
+@pytest.mark.parametrize('message,label',[('This video is private','is private'),('Sign in to view','privacy could not be verified')])
+def test_single_tiktok_error_distinguishes_private_from_login(monkeypatch,message,label):
+    def fail(*args,**kwargs):raise main.yt_dlp.utils.DownloadError(message)
+    monkeypatch.setattr(main,'extract_video',fail)
+    response=client.post('/api/platform/tiktok/analyze',json={'url':'https://www.tiktok.com/@creator/video/'+tik_entry(1)['id']})
+    assert response.status_code==422 and label in response.json()['detail']

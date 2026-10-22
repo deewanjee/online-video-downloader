@@ -16,6 +16,14 @@ List public account videos, review availability and download a selection.
 4. Profile lookup and listing are metadata-only. The review appears while sequential access checks continue; only checked Available video posts can be selected.
 5. A confirmed account has a compact summary. Account details & copy options expands the public fields the source actually supplied. Missing fields and unconfirmed identities do not generate a large empty panel. Source counters do not guarantee that every historical post is downloadable.
 
+## Understand public, private and access status
+
+1. Account privacy is shown separately as Public account, Private account or Not verified. Public/private requires an explicit source flag or an unambiguous account-private response; confirming the account username alone does not prove its privacy.
+2. Each returned video shows Public video, Private video, Access restricted, Accessible (privacy not provided), or Not verified. A usable media listing proves access at check time but does not establish a public privacy setting without source metadata.
+3. Use Public, Private or Access restricted filters in the account review. Private/restricted entries remain disabled. Counts describe returned entries only; TikTok may hide private posts entirely.
+4. Account listing errors, HTTP 403/429, network failures and sign-in prompts do not establish that an account is private. The supplied-video access line can be available while account privacy or the full listing remains unverified.
+5. Single-video analysis shows the same privacy/access distinction. Explicit private/restricted metadata disables Add to queue; an unknown source response explains that privacy could not be verified.
+
 ## If the list cannot be loaded
 
 1. The next-step panel distinguishes a source block from an unavailable account listing. A failure is not evidence that the account has zero videos.

@@ -6,6 +6,14 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## Explicit TikTok privacy and access status (3.6.1)
+
+The TikTok section now separates **account privacy**, **individual video privacy/access** and **listing errors**. Account privacy is Public / Private only when TikTok explicitly confirms it; otherwise **Not verified** stays visible even if the username is confirmed. Returned videos expose source-confirmed public/private labels, restricted access, or accessible media with privacy not provided. Public/private/restricted filters and returned-entry counters are included; omitted private posts are not counted as known.
+
+Fixed a misleading blocked heading: a loose `rate` text match also matched the word `separately`. The UI now uses server issue codes for account failures, with strict fallback matching. Missing account IDs and generic verification/lookup failures no longer imply an IP or rate block. Single-video analysis distinguishes an explicit private response from a sign-in restriction and generic unusable metadata. Private/restricted metadata disables its queue button.
+
+A public account can contain private posts. A downloadable public video does not prove that the entire account list is accessible. See [verification](reports/tiktok-privacy-v361.md) and the English account guide.
+
 ## Simplified TikTok workbench (3.6.0)
 
 The account section now uses **one input** for a username, profile URL or public video/share link. Choose **Find videos**, review source-available posts, then **Download selected**. A supplied video identifies its owner automatically; there is no separate username/assistance-field puzzle and no need to copy internal IDs. Direct video and supported short-link inputs receive the same strict public-source validation.

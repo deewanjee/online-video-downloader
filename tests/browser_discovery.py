@@ -39,12 +39,12 @@ def serve(port):
             if 'tiktok.com/@blockedcreator' in url:raise main.yt_dlp.utils.DownloadError('Unable to extract secondary user ID')
             if 'tiktok.com/@' in url or url.startswith('tiktokuser:'):
                 if '/video/' not in url:
-                    if dl.params.get('_aaasoft_profile'):dl.params['_aaasoft_profile']({'user':{'uniqueId':'creator','nickname':'TikTok fixture creator','signature':'Public fixture bio','id':'123456789','secUid':'MS4wLjABAAAA'+'A'*64,'verified':True},'stats':{'followerCount':1234,'videoCount':63}})
+                    if dl.params.get('_aaasoft_profile'):dl.params['_aaasoft_profile']({'user':{'uniqueId':'creator','nickname':'TikTok fixture creator','signature':'Public fixture bio','id':'123456789','secUid':'MS4wLjABAAAA'+'A'*64,'verified':True,'privateAccount':False},'stats':{'followerCount':1234,'videoCount':63}})
                     return {'_type':'playlist','title':'TikTok fixture creator','entries':[{'id':str(7000000000000000000+i),'title':f'Creator post {i}','duration':4,'thumbnail':f'https://p16.tiktokcdn.com/demo/{i}.jpg'} for i in range(1,64)]}
                 video_id=url.rsplit('/',1)[-1]
                 if video_id=='7000000000000000002':raise main.yt_dlp.utils.DownloadError('Private video')
                 if video_id=='7000000000000000003':return {'formats':[{'vcodec':'none','acodec':'aac'}]}
-                return {'title':'TikTok public video','duration':4,'formats':[{'height':180,'vcodec':'h264','acodec':'aac'}],'uploader_id':'creator','channel_id':'MS4wLjABAAAA'+'A'*64}
+                return {'availability':'public' if video_id=='7000000000000000004' else None,'title':'TikTok public video','duration':4,'formats':[{'height':180,'vcodec':'h264','acodec':'aac'}],'uploader_id':'creator','channel_id':'MS4wLjABAAAA'+'A'*64}
             if 'list=' in url:
                 return {'_type':'playlist','title':'Playlist with previous downloads','entries':[{'id':f'clip{i:07d}','title':'[Private video]' if i==3 else f'Playlist video {i}','availability':'private' if i==3 else 'public'} for i in range(1,6)]}
             if '/results?' in url:
@@ -309,6 +309,8 @@ def verify():
                     page.click('#account-load')
                     page.wait_for_selector('#account-recovery:not([hidden])')
                     assert not page.locator('#account-profile').is_visible()
+                    assert 'Not verified' in page.locator('#account-privacy').inner_text()
+                    assert page.locator('#account-recovery-title').inner_text()=='TikTok did not return an account video list'
                     assert 'Not provided' not in page.locator('#source-panels [data-source=tiktok]').inner_text()
                     page.click('#account-use-video')
                     assert page.input_value('#account-name')==''
@@ -317,7 +319,17 @@ def verify():
                     page.wait_for_function("document.querySelector('#account-status').textContent.includes('Checks complete')",timeout=30000)
                     assert page.locator('#account-videos .account-card').count()==30
                     assert page.locator('#account-profile').is_visible()
-                    assert 'Public account identity confirmed' in page.locator('#account-profile').inner_text()
+                    assert 'Account identity confirmed' in page.locator('#account-profile').inner_text()
+                    assert 'Public account' in page.locator('#account-privacy').inner_text()
+                    page.select_option('#account-filter','private')
+                    page.wait_for_function("document.querySelectorAll('#account-videos .account-card').length===1")
+                    assert 'Private video' in page.locator('#account-videos .account-video-privacy').inner_text()
+                    assert page.locator('#account-videos input').is_disabled()
+                    page.select_option('#account-filter','public')
+                    page.wait_for_function("document.querySelector('#account-videos .account-card')?.dataset.videoId==='7000000000000000004'")
+                    assert 'Public video' in page.locator('#account-videos .account-video-privacy').inner_text()
+                    page.select_option('#account-filter','all')
+                    page.wait_for_function("document.querySelectorAll('#account-videos .account-card').length===30")
                     page.locator('#account-profile summary').click()
                     assert '1234' in page.locator('#account-profile').inner_text()
                     page.get_by_role('button',name='Copy Username',exact=True).click()
