@@ -186,9 +186,15 @@ def verify():
                     page.locator('[data-view=completed]').click()
                     assert page.locator('#status-filter').input_value()=='completed'
                     assert page.locator('#all-jobs .job.completed').count()==2
+                    assert page.evaluate("getComputedStyle(document.getElementById('all-jobs')).gridTemplateColumns.split(' ').length===5")
+                    page.set_viewport_size({'width':1920,'height':1050})
+                    assert page.evaluate("getComputedStyle(document.getElementById('all-jobs')).gridTemplateColumns.split(' ').length===6")
+                    page.set_viewport_size({'width':1440,'height':1050})
                     if screenshot:
                         page.locator('#all-jobs .job').first.focus()
                         page.screenshot(path=str(Path(screenshot).with_name('completed-library-v33.png')),full_page=True)
+                    page.locator('#all-jobs .job').first.focus()
+                    page.locator('#all-jobs .job').first.hover()
                     before_repeat=len(page.request.get(base+'/api/jobs').json())
                     page.locator('#all-jobs .job').first.locator('.redownload-button').click()
                     page.wait_for_selector('#repeat-dialog[open]')
@@ -260,7 +266,8 @@ def verify():
                     assert any(item['event']=='duplicate_skipped' and 'clip0000001' in item['url'] for item in records)
                     assert any(item['event']=='removed' for item in records)
                     assert page.request.get(base+'/api/activity/export?format=csv').headers['content-type'].startswith('text/csv')
-                    assert page.evaluate("parseFloat(getComputedStyle(document.getElementById('activity-search')).fontSize)>=14")
+                    assert page.evaluate("getComputedStyle(document.getElementById('activity-search')).fontSize==='12px'")
+                    assert page.evaluate("getComputedStyle(document.querySelector('.discovery-card h2')).fontSize==='14px'")
                     page.locator('[data-view=discover]').click()
                     page.select_option('#discovery-kind','playlists')
                     page.click('#discovery-submit')
@@ -280,7 +287,7 @@ def verify():
                     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
                     assert not errors, errors
                     browser.close()
-                    print('PASS: archive, persistent duplicate prevention, playlist history, retained/exportable activity, readable fonts, preview without queueing, frame teardown, individual queues, live progress, duplicate guard, merging, completion, failure, saved playback, paging/search reconciliation, history-only badge, embed allowlist and responsive width; no JavaScript errors.')
+                    print('PASS: archive, persistent duplicate prevention, playlist history, retained/exportable activity, restored compact typography, preview without queueing, frame teardown, individual queues, live progress, duplicate guard, merging, completion, failure, saved playback, paging/search reconciliation, history-only badge, embed allowlist and responsive width; no JavaScript errors.')
             finally:
                 process.terminate()
                 try:

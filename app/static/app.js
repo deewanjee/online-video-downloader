@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const UI_VERSION = '3.3.0';
+const UI_VERSION = '3.3.1';
 const audioFormats = ['mp3', 'm4a', 'wav'];
 function icon(name) {
   const paths = {play:'<path d="m8 5 11 7-11 7z"/>',arrow:'<path d="M6 18 18 6M6 6h12v12"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>'};
