@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title StreamVault - Keep this window open
+title AAASoft Video Studio - Keep this window open
 if not exist "requirements.lock" (
   echo Project files are missing. Extract the entire ZIP before launching.
   pause
@@ -18,9 +18,9 @@ if not exist "%SV_PY%" (
     exit /b 1
   )
 )
-"%SV_PY%" -c "import fastapi, uvicorn, yt_dlp, yt_dlp_ejs, curl_cffi" >nul 2>&1
+"%SV_PY%" -m app.dependencies >nul 2>&1
 if errorlevel 1 (
-  echo Installing dependencies. An Internet connection is required on first launch...
+  echo Preparing or updating required dependencies. Internet access is needed for this update...
   "%SV_PY%" -m pip install -r requirements.lock --timeout 120 --retries 10
   if errorlevel 1 (
     echo Installation failed. Check the error above and try again.

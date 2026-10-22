@@ -165,7 +165,7 @@ def isolate_history(tmp_path, monkeypatch):
     monkeypatch.delenv('STREAMVAULT_SYSTEM_CERTS', raising=False)
     monkeypatch.delenv('STREAMVAULT_COOKIE_FILE', raising=False)
     monkeypatch.delenv('STREAMVAULT_DESKTOP', raising=False)
-    deferred = main.DeferredDownloads(lambda: main.source_access.youtube.remaining(), lambda job_id, req: main.resume_deferred(job_id, req))
+    deferred = main.DeferredDownloads(lambda: main.source_access.youtube.remaining(), lambda job_id, req: main.resume_deferred(job_id, req), delay_for=lambda job_id, req: main.recovery_delay(job_id, req))
     monkeypatch.setattr(main, 'deferred_downloads', deferred)
     yield
     deferred.stop()
@@ -1636,7 +1636,9 @@ def test_source_429_holds_current_job_and_other_queued_jobs(monkeypatch):
         job=failed_job(id)|{'status':'queued'};main.jobs[id]=job
         main.run_download(id,main.DownloadRequest(url=job['url']))
     assert len(calls)==1
-    assert all(j['status']=='queued' and j['stage']=='source_wait' for j in main.jobs.values())
+    assert main.jobs['first']['stage']=='retry_wait' and main.jobs['first']['auto_attempts']==1
+    assert main.jobs['second']['stage']=='source_wait'
+    assert all(j['status']=='queued' for j in main.jobs.values())
     assert main.storage.statistics(main.DATA)['total']==0
 
 
@@ -1713,3 +1715,172 @@ def test_queued_removal_race_cannot_delete_running_worker_files(monkeypatch):
         assert not result['removed'] and result['failed'][0]['status']==409
         assert job['id'] in main.jobs
     finally:release.set();worker.join(timeout=2)
+
+
+@pytest.mark.parametrize('message,code,automatic',[
+    ('HTTP Error 503: upstream unavailable','network',True),
+    ('The source connection timed out','network',True),
+    ('HTTP Error 429: Too Many Requests','rate_limit',True),
+    ('Video unavailable','unavailable',True),
+    ('The video is unavailable or has been removed.','unavailable',True),
+    ('Video has been removed','removed',False),
+    ('Private video - Sign in','access',False),
+    ('This video is DRM-protected','restricted',False),
+    ('Not available in your country','restricted',False),
+    ('Not enough free disk space','storage',False),
+    ('The selected folder is not writable','storage',False),
+    ('Requested format is not available','other',False),
+])
+def test_recovery_classifies_temporary_and_actionable_errors(message,code,automatic):
+    issue=main.recovery.classify(message)
+    assert issue['code']==code and issue['retryable'] is automatic
+    assert issue['action']
+
+
+def test_unavailable_uses_one_alternate_client_with_original_options(monkeypatch):
+    calls=[]
+    def extracted(dl,url,download=False):
+        calls.append(dl.params)
+        if len(calls)==1:raise main.yt_dlp.utils.DownloadError('[youtube] example: Video unavailable')
+        return {'title':'Available via alternate client','formats':[]}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extracted)
+    result=main.extract_video('https://youtu.be/example',False,main.options()|{'outtmpl':'keep-this'})
+    assert result['title']=='Available via alternate client' and len(calls)==2
+    assert calls[1]['extractor_args']['youtube']['player_client']==['web','web_safari']
+    assert calls[1]['outtmpl']['default']=='keep-this'
+    assert main.source_access.youtube.metadata_slot.active==0
+
+
+@pytest.mark.parametrize('reason',['Private video','Video unavailable: removed by uploader','Video unavailable: not available in your country','HTTP Error 429: Too Many Requests'])
+def test_client_fallback_never_retries_restricted_or_rate_limited_responses(monkeypatch,reason):
+    calls=[]
+    def extracted(*args,**kwargs):calls.append(1);raise RuntimeError(reason)
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extracted)
+    with pytest.raises(Exception):main.extract_video('https://youtu.be/example',False,main.options())
+    assert len(calls)==1
+
+
+def test_automatic_retry_budget_is_bounded_and_survives_restart(monkeypatch):
+    held=[]
+    monkeypatch.setattr(main.deferred_downloads,'defer',lambda *args,**kwargs:held.append((args,kwargs)))
+    monkeypatch.setattr(main,'extract_video',lambda *args:(_ for _ in ()).throw(RuntimeError('Connection timed out')))
+    job=failed_job('auto_bounded')|{'status':'queued'};main.jobs[job['id']]=job
+    request=main.DownloadRequest(url=job['url'])
+    for attempt in range(4):main.run_download(job['id'],request)
+    assert len(held)==3 and job['status']=='failed' and job['auto_attempts']==3
+    assert job['recovery_exhausted'] and job['error_code']=='network'
+    restored=main.storage.restore(main.DATA);assert restored[job['id']]['auto_attempts']==3
+    main.initialize_recovery();assert len(held)==3
+
+
+def test_recovery_scheduled_after_other_first_pass_work(monkeypatch):
+    job=failed_job('retry_end')|{'status':'failed','error':'Connection timed out'};main.jobs[job['id']]=job
+    other=failed_job('other_first')|{'status':'queued'};main.jobs[other['id']]=other
+    held=[];monkeypatch.setattr(main.deferred_downloads,'defer',lambda *args,**kwargs:held.append(args))
+    assert main.schedule_recovery(job['id'],main.DownloadRequest(url=job['url']),main.recovery.classify(job['error']),job['error'])
+    assert main.recovery_delay(job['id'],main.DownloadRequest(url=job['url']))>=1
+    main.jobs[other['id']]['status']='completed'
+    assert main.recovery_delay(job['id'],main.DownloadRequest(url=job['url']))==0
+    assert job['stage']=='retry_wait' and job['auto_attempts']==1
+
+
+def test_recovery_pause_resume_and_manual_retry_reset(monkeypatch):
+    job=failed_job('settings_retry')|{'error':'Connection timed out'};main.jobs[job['id']]=job
+    monkeypatch.setattr(main.pool,'submit',lambda *args:None)
+    assert client.post('/api/recovery/settings',json={'enabled':True}).status_code==200
+    assert job['stage']=='retry_wait'
+    response=client.post('/api/recovery/settings',json={'enabled':False})
+    assert response.json()['enabled'] is False and job['status']=='failed'
+    assert job['id'] not in main.deferred_downloads.pending
+    assert client.post('/api/jobs/settings_retry/retry').status_code==202
+    assert main.jobs[job['id']]['auto_attempts']==0
+    assert not main.recovery_enabled()
+
+
+def test_recovery_reconsiders_eligible_legacy_failures_only(monkeypatch):
+    temporary=failed_job('temporary')|{'error':'The video is unavailable or has been removed.'}
+    permanent=failed_job('permanent')|{'error':'This video requires sign-in, age verification, or private access.'}
+    for job in [temporary,permanent]:main.jobs[job['id']]=job
+    main.initialize_recovery()
+    assert temporary['status']=='queued' and temporary['auto_attempts']==1
+    assert permanent['status']=='failed'
+    data=client.get('/api/recovery').json();assert data['waiting']==1 and data['needs_action']==1
+    assert all(item['action'] for item in data['items'])
+
+
+def test_recovery_retains_persisted_future_wait_on_restart(monkeypatch):
+    job=failed_job('future_wait')|{'error':'Interrupted by a server restart.','retry_at':main.time.time()+500}
+    main.jobs[job['id']]=job
+    main.initialize_recovery()
+    assert job['retry_at']>=main.time.time()+495
+
+
+def test_recovery_and_help_keep_owner_access_controls(monkeypatch):
+    monkeypatch.setenv('STREAMVAULT_PASSWORD','local-owner')
+    assert client.get('/api/recovery').status_code==401
+    assert client.get('/help').status_code==401
+    assert client.post('/api/recovery/settings',json={'enabled':False},auth=('admin','local-owner'),headers={'Origin':'https://other.example'}).status_code==403
+
+
+def test_separate_english_help_documents_are_served_and_downloadable():
+    topics=['getting-started','single-video','bulk-downloads','playlists','formats-quality','download-location','playback','library-selection','automatic-recovery','troubleshooting','updates-backups']
+    assert client.get('/help').status_code==200
+    for topic in topics:
+        document=client.get('/help/'+topic)
+        assert document.status_code==200 and '<html lang="en">' in document.text
+        assert '/static/help/'+topic+'.md' in document.text
+        assert client.get('/static/help/'+topic+'.md').status_code==200
+    assert client.get('/help/does-not-exist').status_code==404
+    assert client.get('/static/product.js').status_code==200
+    assert client.get('/static/product.css').status_code==200
+
+
+def test_pausing_unstarted_recovery_does_not_burn_single_unavailable_attempt():
+    job=failed_job('pending_once')|{'error':'Video unavailable'};main.jobs[job['id']]=job
+    main.initialize_recovery()
+    assert job['auto_attempts']==1 and job['recovery_pending']
+    assert client.post('/api/recovery/settings',json={'enabled':False}).status_code==200
+    assert job['auto_attempts']==0 and not job['recovery_pending']
+    assert client.post('/api/recovery/settings',json={'enabled':True}).status_code==200
+    assert job['status']=='queued' and job['auto_attempts']==1
+
+
+def test_restart_retains_pending_budget_without_an_extra_consumed_attempt():
+    job=failed_job('pending_restart')|{'error':'Interrupted by a server restart.','last_error':'Video unavailable','auto_attempts':1,'recovery_pending':True}
+    main.jobs[job['id']]=job
+    main.initialize_recovery()
+    assert job['status']=='queued' and job['auto_attempts']==1 and job['recovery_pending']
+
+
+def test_deferred_timing_is_per_job_and_other_sources_can_proceed():
+    sent=[];ready=threading.Event()
+    deferred=main.DeferredDownloads(lambda:600,lambda id,req:(sent.append(id),ready.set()),delay_for=lambda id,req:600 if id=='youtube' else 0)
+    try:
+        deferred.defer('youtube','yt');deferred.defer('other','tk')
+        assert ready.wait(2) and sent==['other']
+        assert 'youtube' in deferred.pending
+    finally:deferred.stop()
+
+
+@pytest.mark.parametrize('installed,expected',[('2026.8.19',False),('2026.10.21',True),('2026.11.1',True)])
+def test_launcher_detects_outdated_extractor_without_downgrading_newer(tmp_path,monkeypatch,installed,expected):
+    from app import dependencies
+    lock=tmp_path/'requirements.lock';lock.write_text('yt-dlp==2026.10.21\nyt-dlp-ejs==0.8.0\ncertifi==2026.10.19\n')
+    monkeypatch.setattr(dependencies,'version',lambda name:{'yt-dlp':installed,'yt-dlp-ejs':'0.8.0','certifi':'2026.10.19'}[name])
+    assert dependencies.ready(lock) is expected
+
+
+def test_network_proxy_rejection_has_a_distinct_actionable_message():
+    error=RuntimeError("Unable to connect to proxy: Tunnel connection failed: 403 Forbidden")
+    assert 'network proxy' in main.download_error(error)
+    issue=main.recovery.classify(error)
+    assert issue['code']=='proxy' and not issue['retryable']
+
+
+def test_legacy_auto_recovery_waits_for_confirmed_desktop_destination(tmp_path,monkeypatch):
+    local,data,chosen=local_desktop_client(tmp_path,monkeypatch)
+    job=failed_job('legacy_auto_folder')|{'error':'Connection timed out','recoverable':True};main.jobs[job['id']]=job
+    main.initialize_recovery()
+    assert job['status']=='failed' and not job.get('output_dir') and 'folder' in job['next_action']
+    assert local.post('/api/download-location',json={'path':str(chosen)}).status_code==200
+    assert job['status']=='queued' and job['output_dir']==str(chosen) and job['legacy_recovery']

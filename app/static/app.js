@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const UI_VERSION = '2.3.0';
+const UI_VERSION = '3.0.0';
 const audioFormats = ['mp3', 'm4a', 'wav'];
 function icon(name) {
   const paths = {play:'<path d="m8 5 11 7-11 7z"/>',arrow:'<path d="M6 18 18 6M6 6h12v12"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>'};
@@ -31,10 +31,11 @@ let playerVersion = 0, previewTimer = null, previewController = null;
 let originalFallback = null, originalTimer = null;
 const rendered = new Map();
 function view(name) {
-  for (const n of ['home','downloads','platforms']) $(n).hidden = n !== name;
+  for (const n of ['home','downloads','platforms','recovery']) $(n).hidden = n !== name;
   document.querySelectorAll('.nav').forEach(el => { el.classList.toggle('active',el.dataset.view === name); el.setAttribute('aria-current', el.dataset.view === name ? 'page' : 'false'); });
-  $('page-label').textContent = {home:'Dashboard',downloads:'Video library',platforms:'Platform insights'}[name];
+  $('page-label').textContent = {home:'Dashboard',downloads:'Video library',platforms:'Platform insights',recovery:'Recovery center'}[name];
   window.scrollTo(0,0);
+  if (name === 'recovery' && typeof loadRecovery === 'function') loadRecovery();
 }
 document.querySelectorAll('.nav').forEach(el => el.onclick = () => view(el.dataset.view));
 $('home-library').onclick = () => view('downloads');
@@ -438,7 +439,7 @@ function createCard(j) {
   const stages = {extracting:'Getting video',downloading:'Downloading',merging:'Merging audio + video',converting:'Converting format',resizing:'Resizing video',verifying:'Checking file'};
   const badge = document.createElement('span');
   badge.className = 'status-badge'+(j.status === 'completed'?' downloaded-before':j.status === 'failed'?' failed':'');
-  badge.textContent = j.status === 'completed' ? '✓ Downloaded' : {failed:'Needs attention',queued:j.stage === 'source_wait' ? 'YouTube cooldown' : 'Queued',processing:stages[j.stage] || 'Finishing file',downloading:(stages[j.stage] || 'Downloading')+' · '+j.progress+'%'}[j.status] || j.status;
+  badge.textContent = j.status === 'completed' ? '✓ Downloaded' : {failed:'Needs attention',queued:j.stage === 'retry_wait' ? 'Recovery queued' : j.stage === 'source_wait' ? 'YouTube cooldown' : 'Queued',processing:stages[j.stage] || 'Finishing file',downloading:(stages[j.stage] || 'Downloading')+' · '+j.progress+'%'}[j.status] || j.status;
   if (j.status !== 'completed' && j.previous_downloads > 0) badge.textContent += ' · Downloaded before';
   cover.append(badge);
   if (j.status === 'completed') {
@@ -459,8 +460,8 @@ function createCard(j) {
   const title = document.createElement('div'); title.className = 'job-title'; title.textContent = j.title; title.title = j.title;
   const meta = document.createElement('div'); meta.className = 'job-meta'; meta.textContent = sourceName(j)+' · '+j.format.toUpperCase()+' · '+(audioFormats.includes(j.format) ? 'Audio' : (j.actual_height || j.quality)+'p')+(j.size?' · '+(j.size/1024/1024).toFixed(1)+' MB':'')+(j.duration?' · '+duration(j.duration):''); meta.title = meta.textContent;
   const status = document.createElement('div'); status.className = 'status'+(j.status === 'failed'?' failed':'');
-  status.textContent = j.error || (j.status === 'completed' ? j.preview_status === 'processing'?'Preview encoding '+(j.preview_progress || 0)+'%':j.preview_status === 'queued'?'Original ready · Preview queued':j.preview_status === 'failed'?'Original ready · Preview can be retried':'Ready to play & save' : j.status === 'queued'?(j.stage === 'source_wait' ? 'YouTube cooldown · Queue kept; resumes after the source wait' : 'Waiting for a download slot'):(stages[j.stage] || 'Downloading')+(j.stage_started?' · '+duration(Math.max(0,Date.now()/1000-j.stage_started))+' elapsed':''));
-  status.title = status.textContent+(j.playlist_title?' · '+j.playlist_title+' #'+j.playlist_position:'');
+  status.textContent = j.error || (j.status === 'completed' ? j.preview_status === 'processing'?'Preview encoding '+(j.preview_progress || 0)+'%':j.preview_status === 'queued'?'Original ready · Preview queued':j.preview_status === 'failed'?'Original ready · Preview can be retried':'Ready to play & save' : j.status === 'queued'?(j.stage === 'retry_wait' ? 'Automatic recovery '+(j.auto_attempts || 1)+' · After current queue' : j.stage === 'source_wait' ? 'YouTube cooldown · Queue kept; resumes after the source wait' : 'Waiting for a download slot'):(stages[j.stage] || 'Downloading')+(j.stage_started?' · '+duration(Math.max(0,Date.now()/1000-j.stage_started))+' elapsed':''));
+  status.title = (j.next_action || status.textContent)+(j.playlist_title?' · '+j.playlist_title+' #'+j.playlist_position:'');
   detail.append(title,meta,status);
   if (['queued','downloading','processing'].includes(j.status)) { const progress = document.createElement('progress'); progress.max = 100; progress.value = j.progress; progress.setAttribute('aria-label','Download progress'); row.append(progress); }
   const actions = document.createElement('div'); actions.className = 'job-actions';
@@ -473,6 +474,7 @@ function createCard(j) {
   }
   if (j.status === 'failed') { const retry = document.createElement('button'); retry.className = 'retry-button'; retry.textContent = j.recoverable?'↻ Resume':'↻ Retry'; retry.onclick = async () => { retry.disabled = true; try { await ensureDownloadLocation(); await api(endpoint(j,'retry'),{method:'POST'}); await refresh(); } catch(e) { notice(e.message,e.retryAfter); view('home'); } finally { retry.disabled = false; } }; actions.append(retry); }
   if (['failed','completed'].includes(j.status)) { const remove = document.createElement('button'); remove.className = 'remove-button'; remove.textContent = '×'; remove.setAttribute('aria-label','Remove '+j.title); remove.title = j.output_dir ? 'Remove from library; keep the saved file' : 'Remove video and history'; remove.onclick = async () => { try { await api('/api/jobs/'+encodeURIComponent(j.id),{method:'DELETE'}); if (playingId === j.id) $('player-dialog').close(); await refresh(); } catch(e) { notice(e.message); view('home'); } }; actions.append(remove); }
+  if (j.status === 'queued' && j.stage === 'retry_wait') row.classList.add('retry-wait');
   row.append(cover,detail,actions); return row;
 }
 function render(target,list) {
@@ -531,10 +533,13 @@ function renderAll() {
   }
   const term = $('search').value.trim().toLowerCase(), filter = $('status-filter').value;
   const filtered = jobs.filter(j => (j.title+' '+j.url+' '+sourceName(j)).toLowerCase().includes(term) && (filter === 'all' || filter === 'downloading' && ['queued','downloading','processing'].includes(j.status) || j.status === filter));
+  const sort = $('sort-order').value;
+  filtered.sort((a,b) => sort === 'oldest' ? a.created-b.created : sort === 'title' ? a.title.localeCompare(b.title) : sort === 'completed' ? Number(b.status==='completed')-Number(a.status==='completed') || b.created-a.created : b.created-a.created);
   selectionLists.library = filtered;
   paginate('library',filtered,'all-jobs','library-pagination');
   syncSelection();
   for (const id of ['total-count','recent-count','nav-count']) $(id).textContent = jobs.length;
+  if (typeof renderQueueOverview === 'function') renderQueueOverview();
   $('ready-count').textContent = jobs.filter(j => j.status === 'completed').length; $('active-count').textContent = jobs.filter(j => ['queued','downloading','processing'].includes(j.status)).length;
 }
 function renderStats(stats) {
@@ -565,6 +570,7 @@ function refresh() {
           $('location-help').classList.add('location-warning');
         }
         jobs = items; renderAll(); renderStats(stats);
+        if (typeof renderSystemChecks === 'function') renderSystemChecks(h);
         const status = h.version !== UI_VERSION ? 'Restart to apply update'
           : !h.ffmpeg ? 'FFmpeg missing' : h.ffprobe === false ? 'FFprobe missing'
           : !h.youtube_ejs ? 'YouTube dependency missing' : !h.js_runtimes?.length ? 'JavaScript runtime missing'
@@ -581,6 +587,7 @@ function refresh() {
   return refreshing;
 }
 $('search').oninput = () => { paginationState.library.page = 1; renderAll(); }; $('status-filter').onchange = () => { paginationState.library.page = 1; renderAll(); };
+$('sort-order').onchange = () => { paginationState.library.page = 1; renderAll(); };
 $('theme').onclick = () => { document.body.classList.toggle('dark'); try { localStorage.setItem('sv-theme',document.body.classList.contains('dark') ? 'dark' : 'light'); } catch {} };
 try { if (localStorage.getItem('sv-theme') === 'dark') document.body.classList.add('dark'); } catch {}
 refresh(); setInterval(refresh,2000);

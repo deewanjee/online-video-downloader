@@ -26,7 +26,7 @@ from app import __version__
 from app.auth import AccessControl
 from app.threads import ThreadsIE
 from app import source_access
-from app import destinations
+from app import destinations, recovery
 from app.deferred import DeferredDownloads
 
 ROOT = Path(__file__).parent
@@ -34,6 +34,7 @@ DATA = Path(os.environ.get('DOWNLOAD_DIR', ROOT.parent / 'data')).resolve()
 DATA.mkdir(parents=True, exist_ok=True)
 @asynccontextmanager
 async def lifespan(application):
+    initialize_recovery()
     try:
         yield
     finally:
@@ -64,7 +65,7 @@ playlist_loads = {}
 playlist_load_lock = threading.Lock()
 playlist_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='playlist')
 folder_dialog_lock = threading.Lock()
-deferred_downloads = DeferredDownloads(lambda: source_access.youtube.remaining(), lambda job_id, req: resume_deferred(job_id, req))
+deferred_downloads = DeferredDownloads(lambda: source_access.youtube.remaining(), lambda job_id, req: resume_deferred(job_id, req), delay_for=lambda job_id, req: recovery_delay(job_id, req))
 
 class VideoRequest(BaseModel):
     url: str = Field(max_length=2048)
@@ -144,7 +145,15 @@ def extract_video(url, download, settings):
         settings = source_access.authenticated_settings(settings) | {'logger': logger, 'sleep_interval_requests': 1, 'extractor_retries': 1}
         try:
             with video_downloader(settings) as dl:
-                result = dl.extract_info(url, download=download)
+                try:
+                    result = dl.extract_info(url, download=download)
+                except Exception as first:
+                    if settings.get('lazy_playlist') or not recovery.youtube_fallback(first) or logger.saw_rate_limit or source_access.youtube.remaining():
+                        raise
+                    alternate = settings.copy()
+                    alternate['extractor_args'] = {**settings.get('extractor_args', {}), 'youtube': {'player_client': ['web', 'web_safari']}}
+                    with video_downloader(alternate) as fallback:
+                        result = fallback.extract_info(url, download=download)
                 if settings.get('lazy_playlist') and result and result.get('_type') == 'playlist':
                     # Playlist pages are lazy network requests: keep the downloader and source gate open.
                     entries = []
@@ -305,6 +314,8 @@ def download_error(exc):
             return 'Threads public video files are unavailable. Check the post on Threads and retry later.'
         if 'share link did not resolve' in message:
             return 'This Threads share link did not resolve to a public post. Copy the direct post link from Threads.'
+    if 'unable to connect to proxy' in message or 'tunnel connection failed' in message:
+        return 'The network proxy rejected the connection. Check proxy or firewall settings on the computer running the app.'
     if 'certificate_verify_failed' in message or 'certificate verify failed' in message:
         return 'The source certificate could not be verified. Check the trusted certificate setup for your network or managed proxy; TLS verification must remain enabled.'
     if 'drm' in message:
@@ -333,11 +344,26 @@ def index():
     return FileResponse(ROOT / 'static' / 'index.html', headers={'Cache-Control': 'no-store'})
 
 
+@app.get('/help')
+def help_index():
+    return FileResponse(ROOT / 'static' / 'help' / 'index.html')
+
+
+@app.get('/help/{topic}')
+def help_article(topic: str):
+    if not re.fullmatch(r'[a-z][a-z-]{1,60}', topic):
+        raise HTTPException(404, 'Help article not found.')
+    file = ROOT / 'static' / 'help' / (topic+'.html')
+    if not file.is_file():
+        raise HTTPException(404, 'Help article not found.')
+    return FileResponse(file)
+
+
 @app.get('/api/health')
 def health():
     with lock:
         active = sum(j['status'] in ('queued', 'downloading', 'processing') for j in jobs.values())
-    return {'application': 'StreamVault', 'version': app.version, 'status': 'ok', 'capabilities': {'youtube_playlists': True, 'direct_save': destinations.enabled()}, 'ffmpeg': bool(shutil.which('ffmpeg')), 'ffprobe': bool(shutil.which('ffprobe')), 'js_runtimes': list(options()['js_runtimes']), 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'youtube_cooldown_seconds': int(source_access.youtube.remaining()), 'active': active}
+    return {'application': 'StreamVault', 'version': app.version, 'status': 'ok', 'capabilities': {'youtube_playlists': True, 'direct_save': destinations.enabled()}, 'ffmpeg': bool(shutil.which('ffmpeg')), 'ffprobe': bool(shutil.which('ffprobe')), 'js_runtimes': list(options()['js_runtimes']), 'yt_dlp_version': yt_dlp.version.__version__, 'youtube_ejs': importlib.util.find_spec('yt_dlp_ejs') is not None, 'youtube_cooldown_seconds': int(source_access.youtube.remaining()), 'active': active}
 
 
 def check_source_cooldown(url):
@@ -367,6 +393,7 @@ def set_download_location(req: FolderRequest, request: Request):
     require_local_desktop(request)
     try:
         destinations.configure(DATA, req.path)
+        initialize_recovery()
     except destinations.DestinationError as exc:
         raise HTTPException(400, str(exc))
     return download_location(request)
@@ -381,6 +408,7 @@ def pick_download_location(request: Request):
         path = destinations.picker(destinations.selected(DATA))
         if path:
             destinations.configure(DATA, path)
+            initialize_recovery()
         return download_location(request) | {'cancelled': not bool(path)}
     except (destinations.DestinationError, subprocess.TimeoutExpired, OSError) as exc:
         raise HTTPException(503, str(exc) if isinstance(exc, destinations.DestinationError) else 'The folder dialog could not finish. Enter a folder path instead.')
@@ -435,7 +463,7 @@ def update(job_id, **values):
     with lock:
         previous_status = jobs[job_id]['status']
         jobs[job_id].update(values)
-        if jobs[job_id]['status'] != previous_status or jobs[job_id]['status'] in ('completed', 'failed') or 'planned_filename' in values or 'retry_at' in values:
+        if jobs[job_id]['status'] != previous_status or jobs[job_id]['status'] in ('completed', 'failed') or 'planned_filename' in values or 'retry_at' in values or 'recovery_pending' in values:
             storage.save(DATA, jobs[job_id])
 
 
@@ -602,23 +630,147 @@ def download_playlist(req: PlaylistDownloadRequest):
         return result
 
 
+def recovery_delay(job_id, req):
+    with lock:
+        job = jobs.get(job_id)
+        if not job:
+            return 0
+        waiting = job.get('stage') == 'retry_wait'
+        busy = waiting and any(j['id'] != job_id and j['status'] in ('queued','downloading','processing')
+                               and j.get('stage') != 'retry_wait' for j in jobs.values())
+    return max(1 if busy else 0, source_access.youtube.remaining() if source_access.youtube_url(req.url) else 0)
+
+
+def recovery_enabled():
+    try:
+        return json.loads((DATA / 'recovery-settings.json').read_text(encoding='utf-8')).get('enabled', True) is True
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
+def schedule_recovery(job_id, req, issue, message, recoverable=False):
+    job = jobs[job_id]
+    attempts = max(0, job.get('auto_attempts', 0) - int(bool(job.get('recovery_pending'))))
+    if not recovery_enabled() or not issue['retryable'] or attempts >= issue['limit']:
+        return False
+    if destinations.enabled() and not job.get('output_dir'):
+        try:
+            destination = destinations.snapshot(DATA)
+        except destinations.DestinationError:
+            update(job_id, next_action='Choose an available download folder to enable recovery for this older video.')
+            return False
+        update(job_id, **destination, legacy_recovery=bool(job.get('recoverable')))
+    delay = max(recovery.DELAYS[min(attempts, len(recovery.DELAYS)-1)], (job.get('retry_at') or 0)-time.time())
+    if issue['code'] == 'rate_limit':
+        if not source_access.youtube.remaining():
+            source_access.youtube.limited()
+        delay = max(delay, source_access.youtube.remaining())
+    update(job_id, status='queued', stage='retry_wait', progress=0, speed=None, eta=None,
+           auto_attempts=attempts+1, recovery_pending=True, retry_at=time.time()+delay, error=None, last_error=message,
+           error_code=issue['code'], next_action=issue['action'], recoverable=recoverable)
+    deferred_downloads.defer(job_id, req, delay=delay)
+    return True
+
+
+def initialize_recovery():
+    if not recovery_enabled():
+        return
+    for job in list(jobs.values()):
+        guard = media_lock(job['id'])
+        if not guard.acquire(blocking=False):
+            continue
+        try:
+            job = jobs.get(job['id'])
+            if not job or job['status'] != 'failed':
+                continue
+            req = DownloadRequest(url=job.get('url',''), format=job.get('format','mp4'), quality=job.get('quality','720'))
+            validate_url(req.url)
+            issue = recovery.classify(job.get('last_error') or job.get('error',''))
+            schedule_recovery(job['id'], req, issue, job.get('error',''), job.get('recoverable',False))
+        except (HTTPException, OSError, storage.sqlite3.Error, ValueError):
+            continue
+        finally:
+            guard.release()
+
+
+@app.get('/api/recovery')
+def recovery_status():
+    with lock:
+        held = [j.copy() for j in jobs.values() if j.get('stage') in ('retry_wait','source_wait') and j['status']=='queued']
+        failed = [j.copy() for j in jobs.values() if j['status']=='failed']
+    return {'enabled':recovery_enabled(), 'max_attempts':recovery.MAX_RETRIES, 'waiting':len(held),
+            'needs_action':len(failed), 'next_retry_at':min(((j.get('retry_at') or time.time()) for j in held), default=None),
+            'items':[{'id':j['id'],'title':j.get('title','Video'),'status':j['status'], 'stage':j.get('stage'),
+                      'attempts':j.get('auto_attempts',0),'retry_at':j.get('retry_at'),
+                      'reason':j.get('last_error') or j.get('error'),
+                      'action':j.get('next_action') or recovery.classify(j.get('error',''))['action']} for j in held+failed]}
+
+
+class RecoverySettings(BaseModel):
+    enabled: bool
+
+
+@app.post('/api/recovery/settings')
+def set_recovery_settings(req: RecoverySettings):
+    # Reuse atomic configuration writes without storing any credentials.
+    import tempfile
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=DATA,delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump({'enabled':req.enabled},handle)
+        temporary.replace(DATA/'recovery-settings.json')
+    except OSError:
+        raise HTTPException(503, 'Recovery settings could not be saved. Check free disk space and folder permissions.') from None
+    finally:
+        if temporary:
+            temporary.unlink(missing_ok=True)
+    if req.enabled:
+        initialize_recovery()
+    else:
+        for job in list(jobs.values()):
+            guard = media_lock(job['id'])
+            if not guard.acquire(blocking=False):
+                continue
+            try:
+                job = jobs.get(job['id'])
+                if job and job['status']=='queued' and job.get('stage')=='retry_wait':
+                    deferred_downloads.discard(job['id'])
+                    update(job['id'], status='failed', recovery_pending=False, auto_attempts=max(0,job.get('auto_attempts',0)-int(bool(job.get('recovery_pending')))), error=job.get('last_error') or 'Automatic recovery is paused. Retry manually when ready.')
+            finally:
+                guard.release()
+    return recovery_status()
+
+
 def pause_for_source(job_id, req, seconds):
     if not source_access.youtube.remaining():
         source_access.youtube.limited(seconds)
-    update(job_id, status='queued', stage='source_wait', retry_at=time.time() + seconds,
+    update(job_id, status='queued', stage='retry_wait' if jobs[job_id].get('recovery_pending') else 'source_wait', retry_at=time.time() + seconds,
            progress=0, speed=None, eta=None, error=None)
     deferred_downloads.defer(job_id, req)
 
 
 def resume_deferred(job_id, req):
-    with lock:
-        job = jobs.get(job_id)
-        if not job or job['status'] != 'queued' or job.get('stage') != 'source_wait':
+    guard = media_lock(job_id)
+    if not guard.acquire(blocking=False):
+        deferred_downloads.defer(job_id, req, delay=1)
+        return
+    try:
+        with lock:
+            job = jobs.get(job_id)
+            if not job or job['status'] != 'queued' or job.get('stage') not in ('source_wait','retry_wait'):
+                return
+        if job.get('stage') == 'retry_wait' and not recovery_enabled():
+            update(job_id, status='failed', recovery_pending=False,
+                   auto_attempts=max(0,job.get('auto_attempts',0)-int(bool(job.get('recovery_pending')))),
+                   error=job.get('last_error') or 'Automatic recovery is paused. Retry manually when ready.')
             return
+    finally:
+        guard.release()
     try:
         submit_job(job_id, req)
-    except (HTTPException, OSError, storage.sqlite3.Error):
-        pass  # submit_job persists a visible worker failure.
+    except (HTTPException, OSError, storage.sqlite3.Error, KeyError):
+        pass  # A worker failure is visible, or a queued job was removed concurrently.
 
 
 def run_download(job_id, req):
@@ -657,6 +809,11 @@ def perform_download(job_id, req):
             if remaining:
                 pause_for_source(job_id, req, remaining)
                 return
+        if job.get('recovery_pending'):
+            if not recovery_enabled():
+                update(job_id, status='failed', recovery_pending=False, auto_attempts=max(0,job.get('auto_attempts',0)-1), error=job.get('last_error') or 'Automatic recovery is paused.')
+                return
+            update(job_id, recovery_pending=False)
         folder = destinations.work_folder(DATA, job)
         if job.get('recoverable'):
             planned = job.get('planned_filename')
@@ -716,7 +873,7 @@ def perform_download(job_id, req):
         duration = media.pop('duration', 0) or info.get('duration')
         update(job_id, status='completed', progress=100, completed_at=time.time(), completion_id=uuid.uuid4().hex, title=info.get('title', file.stem), filename=file.name, size=file.stat().st_size,
                thumbnail=info.get('thumbnail'), duration=duration, platform=info.get('extractor_key'), preview_available=preview_available,
-               preview_status='ready' if preview_available else 'not_requested', preview_progress=100 if preview_available else 0, stage='ready', recoverable=False, legacy_recovery=False, **media)
+               preview_status='ready' if preview_available else 'not_requested', preview_progress=100 if preview_available else 0, stage='ready', recoverable=False, legacy_recovery=False, retry_at=None, error=None, last_error=None, error_code=None, recovery_exhausted=False, next_action=None, **media)
         if job.get('output_dir'):
             shutil.rmtree(folder, ignore_errors=True)
             try:
@@ -730,10 +887,13 @@ def perform_download(job_id, req):
         # Finish cleanup before Retry can see a failed job and start a new attempt.
         if folder is not None and not recovered and not verified:
             shutil.rmtree(folder, ignore_errors=True)
-        if isinstance(exc, source_access.SourceRateLimited) and source_access.youtube_url(req.url):
-            pause_for_source(job_id, req, exc.retry_after)
+        issue = recovery.classify(exc)
+        if schedule_recovery(job_id, req, issue, message, bool(recovered or verified)):
             return
-        update(job_id, status='failed', error=message, recoverable=bool(recovered or verified))
+        exhausted = issue['retryable'] and jobs[job_id].get('auto_attempts',0) >= issue['limit']
+        action = 'Automatic attempt limit reached. Check source availability and local setup, then Retry manually.' if exhausted else 'Automatic recovery is paused. Enable it or Retry manually when ready.' if issue['retryable'] else issue['action']
+        update(job_id, status='failed', error=message, recoverable=bool(recovered or verified),
+               error_code=issue['code'], next_action=action, last_error=message, recovery_exhausted=exhausted)
 
 
 def preview_kwargs(job):
@@ -904,7 +1064,7 @@ def retry_job(job_id: str):
             pending.update(destination_snapshot())
             if pending.get('output_dir') and pending.get('recoverable'):
                 pending['legacy_recovery'] = True
-        pending.update(status='queued', stage='queued', retry_at=None, progress=0, speed=None, eta=None)
+        pending.update(status='queued', stage='queued', auto_attempts=0, recovery_pending=False, recovery_exhausted=False, last_error=None, error_code=None, next_action=None, retry_at=None, progress=0, speed=None, eta=None)
         save_queued(pending)
         jobs[job_id] = pending
         result = pending.copy()
