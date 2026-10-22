@@ -6,6 +6,14 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## Discover live progress and playback (3.2.0)
+
+Search cards now follow the shared queue automatically, updating about every two seconds. Thumbnail badges distinguish **Queued**, **Downloading · %**, finishing stages, **Downloaded** (green frame) and **Needs attention** (red frame with the source error). A progress bar stays on running thumbnails. Repeated download clicks are disabled while that source video is active in Discover; completed videos still offer **Download again**. Canonical source IDs match existing downloads made through short or tracked URLs, and status is restored when paging or searching again.
+
+Use the thumbnail play icon or **Preview** to open an official YouTube/Dailymotion source embed inside the portal. Players load only after an explicit click; closing the dialog unloads them. Source embedding, account/region access and browser autoplay policies still apply. A blocked embed is not bypassed. Once a downloaded file exists, **Play saved** uses the existing local portal player. An older completed copy remains playable while a repeat download runs or fails. Lifetime-only history shows **Downloaded before**, without claiming the removed library entry is still a local playable file.
+
+The English [Discover guide](app/static/help/search-discovery.md) explains progress, previews and saved playback. See [verification details](reports/discovery-playback-v32.md). Optional browser regression: install Playwright/Chromium separately and run `python tests/browser_discovery.py`; `AAASOFT_TEST_PYTHON` selects the app Python and `CHROMIUM_EXECUTABLE` selects an installed Chromium executable. Fixtures use local media, not live platform downloads.
+
 ## Search and playlist availability (3.1.0)
 
 Open **Discover** to search **YouTube videos/playlists** or **Dailymotion videos** inside the portal. Results include thumbnails and creators, with five pages of twelve results. Select up to fifty videos across pages, choose format/quality, then download with the existing destination and queue workflow. Playlist results open the playlist review. Other supported platforms currently require pasted links; this is not universal cross-platform search. Recent searches are cached for five minutes and obey source request gates/cooldowns.

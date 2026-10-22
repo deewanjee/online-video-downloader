@@ -2026,3 +2026,21 @@ def test_playlist_check_running_rejects_queue_and_foreign_ids(monkeypatch):
     assert client.post('/api/playlist/download',json={'token':data['token']}).status_code==409
     assert client.delete('/api/playlist/checks/'+started.json()['id']).status_code==204
     assert main.playlist_checks[started.json()['id']]['cancel'].is_set()
+
+
+def test_discovery_and_jobs_share_canonical_source_identity(monkeypatch):
+    video_id='abcDEFG1234'
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'entries':[{'id':video_id,'title':'Match this video'}]})
+    main.jobs['shared-key']={'id':'shared-key','url':'https://youtu.be/'+video_id+'?si=tracking','title':'Same video','created':1,'status':'queued'}
+    search=client.post('/api/search',json={'query':'shared identity'}).json()['results'][0]
+    listed=client.get('/api/jobs').json()[0]
+    assert search['source_key']==listed['source_key']==main.storage.video_key('https://youtube.com/shorts/'+video_id)
+    assert search['source_key']!=main.storage.video_key('https://youtube.com/watch?v=other000001')
+
+
+def test_discovery_source_identity_survives_cache_hits(monkeypatch):
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'entries':[playlist_entry(1)]})
+    first=client.post('/api/search',json={'query':'canonical'}).json()
+    cached=client.post('/api/search',json={'query':'canonical'}).json()
+    assert cached['cached']
+    assert cached['results'][0]['source_key']==first['results'][0]['source_key']

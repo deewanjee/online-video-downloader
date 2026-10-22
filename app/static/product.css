@@ -238,3 +238,35 @@ body.dark { --bg:#101827; --card:#182337; --text:#e2e9f5; --muted:#94a2bb; --lin
 @media(min-width:1700px) { .discovery-results { grid-template-columns:repeat(4,minmax(0,1fr)); } }
 @media(max-width:1100px) { .discovery-results { grid-template-columns:repeat(2,minmax(0,1fr)); }.dashboard-heading #home-discover { display:none; } }
 @media(max-width:700px) { .discovery-search { padding:17px; }.discovery-fields input { flex-basis:100%; }.discovery-fields select { flex:1; min-width:0; font-size:11px; }.discovery-fields button { padding:12px; font-size:11px; }.discovery-results { gap:12px; }.discovery-card-content { padding:12px; }.discovery-card h2 { font-size:12px; height:40px; }.discovery-card-content>p { font-size:10px; }.discovery-actions { flex-wrap:wrap; gap:5px; }.discovery-actions button { padding:8px; font-size:9px; }.discovery-download-controls { padding:13px; gap:10px; }.discovery-download-controls label { font-size:10px; }.bulk-panel .playlist-video { grid-template-columns:16px minmax(0,1fr); gap:8px; }.playlist-video .playlist-availability { grid-column:2; text-align:left; width:max-content; }.playlist-video>span { font-size:10px; } }
+/* Discovery cards stay connected to queue state without replacing focused controls. */
+.discovery-actions { flex-wrap:wrap; gap:8px; }
+.discovery-card { transition:border-color .2s,box-shadow .2s; }
+.discovery-card[data-state=queued],.discovery-card[data-state=downloading],.discovery-card[data-state=processing],.discovery-card[data-state=adding] { border-color:#7189ed; box-shadow:0 0 0 1px #7189ed; }
+.discovery-card[data-state=completed] { border-color:#26906a; box-shadow:0 0 0 2px #26906a; }
+.discovery-card[data-state=failed] { border-color:#b95565; box-shadow:0 0 0 1px #b95565; }
+.discovery-card[data-state=completed] .discovery-type,.discovery-card[data-state=history] .discovery-type { background:#176849; }
+.discovery-card[data-state=queued] .discovery-type,.discovery-card[data-state=downloading] .discovery-type,.discovery-card[data-state=processing] .discovery-type,.discovery-card[data-state=adding] .discovery-type { background:#263d91; }
+.discovery-card[data-state=failed] .discovery-type { background:#8f3345; }
+.discovery-type { z-index:2; max-width:calc(100% - 65px); }
+.discovery-cover-play { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); display:grid; place-items:center; width:48px; height:48px; padding:0; border:1px solid #ffffffa6; border-radius:50%; background:#13213ddd; color:white; box-shadow:0 4px 16px #0004; z-index:2; cursor:pointer; }
+.discovery-cover-play .ui-icon { width:20px; height:20px; margin-left:2px; }
+.discovery-cover-play:hover,.discovery-cover-play:focus-visible { background:var(--accent); outline:3px solid #ffffffa6; outline-offset:3px; }
+.discovery-card[data-state=completed] .discovery-cover-play { background:#176849ed; }
+.discovery-card-content>.discovery-job-detail { min-height:32px; white-space:normal; line-height:1.5; margin:0 0 12px; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.discovery-card[data-state=completed] .discovery-job-detail { color:#237553; font-weight:600; }
+.discovery-card[data-state=failed] .discovery-job-detail { color:#a33b50; }
+.discovery-progress { position:absolute; bottom:0; left:0; width:100%; height:6px; z-index:3; border-radius:0; background:#d8e0fc; }
+.discovery-progress::-webkit-progress-bar { background:#d8e0fc; }.discovery-progress::-webkit-progress-value { background:#546fe5; }.discovery-progress::-moz-progress-bar { background:#546fe5; }
+.discovery-actions button:disabled { cursor:default; opacity:.65; }
+.dark .discovery-card[data-state=completed] .discovery-job-detail { color:#91d8b7; }
+.dark .discovery-card[data-state=failed] .discovery-job-detail { color:#f0a7b4; }
+#source-preview-dialog { width:min(940px,94vw); max-height:94vh; padding:0; overflow:auto; border:1px solid var(--line); border-radius:15px; background:var(--card); color:var(--text); }
+#source-preview-dialog::backdrop { background:#091226bb; backdrop-filter:blur(5px); }
+#source-preview-frame { aspect-ratio:16/9; background:#090f1e; }
+#source-preview-frame iframe { width:100%; height:100%; border:0; display:block; }
+#source-preview-note { padding:16px 22px 0; margin:0; font-size:12px; color:var(--muted); line-height:1.8; }
+.source-preview-actions { display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:16px 22px 22px; }
+.source-preview-actions button { padding:11px 15px; font-size:12px; }.source-preview-actions a { margin-left:auto; font-size:11px; color:var(--accent); }
+@media(max-width:700px) { .discovery-cover-play { width:38px; height:38px; }.discovery-card-content>.discovery-job-detail { font-size:10px; min-height:30px; }.discovery-type { font-size:8px; left:7px; top:7px; padding:4px 5px; }.discovery-actions button { padding:8px; }.source-preview-actions a { width:100%; margin:0; } }
+
+#source-preview-download-status { margin:10px 22px 0; color:var(--accent); font-size:12px; line-height:1.8; }

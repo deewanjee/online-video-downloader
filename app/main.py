@@ -473,7 +473,7 @@ def search_sources(req: SearchRequest):
                     search_cache.pop(next(iter(search_cache)))
                 search_cache[key]=(time.monotonic(),result)
         counts=storage.video_counts(DATA)
-        rows=[row|{'previous_downloads':counts.get(storage.video_key(row['url']),0) if row['kind']=='videos' else 0} for row in result['results']]
+        rows=[row|{'source_key':storage.video_key(row['url']), 'previous_downloads':counts.get(storage.video_key(row['url']),0) if row['kind']=='videos' else 0} for row in result['results']]
         # Safe flat metadata improves queued-card labels without treating search as full format analysis.
         with lock:
             for row in rows:
@@ -1227,7 +1227,7 @@ def list_jobs():
                 changed = job | {'status': 'failed', 'error': 'The saved file is missing. Use Retry to download it again.', 'preview_available': False}
                 save_queued(changed)
                 job.update(changed)
-        return [j.copy() | {'previous_downloads': counts.get(storage.video_key(j.get('url', '')), 0), 'source_platform': storage.platform_name(j.get('url', ''))} for j in sorted(jobs.values(), key=lambda j: j['created'], reverse=True)]
+        return [j.copy() | {'source_key':storage.video_key(j.get('url', '')), 'previous_downloads': counts.get(storage.video_key(j.get('url', '')), 0), 'source_platform': storage.platform_name(j.get('url', ''))} for j in sorted(jobs.values(), key=lambda j: j['created'], reverse=True)]
 
 
 @app.get('/api/stats')
