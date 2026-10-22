@@ -11,11 +11,13 @@ List public account videos, review availability and download a selection.
 ## Load a TikTok account
 
 1. Open Platform workspaces → TikTok. The three steps are Find account, Review videos and Download selection.
-2. Use the single Account username or TikTok link input. Paste @username, a public profile URL, a direct public video URL, or a vt.tiktok.com / vm.tiktok.com share link. Choose Find videos. No account ID or user ID is required.
-3. When given a video link, the source metadata identifies its owner automatically. The numeric uploader ID is not treated as a username. Missing or mismatching public identity is never guessed.
-4. The browser initially loads 30 posts for faster review. Posts to load also offers 100, 250 and 1,000. Use Load next batch for more. Larger batches need more listing/checking time.
-5. Profile lookup and listing are metadata-only. The review appears while sequential access checks continue; only checked Available video posts can be selected.
-6. A confirmed account has a compact summary. Account details & copy options expands the public fields the source actually supplied. Missing fields and unconfirmed identities do not generate a large empty panel. Source counters do not guarantee that every historical post is downloadable.
+2. Username or profile link is the primary workflow. The portal automatically handles an identified native profile challenge using the maintained extractor handler, with one bounded retry; no video link or manual account-ID copying is required. Public profile access can still fail or require sign-in.
+3. Use the single Account username or TikTok link input. Paste @username, a public profile URL, a direct public video URL, or a vt.tiktok.com / vm.tiktok.com share link. Choose Find videos. No account ID or user ID is required.
+4. A numeric user ID can resolve to its canonical username only when the returned source user ID matches exactly. A missing or mismatched ID is never guessed.
+5. When given a video link, the source metadata identifies its owner automatically. The numeric uploader ID is not treated as a username. Missing or mismatching public identity is never guessed.
+6. The browser initially loads 30 posts for faster review. Posts to load also offers 100, 250 and 1,000. Use Load next batch for more. Larger batches need more listing/checking time.
+7. Profile lookup and listing are metadata-only. The review appears while sequential access checks continue; only checked Available video posts can be selected.
+8. A confirmed account has a compact summary. Account details & copy options expands the public fields the source actually supplied. Missing fields and unconfirmed identities do not generate a large empty panel. Source counters do not guarantee that every historical post is downloadable.
 
 ## Understand public, private and access status
 
@@ -28,7 +30,7 @@ List public account videos, review availability and download a selection.
 ## If the list cannot be loaded
 
 1. The next-step panel distinguishes a source block from an unavailable account listing. A failure is not evidence that the account has zero videos.
-2. Try a public video link changes the same input into the fallback path. Paste a real public post/share link; the system resolves its account automatically. It does not guarantee access to a blocked account API.
+2. Try another username clears and focuses the same input. Check the spelling or open the public profile in your browser. A video link remains an optional input, not a required step for account extraction.
 3. Open supplied TikTok link lets you inspect the requested public link in your browser. Download one video instead focuses the existing single-video form, prefilling a supplied public video/share link when possible.
 4. The account-list API uses the supported browser request dependency within its shared session. If the backend is unavailable, stop and restart with the Windows launcher so locked dependencies can be checked. This transport does not grant private access or guarantee source responses.
 5. An empty or non-JSON account API response is different from a private-account response. The video lookup and account list share a temporary source session. This can preserve source-issued cookies; it does not grant access to private posts or guarantee every listing response.

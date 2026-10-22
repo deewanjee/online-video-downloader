@@ -6,6 +6,14 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## Username/profile-first TikTok account lookup (3.7.0)
+
+A TikTok username or profile link is now the primary workflow; users do not need to find a video first. Inspection of `@gamingpclahore` found that TikTok returned a small native JavaScript challenge page instead of profile metadata. The upstream video extractor handles this challenge, but the username path previously read the challenge page as if it were the profile and failed to find its account ID.
+
+The profile adapter now invokes the existing yt-dlp native handler on an identified profile challenge and reads the profile again once, in the same session. Temporary challenge cookies are cleared afterwards. It also supports matching public profile metadata in older SIGI_STATE pages. Wrong-account responses are rejected and private-account responses remain blocked from enumeration. Numeric user IDs can map to a canonical username only when the source's numeric ID matches; ordinary usernames and profile links continue to work normally.
+
+A bounded live **username/profile-only** check of `gamingpclahore` confirmed its identity and returned **16 unique entries**, without supplying any video link. This does not establish every historical post or every account/network. The existing optional video-link route remains available, but the normal UI/help no longer directs users to find a post first. See [verification](reports/tiktok-username-v37.md).
+
 ## Streaming TikTok listing progress and smaller batches (3.6.4)
 
 The supplied Windows log now shows successful account pagination through at least page 32 / item 465 after using a video link. The portal's zero counter was a progress problem: yt-dlp processed the flat playlist inside extract_info before the application could count the returned entries.

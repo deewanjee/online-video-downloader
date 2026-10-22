@@ -59,7 +59,7 @@ def profile_details(data,expected):
     user=data.get('user') if isinstance(data,dict) else None
     if not isinstance(user,dict):return None
     username=user.get('uniqueId')
-    if not isinstance(username,str) or username.casefold()!=expected.casefold():return None
+    if not isinstance(username,str) or (username.casefold()!=expected.casefold() and not(expected.isdigit() and str(user.get('id') or '')==expected)):return None
     try:url=profile_url(username)
     except HTTPException:return None
     stats=data.get('statsV2') or data.get('stats') or {}
@@ -224,7 +224,7 @@ class AccountManager:
         if 'ip address is blocked' in text:return 'TikTok is blocking access from this network/IP. Account/video availability could not be verified. Try again later.'
         if '403' in text and 'proxy' not in text:return 'TikTok rejected account access (HTTP 403). Its public account listing may be blocked even when individual video links work.'
         if any(x in text for x in ('account is private',"account is either private",'login required','log in','sign in')):return 'TikTok requires authorized access to this account/video. Try a public account; private videos cannot be listed here.'
-        if any(x in text for x in ('captcha','challenge','verify','secondary user id','secuid','impersonat','not a bot')):return 'TikTok could not provide a public account listing or requires browser verification. Paste a public video link in the same input to identify its account automatically. TikTok may still block account listing; individual video downloads can be tried separately.'
+        if any(x in text for x in ('captcha','challenge','verify','secondary user id','secuid','impersonat','not a bot')):return 'TikTok could not provide a public account listing or requires browser verification. Check the username or open its profile in your browser. The portal resolves account IDs automatically; restricted source responses may still prevent listing.'
         if 'does not have any videos' in text:return 'TikTok reports no posted videos for this account.'
         message=self.main.download_error(error)
         return 'TikTok did not provide usable account/video metadata. Privacy and availability could not be verified. Open the source link and check access; this is not proof that the account is private.' if message.startswith('Download failed.') else message
@@ -236,9 +236,11 @@ class AccountManager:
         issue_code=None;failure=None
         username=url.rsplit('@',1)[-1] if url else None
         def receive_profile(data):
+            nonlocal username,url
             profile=profile_details(data,username)
             if profile:
-                with self.lock:task['profile']=profile
+                username=profile['username'];url=profile['profile_url']
+                with self.lock:task['profile']=profile;task['account_url']=url
         with self.lock:
             task['profile']={'username':username,'profile_url':url,'identity_verified':False} if url else None
         def checkpoint():
@@ -281,6 +283,7 @@ class AccountManager:
                     with self.lock:task['stage']='account_listing' if seed_url else 'profile_lookup'
                     info=downloader.extract_info(extract_url,download=False,process=False)
                     if not info or info.get('_type')!='playlist':raise HTTPException(422,'TikTok did not return an account video list. Use a public account username.')
+                    downloader.params['_aaasoft_account_url']=url
                     with self.lock:task['stage']='account_listing'
                     for index,entry in enumerate(islice(info.get('entries') or [],offset+limit+1)):
                         checkpoint()

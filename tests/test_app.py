@@ -2795,3 +2795,94 @@ def test_tiktok_raw_listing_applies_offset_once(tiktok_accounts,monkeypatch):
 def test_tiktok_source_window_size_is_bounded(tiktok_accounts,size):
     assert client.post('/api/tiktok/loads',json={'account':'creator','batch_size':size}).status_code==422
     assert not tiktok_accounts.tasks
+
+
+def _native_profile_challenge():
+    import base64,hashlib,json
+    encode=lambda value:base64.b64encode(value).decode()
+    data={'v':{'a':encode(b'fixture-base'),'c':encode(hashlib.sha256(b'fixture-base1').digest())}}
+    return '<div id="cs" class="'+encode(json.dumps(data).encode())+'"></div><div id="wci" class="fixture_challenge"></div>'
+
+
+def _public_profile_page(username='creator',private=False,legacy=False,user_id='123456789'):
+    import json
+    user={'uniqueId':username,'secUid':'MS4wLjABAAAA'+'A'*64,'id':user_id,'privateAccount':private}
+    stats={'videoCount':0 if private else 2,'followerCount':10}
+    if legacy:return '<script id="SIGI_STATE">'+json.dumps({'UserModule':{'users':{username:user},'stats':{username:stats}}})+'</script>'
+    return '<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__">'+json.dumps({'__DEFAULT_SCOPE__':{'webapp.user-detail':{'statusCode':10222 if private else 0,'userInfo':{'user':user,'stats':stats}}}})+'</script>'
+
+
+def test_username_lookup_handles_native_profile_challenge_without_video(monkeypatch):
+    calls=[];profiles=[]
+    with main.video_downloader(main.options()|{'_aaasoft_profile':profiles.append}) as dl:
+        ie=dl.get_info_extractor('TikTokProfile')
+        def page(url,*args,**kwargs):
+            calls.append(url)
+            assert url=='https://www.tiktok.com/@creator'
+            if len(calls)==1:return _native_profile_challenge()
+            assert 'fixture_challenge=' in (dl.cookiejar.get_cookie_header(url) or '')
+            return _public_profile_page()
+        monkeypatch.setattr(ie,'_download_webpage',page)
+        monkeypatch.setattr(ie,'_extract_sec_uid_from_embed',lambda *args:pytest.fail('No video/embed lookup should be needed'))
+        monkeypatch.setattr(ie,'_entries',lambda *args:iter([]))
+        result=ie._real_extract('https://www.tiktok.com/@creator')
+        assert not dl.cookiejar.get_cookie_header('https://www.tiktok.com/')
+    assert result['_type']=='playlist' and len(calls)==2 and profiles[0]['user']['uniqueId']=='creator'
+
+
+def test_profile_challenge_retry_is_bounded_and_cookies_cleared(monkeypatch):
+    from yt_dlp.utils import ExtractorError
+    calls=[]
+    with main.video_downloader(main.options()) as dl:
+        ie=dl.get_info_extractor('TikTokProfile')
+        def page(url,*args,**kwargs):calls.append(url);return _native_profile_challenge()
+        monkeypatch.setattr(ie,'_download_webpage',page)
+        monkeypatch.setattr(ie,'_extract_sec_uid_from_embed',lambda *args:None)
+        with pytest.raises(ExtractorError,match='secondary user ID'):ie._real_extract('https://www.tiktok.com/@creator')
+        assert not dl.cookiejar.get_cookie_header('https://www.tiktok.com/')
+    assert len(calls)==2
+
+
+def test_private_profile_after_native_challenge_is_not_enumerated(monkeypatch):
+    from yt_dlp.utils import ExtractorError
+    profiles=[];calls=[]
+    with main.video_downloader(main.options()|{'_aaasoft_profile':profiles.append}) as dl:
+        ie=dl.get_info_extractor('TikTokProfile')
+        def page(url,*args,**kwargs):calls.append(url);return _native_profile_challenge() if len(calls)==1 else _public_profile_page(private=True)
+        monkeypatch.setattr(ie,'_download_webpage',page)
+        monkeypatch.setattr(ie,'_entries',lambda *args:pytest.fail('Private profile must not be enumerated'))
+        with pytest.raises(ExtractorError,match='account is private'):ie._real_extract('https://www.tiktok.com/@creator')
+    assert profiles[0]['user']['privateAccount'] is True and len(calls)==2
+
+
+def test_legacy_profile_resolves_username_without_extra_request(monkeypatch):
+    calls=[];profiles=[]
+    with main.video_downloader(main.options()|{'_aaasoft_profile':profiles.append}) as dl:
+        ie=dl.get_info_extractor('TikTokProfile')
+        def page(url,*args,**kwargs):calls.append(url);return _public_profile_page(legacy=True)
+        monkeypatch.setattr(ie,'_download_webpage',page)
+        monkeypatch.setattr(ie,'_entries',lambda *args:iter([]))
+        result=ie._real_extract('https://www.tiktok.com/@creator')
+    assert result['_type']=='playlist' and len(calls)==1 and profiles[0]['stats']['followerCount']==10
+
+
+def test_wrong_profile_response_is_rejected(monkeypatch):
+    from yt_dlp.utils import ExtractorError
+    with main.video_downloader(main.options()) as dl:
+        ie=dl.get_info_extractor('TikTokProfile')
+        monkeypatch.setattr(ie,'_download_webpage',lambda *args,**kwargs:_public_profile_page(username='someone_else'))
+        monkeypatch.setattr(ie,'_entries',lambda *args:pytest.fail('Wrong account must not be enumerated'))
+        with pytest.raises(ExtractorError,match='different profile'):ie._real_extract('https://www.tiktok.com/@creator')
+
+
+def test_numeric_user_id_resolves_only_when_source_id_matches(tiktok_accounts,monkeypatch):
+    def extract(dl,url,download=False,process=True):
+        dl.params['_aaasoft_profile']({'user':{'uniqueId':'creator','id':'123456789','privateAccount':False}})
+        return {'_type':'playlist','entries':[tik_entry(1,formats=[{'vcodec':'h264'}])]}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    task=account_load('123456789')
+    data=client.get('/api/tiktok/previews/'+task['token']).json()
+    assert task['account_url']=='https://www.tiktok.com/@creator' and data['account']=='creator'
+    assert '/@creator/video/' in data['rows'][0]['url']
+    from app.accounts import profile_details
+    assert profile_details({'user':{'uniqueId':'someone_else','id':'987654321'}},'123456789') is None

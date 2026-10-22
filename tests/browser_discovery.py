@@ -314,7 +314,7 @@ def verify():
                     assert 'Not provided' not in page.locator('#source-panels [data-source=tiktok]').inner_text()
                     page.click('#account-use-video')
                     assert page.input_value('#account-name')==''
-                    page.fill('#account-name','https://vt.tiktok.com/Fixture123/')
+                    page.fill('#account-name','@creator')
                     page.click('#account-load')
                     page.wait_for_function("document.querySelector('#account-status').textContent.includes('Checks complete')",timeout=30000)
                     page.wait_for_function("document.querySelectorAll('#account-videos .account-card').length===30")
@@ -387,7 +387,7 @@ def verify():
                     assert page.locator('#source-panels [data-source=instagram]').is_visible()
                     assert not page.locator('#source-panels [data-source=tiktok]').is_visible()
                     page.locator('#source-tabs [data-source=tiktok]').click()
-                    assert page.locator('#account-name').input_value()=='https://vt.tiktok.com/Fixture123/'
+                    assert page.locator('#account-name').input_value()=='@creator'
                     page.set_viewport_size({'width': 390, 'height': 844})
                     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
                     assert not errors, errors
