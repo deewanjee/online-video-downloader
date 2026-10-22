@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import hashlib
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,6 +30,8 @@ def video_key(url):
         identity = (query.get('v') or [None])[0]
         if not identity and ((parsed.hostname or '').endswith('youtu.be') or path.startswith(('shorts/', 'embed/', 'live/'))):
             identity = path.split('/')[-1]
+    elif platform == 'TikTok' and re.search(r'/video/[0-9]{6,25}/?$',parsed.path):
+        identity=path.split('/video/',1)[-1].strip('/')
     elif platform == 'X / Twitter' and '/status/' in '/' + path:
         identity = path.split('/status/', 1)[-1].split('/')[0]
     elif platform == 'Facebook':
@@ -43,12 +46,27 @@ def video_key(url):
     return hashlib.sha256((platform + ':' + canonical).encode()).hexdigest()
 
 
+def video_keys(url):
+    key=video_key(url)
+    if platform_name(url)!='TikTok':return (key,)
+    parsed=urlparse(url);query=parse_qs(parsed.query)
+    meaningful={k:v for k,v in query.items() if k in ('v','id','story_fbid')}
+    legacy=hashlib.sha256(('TikTok:'+parsed.path.strip('/')+'?'+urlencode(meaningful,doseq=True)).encode()).hexdigest()
+    return tuple(dict.fromkeys((key,legacy)))
+
+
+def history_count(counts,url):
+    return sum(counts.get(key,0) for key in video_keys(url))
+
+
 def record_completion(connection, job):
     if job.get('status') == 'completed':
         url = job.get('url', '')
         event_id = job['id'] + (':' + job['completion_id'] if job.get('completion_id') else '')
         connection.execute('INSERT OR IGNORE INTO download_events VALUES (?, ?, ?, ?)',
                            (event_id, platform_name(url), video_key(url) if url else job['id'], job.get('completed_at') or job.get('created') or time.time()))
+        # Repair earlier URL-based identities when retained source metadata is available.
+        if url:connection.execute('UPDATE download_events SET video_key=? WHERE event_id=?',(video_key(url),event_id))
 
 
 @contextmanager
@@ -132,7 +150,8 @@ def video_counts(directory):
 
 def downloaded_count(directory, url):
     with connect(directory) as connection:
-        return connection.execute('SELECT COUNT(*) FROM download_events WHERE video_key = ?', (video_key(url),)).fetchone()[0]
+        keys=video_keys(url)
+        return connection.execute('SELECT COUNT(*) FROM download_events WHERE video_key IN ('+','.join('?' for _ in keys)+')',keys).fetchone()[0]
 
 
 def log_row(connection,job,event,detail=''):

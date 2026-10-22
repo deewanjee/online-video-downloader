@@ -1833,7 +1833,7 @@ def test_recovery_and_help_keep_owner_access_controls(monkeypatch):
 
 
 def test_separate_english_help_documents_are_served_and_downloadable():
-    topics=['search-discovery','getting-started','single-video','bulk-downloads','playlists','formats-quality','download-location','playback','library-selection','automatic-recovery','troubleshooting','updates-backups']
+    topics=['tiktok-accounts','search-discovery','getting-started','single-video','bulk-downloads','playlists','formats-quality','download-location','playback','library-selection','automatic-recovery','troubleshooting','updates-backups']
     assert client.get('/help').status_code==200
     for topic in topics:
         document=client.get('/help/'+topic)
@@ -2196,3 +2196,287 @@ def test_activity_exports_only_public_log_fields_not_job_credentials():
     text=client.get('/api/activity/export?format=json').text
     assert 'secret-cookie' not in text and 'private-proxy' not in text
     assert 'abcDEFG1234' in text
+
+
+@pytest.fixture
+def tiktok_accounts(monkeypatch):
+    manager=main.account_manager
+    class Immediate:
+        def submit(self,fn,*args):fn(*args)
+    monkeypatch.setattr(manager,'tasks',{})
+    monkeypatch.setattr(manager,'previews',{})
+    monkeypatch.setattr(manager,'until',0)
+    monkeypatch.setattr(manager,'pool',Immediate())
+    monkeypatch.setattr(main.pool,'submit',lambda *a:None)
+    return manager
+
+
+def tik_entry(i,**extras):
+    return {'id':str(7000000000000000000+i),'title':'TikTok '+str(i),'duration':10,**extras}
+
+
+def fake_tiktok(monkeypatch,entries,checks=None):
+    calls=[]
+    def extract(dl,url,download=False):
+        calls.append((url,download,dl.params))
+        if '/video/' not in url:return {'_type':'playlist','title':'Creator profile','entries':entries}
+        id=url.rsplit('/',1)[-1]
+        outcome=(checks or {}).get(id,{'formats':[{'vcodec':'h264','acodec':'aac'}]})
+        if isinstance(outcome,Exception):raise outcome
+        return outcome
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    return calls
+
+
+def account_load(account='@creator',offset=0):
+    started=client.post('/api/tiktok/loads',json={'account':account,'offset':offset})
+    assert started.status_code==202,started.text
+    task=client.get('/api/tiktok/tasks/'+started.json()['id']).json()
+    return task
+
+
+@pytest.mark.parametrize('account',['https://evil.test/@creator','https://www.tiktok.com.evil.test/@creator','https://user:pass@tiktok.com/@creator','https://tiktok.com:8080/@creator','https://tiktok.com/@creator/video/7000000000000000001','bad name','@user.','https://127.0.0.1/@creator'])
+def test_account_input_rejects_untrusted_profiles(tiktok_accounts,account):
+    assert client.post('/api/tiktok/loads',json={'account':account}).status_code==400
+
+
+def test_tiktok_profile_lists_and_checks_without_downloading(tiktok_accounts,monkeypatch):
+    calls=fake_tiktok(monkeypatch,[tik_entry(1),tik_entry(2),tik_entry(3,availability='private')],{tik_entry(2)['id']:main.yt_dlp.utils.DownloadError('Video has been removed')})
+    task=account_load('https://www.tiktok.com/@creator?lang=en')
+    assert task['status']=='ready' and task['checked']==3
+    data=client.get('/api/tiktok/previews/'+task['token']).json()
+    assert [row['status'] for row in data['rows']]==['available','removed','private']
+    assert data['counts']['available']==1
+    assert len(calls)==3 and all(download is False for _,download,_ in calls)
+    assert calls[0][0]=='https://www.tiktok.com/@creator'
+    assert calls[0][2]['extract_flat']=='in_playlist' and calls[0][2]['playlistend']==1001
+    assert not main.jobs
+
+
+def test_account_checks_keep_unknown_after_source_network_failure(tiktok_accounts,monkeypatch):
+    fake_tiktok(monkeypatch,[tik_entry(1),tik_entry(2)],{tik_entry(1)['id']:RuntimeError('Unable to connect to proxy: tunnel connection failed: 403 Forbidden')})
+    task=account_load()
+    assert task['status']=='failed' and task['token']
+    data=client.get('/api/tiktok/previews/'+task['token']).json()
+    assert all(row['status']=='unknown' and not row['selectable'] for row in data['rows'])
+    assert client.post('/api/tiktok/previews/'+task['token']+'/download',json={'video_ids':[tik_entry(1)['id']]}).status_code==400
+
+
+def test_account_selection_and_queue_preserve_duplicate_history(tiktok_accounts,monkeypatch):
+    fake_tiktok(monkeypatch,[tik_entry(1),tik_entry(2),tik_entry(3)])
+    task=account_load();token=task['token'];rows=client.get('/api/tiktok/previews/'+token).json()['rows']
+    main.storage.save(main.DATA,{'id':'past','url':rows[0]['url'],'title':'Saved earlier','status':'completed','created':1})
+    main.storage.delete(main.DATA,'past')
+    selection=client.get('/api/tiktok/previews/'+token+'/selection').json()['ids']
+    assert selection==[tik_entry(2)['id'],tik_entry(3)['id']]
+    response=client.post('/api/tiktok/previews/'+token+'/download',json={'video_ids':[r['id'] for r in rows]})
+    assert response.status_code==202 and response.json()['added']==2 and response.json()['duplicates_removed']==1
+    again=client.post('/api/tiktok/previews/'+token+'/download',json={'video_ids':[r['id'] for r in rows]})
+    assert again.json()['jobs']==response.json()['jobs'] and len(main.jobs)==2
+    assert client.get('/api/tiktok/previews/'+token).json()['rows'][0]['previous_downloads']==1
+
+
+def test_account_live_checks_are_required_and_foreign_ids_rejected(tiktok_accounts,monkeypatch):
+    fake_tiktok(monkeypatch,[tik_entry(1),tik_entry(2)],{tik_entry(2)['id']:{'formats':[]}})
+    task=account_load();token=task['token']
+    for ids in [[tik_entry(2)['id']],[tik_entry(99)['id']]]:
+        assert client.post('/api/tiktok/previews/'+token+'/download',json={'video_ids':ids}).status_code==400
+    assert not main.jobs
+
+
+def test_account_cancellation_retains_checked_partial_list(tiktok_accounts,monkeypatch):
+    checks=0
+    def extract(dl,url,download=False):
+        nonlocal checks
+        if '/video/' not in url:return {'_type':'playlist','entries':[tik_entry(1),tik_entry(2)]}
+        checks+=1
+        if checks==1:next(iter(tiktok_accounts.tasks.values()))['cancel'].set()
+        return {'formats':[{'vcodec':'h264'}]}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    task=account_load()
+    assert task['status']=='cancelled' and task['token']
+    data=client.get('/api/tiktok/previews/'+task['token']).json()
+    assert data['busy'] is False and [row['status'] for row in data['rows']]==['available','unknown']
+    assert checks==1
+
+
+def test_account_rate_limit_cools_down_without_retry_storm(tiktok_accounts,monkeypatch):
+    fake_tiktok(monkeypatch,[tik_entry(1),tik_entry(2)],{tik_entry(1)['id']:main.yt_dlp.utils.DownloadError('HTTP Error 429: Too Many Requests')})
+    task=account_load()
+    assert task['status']=='failed' and task['checked']==0
+    result=client.post('/api/tiktok/loads',json={'account':'another'})
+    assert result.status_code==429 and int(result.headers['retry-after'])>590
+    assert 'TikTok' in result.json()['detail']
+
+
+def test_account_list_is_consumed_inside_open_downloader(tiktok_accounts,monkeypatch):
+    alive=[False]
+    class Downloader:
+        def __enter__(self):alive[0]=True;return self
+        def __exit__(self,*args):alive[0]=False
+        def extract_info(self,url,download=False):
+            def entries():
+                assert alive[0]
+                yield tik_entry(1,formats=[{'vcodec':'h264'}])
+            return {'_type':'playlist','entries':entries()}
+    monkeypatch.setattr(main,'video_downloader',lambda *a:Downloader())
+    assert account_load()['status']=='ready'
+    assert alive[0] is False
+
+
+def test_tiktok_account_large_profile_exposes_next_batch(tiktok_accounts,monkeypatch):
+    entries=[tik_entry(i,formats=[{'vcodec':'h264'}]) for i in range(1001)]
+    calls=fake_tiktok(monkeypatch,entries)
+    task=account_load(offset=1000)
+    data=client.get('/api/tiktok/previews/'+task['token']+'?page=2&size=30').json()
+    assert data['counts']['all']==1000 and data['has_more'] and len(data['rows'])==30
+    assert data['rows'][0]['position']==1031
+    assert calls[0][2]['playliststart']==1001 and calls[0][2]['playlistend']==2001
+
+
+def test_account_serializes_active_work_and_handles_unavailable_worker(tiktok_accounts,monkeypatch):
+    class Held:
+        def submit(self,*a):pass
+    monkeypatch.setattr(tiktok_accounts,'pool',Held())
+    started=client.post('/api/tiktok/loads',json={'account':'creator'})
+    assert started.status_code==202
+    assert client.post('/api/tiktok/loads',json={'account':'another'}).status_code==409
+    id=started.json()['id']
+    assert client.delete('/api/tiktok/tasks/'+id).status_code==204
+    assert tiktok_accounts.tasks[id]['cancel'].is_set()
+
+
+def test_source_workspaces_enforce_selected_platform(monkeypatch):
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'title':'Public video','formats':[{'vcodec':'h264','height':720}]})
+    assert client.post('/api/platform/tiktok/analyze',json={'url':'https://youtu.be/abcDEFG1234'}).status_code==400
+    assert client.post('/api/platform/tiktok/analyze',json={'url':'https://www.tiktok.com/@creator/video/7000000000000000001'}).status_code==200
+    assert client.post('/api/platform/other/analyze',json={'url':'https://youtu.be/abcDEFG1234'}).status_code==400
+
+
+def test_tiktok_account_routes_keep_owner_and_origin_guards(tiktok_accounts,monkeypatch):
+    monkeypatch.setenv('STREAMVAULT_PASSWORD','owner-secret')
+    assert client.post('/api/tiktok/loads',json={'account':'creator'}).status_code==401
+    assert client.post('/api/tiktok/loads',json={'account':'creator'},auth=('admin','owner-secret'),headers={'Origin':'https://evil.test'}).status_code==403
+
+
+def test_account_audio_only_or_malformed_entries_are_not_videos(tiktok_accounts,monkeypatch):
+    fake_tiktok(monkeypatch,[tik_entry(1,formats=[{'vcodec':'none','acodec':'aac'}]),None,{'id':'../../escape','title':'Bad'}])
+    task=account_load();rows=client.get('/api/tiktok/previews/'+task['token']).json()['rows']
+    assert [r['status'] for r in rows]==['unsupported','invalid','invalid']
+    assert all(not row['selectable'] for row in rows)
+
+
+def test_account_preview_supports_multiple_selections_and_request_id_retries(tiktok_accounts,monkeypatch):
+    fake_tiktok(monkeypatch,[tik_entry(1),tik_entry(2),tik_entry(3)])
+    token=account_load()['token']
+    first=client.post('/api/tiktok/previews/'+token+'/download',json={'video_ids':[tik_entry(1)['id']],'request_id':'first-selection'})
+    assert first.status_code==202 and first.json()['added']==1
+    repeated=client.post('/api/tiktok/previews/'+token+'/download',json={'video_ids':[tik_entry(1)['id']],'request_id':'first-selection'})
+    assert repeated.json()==first.json() and len(main.jobs)==1
+    assert client.post('/api/tiktok/previews/'+token+'/download',json={'video_ids':[tik_entry(2)['id']],'request_id':'first-selection'}).status_code==409
+    second=client.post('/api/tiktok/previews/'+token+'/download',json={'video_ids':[tik_entry(2)['id']],'request_id':'second-selection'})
+    assert second.status_code==202 and second.json()['added']==1 and len(main.jobs)==2
+
+
+def test_account_seed_resolves_only_verified_same_account(tiktok_accounts,monkeypatch):
+    secondary='MS4wLjABAAAA'+'A'*64
+    calls=fake_tiktok(monkeypatch,[tik_entry(1)],{tik_entry(1)['id']:{'formats':[{'vcodec':'h264'}],'uploader_id':'creator','channel_id':secondary}})
+    request=client.post('/api/tiktok/loads',json={'account':'creator','seed_url':'https://www.tiktok.com/@creator/video/'+tik_entry(1)['id']})
+    assert request.status_code==202
+    task=client.get('/api/tiktok/tasks/'+request.json()['id']).json()
+    assert task['status']=='ready'
+    assert any(url=='tiktokuser:'+secondary for url,_,_ in calls)
+    for url in ['https://evil.test/@creator/video/7000000000000000001','https://tiktok.com/@different/video/7000000000000000001','https://[invalid']:
+        assert client.post('/api/tiktok/loads',json={'account':'creator','seed_url':url}).status_code==400
+
+
+def test_account_seed_cannot_load_another_actual_uploader(tiktok_accounts,monkeypatch):
+    calls=fake_tiktok(monkeypatch,[tik_entry(1)],{tik_entry(1)['id']:{'formats':[{'vcodec':'h264'}],'uploader_id':'other','channel_id':'MS4wLjABAAAA'+'A'*64}})
+    response=client.post('/api/tiktok/loads',json={'account':'creator','seed_url':'https://www.tiktok.com/@creator/video/'+tik_entry(1)['id']})
+    task=client.get('/api/tiktok/tasks/'+response.json()['id']).json()
+    assert task['status']=='failed' and 'same account' in task['detail']
+    assert len(calls)==1
+
+
+def test_account_checks_expire_after_run_not_while_worker_is_busy(tiktok_accounts,monkeypatch):
+    fake_tiktok(monkeypatch,[tik_entry(1)])
+    task=account_load();token=task['token'];cache=tiktok_accounts.previews[token]
+    cache['created']=main.time.monotonic()-2000;cache['busy']=True
+    assert client.get('/api/tiktok/previews/'+token).status_code==200
+    assert client.post('/api/tiktok/previews/'+token+'/download',json={'video_ids':[tik_entry(1)['id']]}).status_code==409
+    cache['busy']=False
+    assert client.get('/api/tiktok/previews/'+token).status_code==410
+
+
+def test_account_listing_page_failure_does_not_publish_a_partial_collection(tiktok_accounts,monkeypatch):
+    def extract(dl,url,download=False):
+        def entries():
+            yield tik_entry(1)
+            raise RuntimeError('Unable to download webpage: connection reset')
+        return {'_type':'playlist','entries':entries()}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    task=account_load()
+    assert task['status']=='failed' and not task['token'] and not tiktok_accounts.previews
+
+
+@pytest.mark.parametrize('provider,url',[
+    ('youtube','https://youtu.be/abcDEFG1234'),('tiktok','https://www.tiktok.com/@creator/video/7000000000000000001'),
+    ('instagram','https://www.instagram.com/reel/public123/'),('facebook','https://www.facebook.com/watch/?v=123456'),
+    ('x','https://x.com/public/status/123456'),('dailymotion','https://www.dailymotion.com/video/x123abc'),('threads','https://www.threads.com/@public/post/ABC123')])
+def test_each_source_has_a_working_own_analyze_route(monkeypatch,provider,url):
+    monkeypatch.setattr(main,'extract_video',lambda *a:{'title':'Source video','formats':[{'vcodec':'h264','height':720}]})
+    result=client.post('/api/platform/'+provider+'/analyze',json={'url':url})
+    assert result.status_code==200 and result.json()['title']=='Source video'
+
+
+def test_tiktok_account_ip_block_stops_checks_without_mislabeling_videos(tiktok_accounts,monkeypatch):
+    calls=fake_tiktok(monkeypatch,[tik_entry(1),tik_entry(2)],{tik_entry(1)['id']:main.yt_dlp.utils.DownloadError('Your IP address is blocked from accessing this post')})
+    task=account_load()
+    assert task['status']=='failed' and task['checked']==0 and 'network/IP' in task['detail']
+    assert len(calls)==2
+    rows=client.get('/api/tiktok/previews/'+task['token']).json()['rows']
+    assert all(row['status']=='unknown' for row in rows)
+    assert client.post('/api/tiktok/loads',json={'account':'another'}).status_code==429
+
+
+def test_tiktok_ip_block_is_clear_and_not_automatically_retried():
+    error=RuntimeError('Your IP address is blocked from accessing this post')
+    assert 'network/IP' in main.download_error(error)
+    assert main.recovery.classify(error)['retryable'] is False
+
+
+def test_tiktok_download_rate_limit_does_not_pause_youtube():
+    url='https://www.tiktok.com/@creator/video/7000000000000000001'
+    main.jobs['tiktok-rate']={'id':'tiktok-rate','url':url,'title':'TikTok video','created':1,'status':'downloading','format':'mp4','quality':'1080'}
+    issue=main.recovery.classify(RuntimeError('HTTP Error 429'))
+    assert main.schedule_recovery('tiktok-rate',main.DownloadRequest(url=url),issue,'Source rate limited')
+    assert main.source_access.youtube.remaining()==0
+    assert main.jobs['tiktok-rate']['retry_at']>=main.time.time()+590
+
+
+def test_tiktok_identity_matches_video_across_account_names(monkeypatch):
+    first='https://www.tiktok.com/@creator/video/7000000000000000001'
+    renamed='https://www.tiktok.com/@new_name/video/7000000000000000001?share=track'
+    assert main.storage.video_key(first)==main.storage.video_key(renamed)
+    main.storage.save(main.DATA,{'id':'renamed','url':first,'title':'Saved','status':'completed','created':1})
+    assert client.post('/api/download',json={'url':renamed}).status_code==409
+
+
+def test_tiktok_legacy_deleted_history_still_protects_same_source_link():
+    url='https://www.tiktok.com/@creator/video/7000000000000000001'
+    with main.storage.connect(main.DATA) as connection:
+        connection.execute('INSERT INTO download_events VALUES (?,?,?,?)',('old','TikTok',main.storage.video_keys(url)[1],1))
+    assert main.storage.downloaded_count(main.DATA,url)==1
+    assert client.post('/api/download',json={'url':url}).status_code==409
+
+
+def test_retained_tiktok_history_repairs_older_url_identity():
+    import json
+    url='https://www.tiktok.com/@creator/video/7000000000000000001'
+    job={'id':'old','url':url,'title':'Old saved','status':'completed','created':1}
+    with main.storage.connect(main.DATA) as connection:
+        connection.execute('INSERT INTO jobs VALUES (?,?)',('old',json.dumps(job)))
+        connection.execute('INSERT INTO download_events VALUES (?,?,?,?)',('old','TikTok',main.storage.video_keys(url)[1],1))
+    main.storage.restore(main.DATA)
+    assert main.storage.downloaded_count(main.DATA,'https://www.tiktok.com/@renamed/video/7000000000000000001')==1
+    assert main.storage.statistics(main.DATA)['total']==1

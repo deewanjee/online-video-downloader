@@ -35,6 +35,13 @@ def serve(port):
 
     def extracted(dl, url, download=False):
         if not download:
+            if 'tiktok.com/@' in url or url.startswith('tiktokuser:'):
+                if '/video/' not in url:
+                    return {'_type':'playlist','title':'TikTok fixture creator','entries':[{'id':str(7000000000000000000+i),'title':f'Creator post {i}','duration':4,'thumbnail':f'https://p16.tiktokcdn.com/demo/{i}.jpg'} for i in range(1,64)]}
+                video_id=url.rsplit('/',1)[-1]
+                if video_id=='7000000000000000002':raise main.yt_dlp.utils.DownloadError('Private video')
+                if video_id=='7000000000000000003':return {'formats':[{'vcodec':'none','acodec':'aac'}]}
+                return {'title':'TikTok public video','duration':4,'formats':[{'height':180,'vcodec':'h264','acodec':'aac'}],'uploader_id':'creator','channel_id':'MS4wLjABAAAA'+'A'*64}
             if 'list=' in url:
                 return {'_type':'playlist','title':'Playlist with previous downloads','entries':[{'id':f'clip{i:07d}','title':'[Private video]' if i==3 else f'Playlist video {i}','availability':'private' if i==3 else 'public'} for i in range(1,6)]}
             if '/results?' in url:
@@ -57,6 +64,12 @@ def serve(port):
         return {'title': 'Selected video', 'duration': 4, 'extractor_key': 'Youtube'}
 
     main.yt_dlp.YoutubeDL.extract_info = extracted
+
+    @main.app.post('/_test/tiktok-history')
+    def history():
+        job={'id':'past-tiktok','url':'https://www.tiktok.com/@creator/video/7000000000000000001','title':'Previously saved TikTok','status':'completed','created':1}
+        main.storage.save(main.DATA,job);main.storage.delete(main.DATA,job['id'])
+        return {'seeded':True}
 
     @main.app.post('/_test/release')
     def release():
@@ -117,6 +130,8 @@ def verify():
                         route.fulfill(content_type='text/html', body='<html><body style="background:#122033;color:white"><h1>Source preview fixture</h1><video controls autoplay muted src="'+base+'/_test/media"></video></body></html>')
                     page.route('https://www.youtube-nocookie.com/embed/**', embed)
                     page.route('https://www.dailymotion.com/embed/video/**', embed)
+                    page.route('https://www.tiktok.com/player/v1/**',embed)
+                    page.route('https://p16.tiktokcdn.com/**',lambda route:route.fulfill(content_type='image/svg+xml',body='<svg xmlns="http://www.w3.org/2000/svg" width="200" height="160"><rect width="200" height="160" fill="#3b6172"/></svg>'))
                     page.goto(base, wait_until='domcontentloaded')
                     page.locator('[data-view=discover]').click()
                     page.fill('#discovery-query', 'journeys')
@@ -283,11 +298,60 @@ def verify():
                     page.keyboard.press('Escape')
                     page.wait_for_function("document.querySelector('#source-preview-frame').children.length===0")
                     page.locator('[data-view=discover]').click()
+                    # TikTok account workspace: auto-check, history, paging, selection and real saves.
+                    page.request.post(base+'/_test/tiktok-history')
+                    page.locator('[data-view=sources]').click()
+                    assert page.locator('#source-tabs button').count()==7
+                    page.fill('#account-name','@creator')
+                    page.click('#account-load')
+                    page.wait_for_function("document.querySelector('#account-status').textContent.includes('Checks complete')",timeout=30000)
+                    assert page.locator('#account-videos .account-card').count()==30
+                    assert page.evaluate("getComputedStyle(document.getElementById('account-videos')).gridTemplateColumns.split(' ').length===5")
+                    page.set_viewport_size({'width':1920,'height':1050})
+                    assert page.evaluate("getComputedStyle(document.getElementById('account-videos')).gridTemplateColumns.split(' ').length===6")
+                    page.set_viewport_size({'width':1440,'height':1050})
+                    assert '63 listed' in page.locator('#account-counts').inner_text()
+                    assert '61 available' in page.locator('#account-counts').inner_text()
+                    assert page.locator('#account-videos input[value="7000000000000000001"]').is_disabled()
+                    assert page.locator('#account-videos input[value="7000000000000000002"]').is_disabled()
+                    assert page.locator('#account-videos input[value="7000000000000000003"]').is_disabled()
+                    if screenshot:page.screenshot(path=str(Path(screenshot).with_name('tiktok-account-v34.png')),full_page=True)
+                    card=page.locator('.account-card[data-video-id="7000000000000000004"]')
+                    card.locator('.account-preview').click()
+                    page.wait_for_selector('#source-preview-dialog[open] iframe')
+                    assert any('/player/v1/7000000000000000004?' in url for url in embeds)
+                    assert page.locator('#source-preview-download').is_hidden()
+                    page.click('#source-preview-close')
+                    page.select_option('#account-filter','available')
+                    page.wait_for_function("document.querySelector('#account-videos input[value=\"7000000000000000002\"]')===null")
+                    page.locator('#account-videos input[value="7000000000000000004"]').check()
+                    page.locator('#account-pagination').get_by_role('button',name='Next',exact=True).click()
+                    page.wait_for_function("document.querySelector('#account-pagination').textContent.includes('Page 2')")
+                    assert page.locator('#account-selected').inner_text()=='1 selected'
+                    page.click('#account-select-all')
+                    page.wait_for_function("document.querySelector('#account-selected').textContent==='60 selected'")
+                    page.click('#account-clear')
+                    page.locator('#account-pagination').get_by_role('button',name='Previous',exact=True).click()
+                    page.wait_for_selector('#account-videos input[value="7000000000000000004"]')
+                    page.locator('#account-videos input[value="7000000000000000004"]').check()
+                    page.locator('#account-videos input[value="7000000000000000005"]').check()
+                    page.click('#account-queue')
+                    page.wait_for_function("document.querySelector('#account-status').textContent.includes('2 videos queued')")
+                    page.wait_for_function("fetch('/api/jobs').then(r=>r.json()).then(rows=>rows.filter(j=>j.url.includes('tiktok.com') && j.status==='completed').length===2)",timeout=20000)
+                    page.locator('[data-source=tiktok] .source-single').get_by_role('button',name='View TikTok completed videos').click()
+                    assert page.locator('#source-filter').input_value()=='TikTok'
+                    page.wait_for_function("document.querySelectorAll('#all-jobs .job.completed').length===2")
+                    page.locator('[data-view=sources]').click()
+                    page.locator('#source-tabs [data-source=instagram]').click()
+                    assert page.locator('#source-panels [data-source=instagram]').is_visible()
+                    assert not page.locator('#source-panels [data-source=tiktok]').is_visible()
+                    page.locator('#source-tabs [data-source=tiktok]').click()
+                    assert page.locator('#account-name').input_value()=='@creator'
                     page.set_viewport_size({'width': 390, 'height': 844})
                     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
                     assert not errors, errors
                     browser.close()
-                    print('PASS: archive, persistent duplicate prevention, playlist history, retained/exportable activity, restored compact typography, preview without queueing, frame teardown, individual queues, live progress, duplicate guard, merging, completion, failure, saved playback, paging/search reconciliation, history-only badge, embed allowlist and responsive width; no JavaScript errors.')
+                    print('PASS: TikTok account checks, source workspaces, account paging/selection/preview/history/saves, exact platform filter, archive, persistent duplicate prevention, playlist history, retained/exportable activity, restored compact typography, preview without queueing, frame teardown, individual queues, live progress, duplicate guard, merging, completion, failure, saved playback, paging/search reconciliation, history-only badge, embed allowlist and responsive width; no JavaScript errors.')
             finally:
                 process.terminate()
                 try:

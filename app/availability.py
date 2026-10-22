@@ -32,7 +32,7 @@ def checked(info=None,error=None):
         state='live'
     elif info.get('availability') in ('private','needs_auth','premium_only','subscriber_only'):
         state='private'
-    elif any(isinstance(f,dict) and (f.get('vcodec') not in (None,'none') or f.get('acodec') not in (None,'none')) for f in info.get('formats',[])):
+    elif any(isinstance(f,dict) and (f.get('vcodec') not in (None,'none') or f.get('acodec') not in (None,'none')) for f in (info.get('formats') or [])):
         state='available'
     else:state='unknown'
     return {'status':state,'status_label':LABELS[state],'selectable':state not in BLOCKED,

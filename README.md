@@ -6,6 +6,20 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## TikTok accounts and separate platform workspaces (3.4.0)
+
+Open **Platform workspaces → TikTok**. Enter an `@username` or `https://www.tiktok.com/@username` profile, then choose **Load & check**. The importer lists source-returned posts and checks their video metadata before selection. Available videos can be selected across pages; private, removed, restricted and non-video posts stay disabled. A network failure leaves untested posts **Not verified**, rather than falsely calling them removed. Stop and recheck controls, caption/ID search, availability/history filters, checked timestamps and live queue badges are included.
+
+Listings use windows of up to **1,000 posts**, with controls to load the next window. Preview sessions last 30 minutes after checks finish; one account task runs at a time. **Select all available matches** respects current filters and skips already downloaded/active sources by default. Choose format/quality and **Download selected** to use the existing download destination and queue. Multiple distinct selections from the same preview are supported; retried submissions do not enqueue duplicate copies. TikTok numeric video IDs now identify the same post across username changes. Existing retained URL-based records remain recognized for their original URLs.
+
+If TikTok cannot resolve an account identifier, the optional **public video from the same account** field uses a verified post's source channel ID for the listing. This requires publicly accessible metadata and does not grant access to a private account. Thumbnail previews use the official TikTok player; saved files use the portal player. Source embedding can still be disabled.
+
+**YouTube, TikTok, Instagram, Facebook, X / Twitter, Dailymotion and Threads** each have their own panel, source-validated single-link form, lifetime counter and link to completed media. YouTube/Dailymotion panels link to existing search; YouTube also links to playlist tools. Account importing is currently TikTok-specific. The library has an exact platform filter. Compact fonts and five desktop / six wide-screen thumbnail columns are preserved.
+
+Read the [TikTok account guide](app/static/help/tiktok-accounts.md), also available at `/help/tiktok-accounts`; the Help center now contains **fourteen English guides**. Verification and screenshot: [reports/tiktok-workspaces-v34.md](reports/tiktok-workspaces-v34.md).
+
+**Live-source limitation:** automated workflow/browser tests pass with controlled fixtures, but live TikTok profile resolution failed from this cloud and the public-post fallback encountered an explicit IP block. Live account enumeration was therefore not established here. TikTok can omit posts, require authentication or block requests; the portal cannot promise every account/post will download. Rate/IP blocks pause account attempts for ten minutes, stop repeated checks, and display actionable status. Back up and preserve `data/`, `.env`, `.venv` and media folders when updating, then restart the app and refresh with Ctrl+F5.
+
 ## Protected queues, Completed archive and retained activity (3.3.0)
 
 **Duplicate protection is now on by default across single links, bulk requests and playlists.** Canonical source identity matches supported short/tracked URL variants. Already active copies are rejected even when repeats are allowed. Previously completed sources are remembered by the lifetime ledger after library removal/restart; they are skipped unless **Allow repeat downloads** is explicitly enabled for this page session. A completed-card **Again** action asks for confirmation. This also applies when choosing another format or quality for the same source. Reuploads under different source IDs/platforms and unresolved share-link aliases are not content-fingerprint matches.

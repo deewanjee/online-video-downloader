@@ -137,6 +137,7 @@ let sourcePreviewRow=null;
 function discoveryEmbedURL(row) {
   if(row.provider==='youtube' && /^[A-Za-z0-9_-]{11}$/.test(row.id))return 'https://www.youtube-nocookie.com/embed/'+row.id+'?autoplay=1&playsinline=1&rel=0&origin='+encodeURIComponent(location.origin);
   if(row.provider==='dailymotion' && /^[A-Za-z0-9]{3,30}$/.test(row.id))return 'https://www.dailymotion.com/embed/video/'+row.id+'?autoplay=1';
+  if(row.provider==='tiktok' && /^[0-9]{6,25}$/.test(row.id))return 'https://www.tiktok.com/player/v1/'+row.id+'?autoplay=1';
   return null;
 }
 function stopSourcePreview() {
@@ -146,6 +147,7 @@ function syncSourcePreview(index=discoveryJobIndex()) {
   if(!sourcePreviewRow)return;
   const state=discoveryState(sourcePreviewRow,index);
   $('source-preview-saved').hidden=!state.saved;
+  $('source-preview-download').hidden=!!sourcePreviewRow.account_preview;
   const status=state.kind==='idle'?'':state.label+' · '+state.detail;
   if($('source-preview-download-status').textContent!==status)$('source-preview-download-status').textContent=status;
   $('source-preview-download').disabled=discoveryBusy || !!state.active || state.pending || (!!state.count && !repeatAllowed());
@@ -158,7 +160,7 @@ function playDiscovered(row) {
   if(!url){searchMessage('Source preview is unavailable for this result. Download the video to play the saved file.');return;}
   $('player-dialog').close();stopSourcePreview();sourcePreviewRow=row;
   $('source-preview-title').textContent=row.title;
-  $('source-preview-note').textContent='Preview provided by '+row.platform+'. Playback depends on the source allowing embedded video. If it is blocked, download the video and use Play saved when ready.';
+  $('source-preview-note').textContent='Preview provided by '+row.platform+'. Playback depends on the source allowing embedded video. '+(row.account_preview?'Close this preview and select checked videos in the account list to download.':'If it is blocked, download the video and use Play saved when ready.');
   const frame=document.createElement('iframe');frame.title='Source preview: '+row.title;frame.src=url;
   frame.allow='autoplay; encrypted-media; fullscreen; picture-in-picture';frame.allowFullscreen=true;frame.referrerPolicy='strict-origin-when-cross-origin';
   frame.onerror=()=>{$('source-preview-note').textContent='The source preview could not load. Download the video and use Play saved when ready.';};

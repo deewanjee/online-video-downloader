@@ -41,6 +41,7 @@ async def lifespan(application):
         deferred_downloads.stop()
         stop_playlist_loads()
         stop_previews()
+        account_manager.stop()
 
 
 app = FastAPI(title='AAASoft Video Studio', version=__version__, lifespan=lifespan)
@@ -308,6 +309,8 @@ def download_error(exc):
             return error
     if 'netscape format cookies file' in message or 'failed to load cookies' in message:
         return 'The local session cookie file could not be read. Export a valid Netscape-format cookie file and check its permissions.'
+    if 'ip address is blocked' in message:
+        return 'The source is blocking access from this network/IP. Try again later; video availability could not be confirmed.'
     if source_access.is_rate_limit(message):
         return 'The source is limiting download requests (HTTP 429). Wait before retrying; repeated retries can prolong the limit.'
     if source_access.is_bot_verification(message):
@@ -820,9 +823,11 @@ def schedule_recovery(job_id, req, issue, message, recoverable=False):
         update(job_id, **destination, legacy_recovery=bool(job.get('recoverable')))
     delay = max(recovery.DELAYS[min(attempts, len(recovery.DELAYS)-1)], (job.get('retry_at') or 0)-time.time())
     if issue['code'] == 'rate_limit':
-        if not source_access.youtube.remaining():
-            source_access.youtube.limited()
-        delay = max(delay, source_access.youtube.remaining())
+        delay=max(delay,600)
+        if source_access.youtube_url(req.url):
+            if not source_access.youtube.remaining():
+                source_access.youtube.limited()
+            delay = max(delay, source_access.youtube.remaining())
     update(job_id, status='queued', stage='retry_wait', progress=0, speed=None, eta=None,
            auto_attempts=attempts+1, recovery_pending=True, retry_at=time.time()+delay, error=None, last_error=message,
            error_code=issue['code'], next_action=issue['action'], recoverable=recoverable)
@@ -943,7 +948,7 @@ def run_download(job_id, req):
                 with lock:
                     key=storage.video_key(job['url'])
                     older=[other for other in jobs.values() if other['id']!=job_id and other['status'] in ('queued','downloading','processing') and storage.video_key(other.get('url',''))==key and (other.get('created',0),other['id'])<(job.get('created',0),job_id)]
-                    completed=storage.video_counts(DATA).get(key,0)
+                    completed=storage.history_count(storage.video_counts(DATA),job['url'])
                     if older:reason='An earlier copy is already queued or running.'
                     elif completed and not (job.get('allow_repeat') or job.get('completion_id')):reason='This video was already downloaded. Open Completed or request an explicit repeat.'
             if reason:
@@ -1144,7 +1149,7 @@ def duplicate_reason(url,counts,allow_repeat=False,exclude=None):
     key=storage.video_key(url)
     if any(j['id']!=exclude and storage.video_key(j.get('url',''))==key and j['status'] in ('queued','downloading','processing') for j in jobs.values()):
         return 'active','This video is already queued or downloading. Open Work queue to follow progress.'
-    if not allow_repeat and (counts.get(key,0) or any(j['id']!=exclude and j['status']=='completed' and storage.video_key(j.get('url',''))==key for j in jobs.values())):
+    if not allow_repeat and (storage.history_count(counts,url) or any(j['id']!=exclude and j['status']=='completed' and storage.video_key(j.get('url',''))==key for j in jobs.values())):
         return 'completed','This video was already downloaded. Open Completed, or explicitly enable Allow repeat downloads for another copy.'
     return None
 
@@ -1272,7 +1277,7 @@ def list_jobs():
                 changed = job | {'status': 'failed', 'error': 'The saved file is missing. Use Retry to download it again.', 'preview_available': False}
                 save_queued(changed)
                 job.update(changed)
-        return [j.copy() | {'source_key':storage.video_key(j.get('url', '')), 'previous_downloads': counts.get(storage.video_key(j.get('url', '')), 0), 'source_platform': storage.platform_name(j.get('url', ''))} for j in sorted(jobs.values(), key=lambda j: j['created'], reverse=True)]
+        return [j.copy() | {'source_key':storage.video_key(j.get('url', '')), 'previous_downloads': storage.history_count(counts,j.get('url','')), 'source_platform': storage.platform_name(j.get('url', ''))} for j in sorted(jobs.values(), key=lambda j: j['created'], reverse=True)]
 
 
 @app.get('/api/stats')
@@ -1494,3 +1499,9 @@ def export_activity(format:Literal['csv','json']='csv'):
                 cells=["'"+value if isinstance(value,str) and value.lstrip().startswith(('=','+','-','@')) else value for value in cells]
                 writer.writerow(cells);yield buffer.getvalue();buffer.seek(0);buffer.truncate(0)
     return StreamingResponse(generate(),media_type='application/json' if format=='json' else 'text/csv',headers={'Content-Disposition':'attachment; filename="aaasoft-activity.'+format+'"','Cache-Control':'no-store'})
+
+
+# Register source workspaces after the shared queue functions are defined.
+import sys
+from app import accounts
+account_manager=accounts.register(sys.modules[__name__])

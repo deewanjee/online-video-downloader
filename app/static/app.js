@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const UI_VERSION = '3.3.1';
+const UI_VERSION = '3.4.0';
 const audioFormats = ['mp3', 'm4a', 'wav'];
 function icon(name) {
   const paths = {play:'<path d="m8 5 11 7-11 7z"/>',arrow:'<path d="M6 18 18 6M6 6h12v12"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/>'};
@@ -34,11 +34,12 @@ function view(name,tab='pending') {
   const requested=name;
   if(name==='completed'){name='downloads';tab='completed';}
   if(name==='downloads')$('status-filter').value=tab;
-  for (const n of ['home','discover','downloads','platforms','recovery','activity']) $(n).hidden = n !== name;
+  for (const n of ['home','discover','downloads','platforms','recovery','activity','sources']) $(n).hidden = n !== name;
   document.querySelectorAll('.nav').forEach(el => { el.classList.toggle('active',el.dataset.view === requested); el.setAttribute('aria-current', el.dataset.view === requested ? 'page' : 'false'); });
-  $('page-label').textContent = {home:'Dashboard',discover:'Discover',downloads:'Video library',platforms:'Platform insights',recovery:'Recovery center',activity:'Activity log'}[name];
+  $('page-label').textContent = {home:'Dashboard',discover:'Discover',downloads:'Video library',platforms:'Platform insights',recovery:'Recovery center',activity:'Activity log',sources:'Platform workspaces'}[name];
   window.scrollTo(0,0);
   if (name==='downloads')renderAll();
+  if(name==='sources' && typeof refreshSources==='function')refreshSources();
   if (name==='activity' && typeof loadActivity==='function')loadActivity();
   if (name === 'recovery' && typeof loadRecovery === 'function') loadRecovery();
 }
@@ -536,7 +537,7 @@ function renderAll() {
     button.querySelector('b').textContent = jobs.filter(j => matchesStatus(j,button.dataset.filter)).length;
   }
   const term = $('search').value.trim().toLowerCase(), filter = $('status-filter').value;
-  const filtered = jobs.filter(j => (j.title+' '+j.url+' '+sourceName(j)).toLowerCase().includes(term) && matchesStatus(j,filter));
+  const filtered = jobs.filter(j => ($('source-filter').value==='all' || sourceName(j)===$('source-filter').value) && (j.title+' '+j.url+' '+sourceName(j)).toLowerCase().includes(term) && matchesStatus(j,filter));
   const sort = $('sort-order').value;
   filtered.sort((a,b) => sort === 'oldest' ? a.created-b.created : sort === 'title' ? a.title.localeCompare(b.title) : sort === 'completed' ? Number(b.status==='completed')-Number(a.status==='completed') || b.created-a.created : b.created-a.created);
   selectionLists.library = filtered;
@@ -549,6 +550,7 @@ function renderAll() {
   $('ready-count').textContent = jobs.filter(j => j.status === 'completed').length; $('active-count').textContent = jobs.filter(j => ['queued','downloading','processing'].includes(j.status)).length;
 }
 function renderStats(stats) {
+  if(typeof syncSourceStatistics==='function')syncSourceStatistics(stats);
   $('lifetime-total').textContent = stats?stats.total.toLocaleString():'—'; $('insights-total').textContent = stats?stats.total.toLocaleString():'—';
   for (const card of $('all-platforms').children) {
     const value = stats?.platforms.find(p => p.name === card.dataset.platform)?.downloads || 0;
@@ -578,6 +580,7 @@ function refresh() {
         jobs = items; renderAll(); renderStats(stats);
         if (typeof syncDiscoveryJobs === 'function') syncDiscoveryJobs();
         if (typeof refreshWorkspace === 'function') refreshWorkspace();
+        if (typeof refreshSources === 'function')refreshSources();
         if (typeof renderSystemChecks === 'function') renderSystemChecks(h);
         const status = h.version !== UI_VERSION ? 'Restart to apply update'
           : !h.ffmpeg ? 'FFmpeg missing' : h.ffprobe === false ? 'FFprobe missing'
@@ -595,6 +598,7 @@ function refresh() {
   return refreshing;
 }
 $('search').oninput = () => { paginationState.library.page = 1; renderAll(); }; $('status-filter').onchange = () => { paginationState.library.page = 1; renderAll(); };
+$('source-filter').onchange=()=>{paginationState.library.page=1;renderAll();};
 $('sort-order').onchange = () => { paginationState.library.page = 1; renderAll(); };
 $('theme').onclick = () => { document.body.classList.toggle('dark'); try { localStorage.setItem('sv-theme',document.body.classList.contains('dark') ? 'dark' : 'light'); } catch {} };
 try { if (localStorage.getItem('sv-theme') === 'dark') document.body.classList.add('dark'); } catch {}
