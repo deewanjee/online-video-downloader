@@ -10,11 +10,18 @@ List public account videos, review availability and download a selection.
 
 ## Load a TikTok account
 
-1. Choose TikTok and enter @username, username, or https://www.tiktok.com/@username. Use the account username, not a display name or individual video URL.
-2. If account-ID lookup fails, expand Optional: assist account lookup with a public video. Paste a public video URL or a vt.tiktok.com / vm.tiktok.com share link from the same username. Supported short links are resolved by the video extractor before the actual uploader is checked. The video metadata must confirm that uploader and a supported public account ID; this does not bypass account access restrictions.
-3. Choose Load & check account. The account details panel shows the public display name, username, bio, IDs and counters supplied by TikTok, with Copy buttons and Copy account details. Missing fields say Not provided; source counts are not guaranteed downloadable totals. A confirmed identity is used automatically, so manually copying IDs into another field is unnecessary. If listing fails after profile metadata arrives, the available details remain visible.
-4. Listing is metadata-only: it does not download media files. Availability checks run sequentially in the background; the progress indicator shows how many entries have been classified.
-5. The list becomes visible while checks continue. Only Available - checked video entries are selectable; unknown, private, removed, live and non-video posts cannot be queued. Availability can change after checking.
+1. Open Platform workspaces → TikTok. The three steps are Find account, Review videos and Download selection.
+2. Use the single Account username or TikTok link input. Paste @username, a public profile URL, a direct public video URL, or a vt.tiktok.com / vm.tiktok.com share link. Choose Find videos. No account ID or user ID is required.
+3. When given a video link, the source metadata identifies its owner automatically. The numeric uploader ID is not treated as a username. Missing or mismatching public identity is never guessed.
+4. Profile lookup and listing are metadata-only. The review appears while sequential access checks continue; only checked Available video posts can be selected.
+5. A confirmed account has a compact summary. Account details & copy options expands the public fields the source actually supplied. Missing fields and unconfirmed identities do not generate a large empty panel. Source counters do not guarantee that every historical post is downloadable.
+
+## If the list cannot be loaded
+
+1. The next-step panel distinguishes a source block from an unavailable account listing. A failure is not evidence that the account has zero videos.
+2. Try a public video link changes the same input into the fallback path. Paste a real public post/share link; the system resolves its account automatically. It does not guarantee access to a blocked account API.
+3. Open supplied TikTok link lets you inspect the requested public link in your browser. Download one video instead focuses the existing single-video form, prefilling a supplied public video/share link when possible.
+4. For HTTP 429 or explicit IP blocks, wait before retrying. Repeated clicks do not remove source restrictions. Private, removed, omitted and blocked posts are not guaranteed to list or download.
 
 ## Review and select
 
@@ -28,7 +35,7 @@ List public account videos, review availability and download a selection.
 1. Stop requests cancellation after the current source request. Checked entries stay reviewable; unverified entries remain disabled. Check unverified again resumes checks for unknown entries without relisting the account.
 2. The source is read in batches of up to 1,000 returned entries. Next profile batch requests the next source window; previous batches can be loaded again. Changing a batch clears that batch selection, after confirmation. The supported offset limit is 100,000 posts.
 3. A preview remains available for 30 minutes after checking ends; app restart clears previews. Checks have a 30-minute run limit. One account metadata task runs at a time to limit source requests. TikTok HTTP 429 or explicit IP blocking pauses new account tasks for ten minutes; access is not guaranteed when that pause ends.
-4. Retry status reconnects polling if the browser loses contact repeatedly. This does not create another download or account task.
+4. Reconnect resumes polling if the browser loses contact repeatedly. This does not create another download or account task.
 
 ## Understand limitations
 

@@ -35,6 +35,8 @@ def serve(port):
 
     def extracted(dl, url, download=False):
         if not download:
+            if url=='https://vt.tiktok.com/Fixture123/':return {'uploader_url':'https://www.tiktok.com/@creator','uploader_id':'123456789','channel_id':'MS4wLjABAAAA'+'A'*64,'formats':[{'vcodec':'h264'}]}
+            if 'tiktok.com/@blockedcreator' in url:raise main.yt_dlp.utils.DownloadError('Unable to extract secondary user ID')
             if 'tiktok.com/@' in url or url.startswith('tiktokuser:'):
                 if '/video/' not in url:
                     if dl.params.get('_aaasoft_profile'):dl.params['_aaasoft_profile']({'user':{'uniqueId':'creator','nickname':'TikTok fixture creator','signature':'Public fixture bio','id':'123456789','secUid':'MS4wLjABAAAA'+'A'*64,'verified':True},'stats':{'followerCount':1234,'videoCount':63}})
@@ -303,15 +305,24 @@ def verify():
                     page.request.post(base+'/_test/tiktok-history')
                     page.locator('[data-view=sources]').click()
                     assert page.locator('#source-tabs button').count()==7
-                    page.fill('#account-name','@creator')
+                    page.fill('#account-name','@blockedcreator')
+                    page.click('#account-load')
+                    page.wait_for_selector('#account-recovery:not([hidden])')
+                    assert not page.locator('#account-profile').is_visible()
+                    assert 'Not provided' not in page.locator('#source-panels [data-source=tiktok]').inner_text()
+                    page.click('#account-use-video')
+                    assert page.input_value('#account-name')==''
+                    page.fill('#account-name','https://vt.tiktok.com/Fixture123/')
                     page.click('#account-load')
                     page.wait_for_function("document.querySelector('#account-status').textContent.includes('Checks complete')",timeout=30000)
                     assert page.locator('#account-videos .account-card').count()==30
                     assert page.locator('#account-profile').is_visible()
                     assert 'Public account identity confirmed' in page.locator('#account-profile').inner_text()
+                    page.locator('#account-profile summary').click()
                     assert '1234' in page.locator('#account-profile').inner_text()
                     page.get_by_role('button',name='Copy Username',exact=True).click()
                     page.wait_for_function("document.querySelector('[aria-label=\"Copy Username\"]').textContent==='Copied'")
+                    page.locator('#account-profile summary').click()
                     assert page.evaluate("getComputedStyle(document.getElementById('account-videos')).gridTemplateColumns.split(' ').length===5")
                     page.set_viewport_size({'width':1920,'height':1050})
                     assert page.evaluate("getComputedStyle(document.getElementById('account-videos')).gridTemplateColumns.split(' ').length===6")
@@ -352,7 +363,7 @@ def verify():
                     assert page.locator('#source-panels [data-source=instagram]').is_visible()
                     assert not page.locator('#source-panels [data-source=tiktok]').is_visible()
                     page.locator('#source-tabs [data-source=tiktok]').click()
-                    assert page.locator('#account-name').input_value()=='@creator'
+                    assert page.locator('#account-name').input_value()=='https://vt.tiktok.com/Fixture123/'
                     page.set_viewport_size({'width': 390, 'height': 844})
                     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
                     assert not errors, errors

@@ -77,6 +77,22 @@ def profile_details(data,expected):
     return result
 
 
+def public_video_url(value,expected=None):
+    """Accept only supported TikTok public post/share URLs, never arbitrary URLs."""
+    try:
+        parsed=urlparse(value.strip())
+        if parsed.scheme!='https' or parsed.username or parsed.password or parsed.port not in (None,443):raise ValueError()
+        match=re.fullmatch(r'/@([A-Za-z0-9_.]{1,24})/video/([0-9]{6,25})/?',parsed.path)
+        if parsed.hostname in ('www.tiktok.com','tiktok.com') and match:
+            if expected and match[1].casefold()!=expected.casefold():raise HTTPException(400,'Use a public video from the same username as the account.')
+            return 'https://www.tiktok.com/@'+match[1]+'/video/'+match[2]
+        if ((parsed.hostname in ('vm.tiktok.com','vt.tiktok.com') and re.fullmatch(r'/[A-Za-z0-9_-]{3,100}/?',parsed.path)) or
+            (parsed.hostname in ('www.tiktok.com','tiktok.com') and re.fullmatch(r'/t/[A-Za-z0-9_-]{3,100}/?',parsed.path))):
+            return 'https://'+parsed.hostname+parsed.path
+    except ValueError:pass
+    raise HTTPException(400,'Enter a TikTok @username, profile URL, direct public video URL or supported vt.tiktok.com / vm.tiktok.com share link.')
+
+
 def video_state(info):
     state=availability.checked(info)
     if state['status']=='available' and not any(isinstance(f,dict) and f.get('vcodec') not in (None,'none') for f in (info or {}).get('formats',[]) or []):
@@ -166,20 +182,20 @@ class AccountManager:
         if 'ip address is blocked' in text:return 'TikTok is blocking access from this network/IP. Account/video availability could not be verified. Try again later.'
         if '403' in text and 'proxy' not in text:return 'TikTok rejected account access (HTTP 403). Its public account listing may be blocked even when individual video links work.'
         if any(x in text for x in ('account is private',"account is either private",'login required','log in','sign in')):return 'TikTok requires authorized access to this account/video. Try a public account; private videos cannot be listed here.'
-        if any(x in text for x in ('captcha','challenge','verify','secondary user id','secuid','impersonat','not a bot')):return 'TikTok could not provide a public account listing or requires browser verification. Use the optional public-video link from the same account to assist ID resolution; account import may still be blocked.'
+        if any(x in text for x in ('captcha','challenge','verify','secondary user id','secuid','impersonat','not a bot')):return 'TikTok could not provide a public account listing or requires browser verification. Paste a public video link in the same input to identify its account automatically. TikTok may still block account listing; individual video downloads can be tried separately.'
         if 'does not have any videos' in text:return 'TikTok reports no posted videos for this account.'
         return self.main.download_error(error)
 
     def run(self,id,url,offset,token,all_entries,seed_url=None):
         task=self.tasks[id];event=task['cancel'];cache=None;terminal='ready';detail=None
         manager=self
-        username=url.rsplit('@',1)[-1]
+        username=url.rsplit('@',1)[-1] if url else None
         def receive_profile(data):
             profile=profile_details(data,username)
             if profile:
                 with self.lock:task['profile']=profile
         with self.lock:
-            task['profile']={'username':username,'profile_url':url,'identity_verified':False}
+            task['profile']={'username':username,'profile_url':url,'identity_verified':False} if url else None
         def checkpoint():
             if event.is_set():raise source_access.SourceCancelled()
             if time.monotonic()-task['created']>1800:raise HTTPException(408,'Account checks reached the 30-minute time limit. Checked entries remain reviewable; recheck unverified entries later.')
@@ -201,9 +217,11 @@ class AccountManager:
                 extract_url=url
                 if seed_url:
                     seed=self.main.extract_video(seed_url,False,self.main.options()|{'logger':logger,'socket_timeout':20,'retries':1,'extractor_retries':1}) or {}
-                    username=url.rsplit('@',1)[-1]
                     actual=video_username(seed)
-                    if not actual or actual.casefold()!=username.casefold():raise HTTPException(422,'The public video belongs to @'+actual+' rather than @'+username+'. Use a video from the same account.' if actual else 'TikTok did not expose a verifiable username for this video. The numeric user ID alone cannot confirm the account.')
+                    if not actual or (username and actual.casefold()!=username.casefold()):raise HTTPException(422,'The public video belongs to @'+actual+' rather than @'+username+'. Use a video from the same account.' if actual else 'TikTok did not expose a verifiable username for this video. The numeric user ID alone cannot confirm the account.')
+                    if not username:
+                        username=actual;url=profile_url(actual)
+                    with self.lock:task['account_url']=url
                     receive_profile({'user':{'uniqueId':actual,'nickname':seed.get('uploader'),'id':seed.get('uploader_id'),'secUid':seed.get('channel_id')}})
                     secondary=seed.get('channel_id')
                     if not isinstance(secondary,str) or not re.fullmatch(r'MS4wLjABAAAA[A-Za-z0-9_-]{64}',secondary):raise HTTPException(422,'The public video did not provide a supported account ID. Account listing is unavailable from this source response.')
@@ -287,21 +305,13 @@ def register(main):
     manager=AccountManager(main);app=main.app
     @app.post('/api/tiktok/loads',status_code=202)
     def load(req:AccountRequest):
-        url=profile_url(req.account);seed=None
+        value=req.account.strip();seed=None
+        try:url=profile_url(value)
+        except HTTPException:
+            seed=public_video_url(value);url=None
         if req.seed_url:
-            main.validate_url(req.seed_url)
-            parsed=urlparse(req.seed_url)
-            match=re.fullmatch(r'/@([A-Za-z0-9_.]{1,24})/video/([0-9]{6,25})/?',parsed.path)
-            direct=parsed.hostname in ('www.tiktok.com','tiktok.com') and match
-            short=(parsed.hostname in ('vm.tiktok.com','vt.tiktok.com') and re.fullmatch(r'/[A-Za-z0-9_-]{3,100}/?',parsed.path)) or (parsed.hostname in ('www.tiktok.com','tiktok.com') and re.fullmatch(r'/t/[A-Za-z0-9_-]{3,100}/?',parsed.path))
-            if direct:
-                if match[1].casefold()!=url.rsplit('@',1)[-1].casefold():raise HTTPException(400,'Use a public video from the same username as the account.')
-                seed='https://www.tiktok.com/@'+match[1]+'/video/'+match[2]
-            elif short:
-                # yt-dlp's TikTok share extractor resolves these supported aliases.
-                # The worker verifies the actual uploader before using its account ID.
-                seed='https://'+parsed.hostname+parsed.path
-            else:raise HTTPException(400,'Use a TikTok video URL or a vt.tiktok.com / vm.tiktok.com share link from this account. Open other share links in your browser and copy the final video address.')
+            if not url:raise HTTPException(400,'Paste just one public video link, or a username with an optional matching video.')
+            seed=public_video_url(req.seed_url,url.rsplit('@',1)[-1])
         return manager.start(url,req.offset,seed_url=seed)
 
     @app.get('/api/tiktok/tasks/{id}')
@@ -309,7 +319,7 @@ def register(main):
         with manager.lock:
             item=manager.tasks.get(id)
             if not item:raise HTTPException(404,'TikTok account task expired.')
-            return {key:item[key] for key in ('id','status','phase','checked','total','entries','token','detail','profile') if key in item}
+            return {key:item[key] for key in ('id','status','phase','checked','total','entries','token','detail','profile','account_url') if key in item}
 
     @app.delete('/api/tiktok/tasks/{id}',status_code=204)
     def cancel(id:str):

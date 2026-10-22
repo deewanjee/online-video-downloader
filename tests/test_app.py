@@ -2235,7 +2235,7 @@ def account_load(account='@creator',offset=0):
     return task
 
 
-@pytest.mark.parametrize('account',['https://evil.test/@creator','https://www.tiktok.com.evil.test/@creator','https://user:pass@tiktok.com/@creator','https://tiktok.com:8080/@creator','https://tiktok.com/@creator/video/7000000000000000001','bad name','@user.','https://127.0.0.1/@creator'])
+@pytest.mark.parametrize('account',['https://evil.test/@creator','https://www.tiktok.com.evil.test/@creator','https://user:pass@tiktok.com/@creator','https://tiktok.com:8080/@creator','bad name','@user.','https://127.0.0.1/@creator'])
 def test_account_input_rejects_untrusted_profiles(tiktok_accounts,account):
     assert client.post('/api/tiktok/loads',json={'account':account}).status_code==400
 
@@ -2586,3 +2586,34 @@ def test_profile_extractor_reuses_existing_profile_page_without_extra_requests(m
         result=extractor._real_extract('https://www.tiktok.com/@creator')
     assert result['_type']=='playlist' and len(requests)==1
     assert captured[0]['user']['uniqueId']=='creator'
+
+
+@pytest.mark.parametrize('link',['https://vt.tiktok.com/Fixture123/','https://vm.tiktok.com/Fixture123/','https://www.tiktok.com/@creator/video/7000000000000000001'])
+def test_one_input_video_identifies_account_without_manual_username(tiktok_accounts,monkeypatch,link):
+    calls=[]
+    def extract(dl,url,download=False):
+        calls.append(url)
+        if url.startswith('tiktokuser:'):
+            return {'_type':'playlist','entries':[tik_entry(1,formats=[{'vcodec':'h264'}])]}
+        return {'uploader_url':'https://www.tiktok.com/@Creator','uploader_id':'123456789',
+                'channel_id':'MS4wLjABAAAA'+'A'*64,'formats':[{'vcodec':'h264'}]}
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    response=client.post('/api/tiktok/loads',json={'account':link})
+    assert response.status_code==202,response.text
+    task=client.get('/api/tiktok/tasks/'+response.json()['id']).json()
+    assert task['status']=='ready' and task['account_url']=='https://www.tiktok.com/@Creator'
+    preview=client.get('/api/tiktok/previews/'+task['token']).json()
+    assert preview['account']=='Creator' and preview['rows'][0]['selectable']
+    assert len(calls)==2 and calls[1].startswith('tiktokuser:')
+
+
+def test_one_input_video_with_numeric_identity_only_does_not_guess_account(tiktok_accounts,monkeypatch):
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',lambda *args,**kwargs:{'uploader_id':'123456789','channel_id':'MS4wLjABAAAA'+'A'*64})
+    response=client.post('/api/tiktok/loads',json={'account':'https://vt.tiktok.com/Fixture123/'})
+    task=client.get('/api/tiktok/tasks/'+response.json()['id']).json()
+    assert task['status']=='failed' and task['profile'] is None and 'numeric user ID' in task['detail']
+
+
+def test_one_input_rejects_two_ambiguous_video_links(tiktok_accounts):
+    response=client.post('/api/tiktok/loads',json={'account':'https://vt.tiktok.com/Fixture123/','seed_url':'https://vm.tiktok.com/Other123/'})
+    assert response.status_code==400 and not tiktok_accounts.tasks

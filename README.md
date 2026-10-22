@@ -6,6 +6,14 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## Simplified TikTok workbench (3.6.0)
+
+The account section now uses **one input** for a username, profile URL or public video/share link. Choose **Find videos**, review source-available posts, then **Download selected**. A supplied video identifies its owner automatically; there is no separate username/assistance-field puzzle and no need to copy internal IDs. Direct video and supported short-link inputs receive the same strict public-source validation.
+
+The former empty metadata grid is removed: only a confirmed account gets a compact summary, and **Account details & copy options** expands the fields actually returned. Failed listing shows a next-step panel with **Try a public video link**, **Open supplied TikTok link** and **Download one video instead**. These actions guide the user rather than pretending that a blocked source has no posts. The input includes a Paste button and the workbench shows three clear steps. Existing selection, paging, checks, history and destination behavior remain intact.
+
+This rebuild fixes the confusing workflow; it does not remove TikTok account API, IP, verification or private-access restrictions. Source listing can still fail even when a public single-video download works. Read [verification](reports/tiktok-workbench-v36.md) and the updated [English guide](app/static/help/tiktok-accounts.md).
+
 ## TikTok account details and identity fix (3.5.0)
 
 Username lookup now displays an **Account details** panel while loading videos. Public name, bio, username/profile URL, numeric user ID, source account ID, follower/following/like/video counts and verification/private flags appear when TikTok supplies them. Each field and the full details can be copied; IDs are used automatically. Missing fields say **Not provided**, and a requested profile link is clearly distinguished from a source-confirmed identity. Details already returned remain reviewable if subsequent video listing fails. Counts do not guarantee a matching number of downloadable videos.
