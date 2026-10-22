@@ -25,6 +25,7 @@ from app import storage
 from app import __version__
 from app.auth import AccessControl
 from app.threads import ThreadsIE
+from app.tiktok_profile import TikTokProfileIE
 from app import source_access
 from app import destinations, recovery, discovery, availability
 from app.deferred import DeferredDownloads
@@ -133,6 +134,7 @@ def options():
 def video_downloader(settings):
     downloader = yt_dlp.YoutubeDL(settings, auto_init=False)
     downloader.add_info_extractor(ThreadsIE())
+    downloader.add_info_extractor(TikTokProfileIE())
     downloader.add_default_info_extractors()
     return downloader
 

@@ -37,6 +37,7 @@ def serve(port):
         if not download:
             if 'tiktok.com/@' in url or url.startswith('tiktokuser:'):
                 if '/video/' not in url:
+                    if dl.params.get('_aaasoft_profile'):dl.params['_aaasoft_profile']({'user':{'uniqueId':'creator','nickname':'TikTok fixture creator','signature':'Public fixture bio','id':'123456789','secUid':'MS4wLjABAAAA'+'A'*64,'verified':True},'stats':{'followerCount':1234,'videoCount':63}})
                     return {'_type':'playlist','title':'TikTok fixture creator','entries':[{'id':str(7000000000000000000+i),'title':f'Creator post {i}','duration':4,'thumbnail':f'https://p16.tiktokcdn.com/demo/{i}.jpg'} for i in range(1,64)]}
                 video_id=url.rsplit('/',1)[-1]
                 if video_id=='7000000000000000002':raise main.yt_dlp.utils.DownloadError('Private video')
@@ -306,6 +307,11 @@ def verify():
                     page.click('#account-load')
                     page.wait_for_function("document.querySelector('#account-status').textContent.includes('Checks complete')",timeout=30000)
                     assert page.locator('#account-videos .account-card').count()==30
+                    assert page.locator('#account-profile').is_visible()
+                    assert 'Public account identity confirmed' in page.locator('#account-profile').inner_text()
+                    assert '1234' in page.locator('#account-profile').inner_text()
+                    page.get_by_role('button',name='Copy Username',exact=True).click()
+                    page.wait_for_function("document.querySelector('[aria-label=\"Copy Username\"]').textContent==='Copied'")
                     assert page.evaluate("getComputedStyle(document.getElementById('account-videos')).gridTemplateColumns.split(' ').length===5")
                     page.set_viewport_size({'width':1920,'height':1050})
                     assert page.evaluate("getComputedStyle(document.getElementById('account-videos')).gridTemplateColumns.split(' ').length===6")

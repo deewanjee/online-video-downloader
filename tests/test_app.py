@@ -2529,3 +2529,60 @@ def test_account_seed_rejects_unrecognized_share_urls(tiktok_accounts,url):
     response=client.post('/api/tiktok/loads',json={'account':'creator','seed_url':url})
     assert response.status_code==400,response.text
     assert not tiktok_accounts.tasks
+
+
+def test_account_seed_numeric_user_id_uses_verified_profile_username(tiktok_accounts,monkeypatch):
+    calls=fake_tiktok(monkeypatch,[tik_entry(1)],{tik_entry(1)['id']:{'formats':[{'vcodec':'h264'}],
+        'uploader_id':'1234567890123456789','uploader_url':'https://www.tiktok.com/@Creator',
+        'uploader':'Creator display name','channel_id':'MS4wLjABAAAA'+'A'*64}})
+    direct=client.post('/api/tiktok/loads',json={'account':'creator','seed_url':'https://www.tiktok.com/@creator/video/'+tik_entry(1)['id']})
+    task=client.get('/api/tiktok/tasks/'+direct.json()['id']).json()
+    assert task['status']=='ready'
+    assert task['profile']['username']=='Creator' and task['profile']['identity_verified']
+    assert task['profile']['user_id']=='1234567890123456789'
+    assert task['profile']['display_name']=='Creator display name'
+    preview=client.get('/api/tiktok/previews/'+task['token']).json()
+    assert preview['profile']==task['profile']
+
+
+def test_profile_collected_before_listing_failure_is_reviewable(tiktok_accounts,monkeypatch):
+    def extract(dl,url,download=False):
+        dl.params['_aaasoft_profile']({'user':{'uniqueId':'creator','nickname':'Public name','signature':'Public bio',
+            'id':'123456789','secUid':'MS4wLjABAAAA'+'A'*64,'verified':True,'privateAccount':False,
+            'avatarLarger':'https://p16.tiktokcdn.com/avatar.jpg'},'stats':{'followerCount':'1234','followingCount':12,'videoCount':25,'heartCount':9000}})
+        raise main.yt_dlp.utils.DownloadError('Unable to download API page: HTTP Error 403')
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    task=account_load()
+    assert task['status']=='failed' and not task['token']
+    profile=task['profile']
+    assert profile['identity_verified'] and profile['followers']==1234 and profile['video_count']==25
+    assert profile['display_name']=='Public name' and profile['private'] is False and profile['verified'] is True
+
+
+def test_profile_ignores_wrong_identity_and_never_invents_counts(tiktok_accounts):
+    from app.accounts import profile_details,video_username
+    assert profile_details({'user':{'uniqueId':'other'}},'creator') is None
+    profile=profile_details({'user':{'uniqueId':'creator','avatarLarger':'https://evil.test/avatar'},
+        'stats':{'followerCount':-1,'heartCount':True,'videoCount':'not known'}},'creator')
+    assert profile['avatar'] is None and profile['followers'] is None and profile['likes'] is None and profile['video_count'] is None
+    assert video_username({'uploader_id':'123456789'}) is None
+    assert video_username({'uploader_url':'https://evil.test/@creator','uploader_id':'123456789'}) is None
+    assert video_username({'uploader_url':'https://www.tiktok.com/@other','uploader_id':'creator'})=='other'
+
+
+def test_profile_extractor_reuses_existing_profile_page_without_extra_requests(monkeypatch):
+    from app.tiktok_profile import TikTokProfileIE
+    captured=[];requests=[]
+    data={'__DEFAULT_SCOPE__':{'webapp.user-detail':{'userInfo':{'user':{'uniqueId':'creator','secUid':'MS4wLjABAAAA'+'A'*64},'stats':{'videoCount':2}}}}}
+    import json
+    with main.video_downloader(main.options()|{'_aaasoft_profile':captured.append}) as dl:
+        extractor=dl.get_info_extractor('TikTokProfile')
+        assert isinstance(extractor,TikTokProfileIE)
+        def page(url,*args,**kwargs):
+            requests.append(url)
+            return '<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">'+json.dumps(data)+'</script>'
+        monkeypatch.setattr(extractor,'_download_webpage',page)
+        monkeypatch.setattr(extractor,'_entries',lambda *args:iter([]))
+        result=extractor._real_extract('https://www.tiktok.com/@creator')
+    assert result['_type']=='playlist' and len(requests)==1
+    assert captured[0]['user']['uniqueId']=='creator'

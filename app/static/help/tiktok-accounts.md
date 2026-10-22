@@ -12,8 +12,9 @@ List public account videos, review availability and download a selection.
 
 1. Choose TikTok and enter @username, username, or https://www.tiktok.com/@username. Use the account username, not a display name or individual video URL.
 2. If account-ID lookup fails, expand Optional: assist account lookup with a public video. Paste a public video URL or a vt.tiktok.com / vm.tiktok.com share link from the same username. Supported short links are resolved by the video extractor before the actual uploader is checked. The video metadata must confirm that uploader and a supported public account ID; this does not bypass account access restrictions.
-3. Choose Load & check account. Listing is metadata-only: it does not download media files. Availability checks run sequentially in the background; the progress indicator shows how many entries have been classified.
-4. The list becomes visible while checks continue. Only Available - checked video entries are selectable; unknown, private, removed, live and non-video posts cannot be queued. Availability can change after checking.
+3. Choose Load & check account. The account details panel shows the public display name, username, bio, IDs and counters supplied by TikTok, with Copy buttons and Copy account details. Missing fields say Not provided; source counts are not guaranteed downloadable totals. A confirmed identity is used automatically, so manually copying IDs into another field is unnecessary. If listing fails after profile metadata arrives, the available details remain visible.
+4. Listing is metadata-only: it does not download media files. Availability checks run sequentially in the background; the progress indicator shows how many entries have been classified.
+5. The list becomes visible while checks continue. Only Available - checked video entries are selectable; unknown, private, removed, live and non-video posts cannot be queued. Availability can change after checking.
 
 ## Review and select
 

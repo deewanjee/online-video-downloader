@@ -42,6 +42,41 @@ def cover(value):
     return None
 
 
+def video_username(info):
+    # yt-dlp uploader_id is normally a numeric user ID, NOT the @username.
+    value=info.get('uploader_url')
+    if isinstance(value,str):
+        try:return profile_url(value).rsplit('@',1)[-1]
+        except HTTPException:pass
+    value=info.get('uploader_id')
+    if isinstance(value,str) and not value.isdigit():
+        try:return profile_url(value).rsplit('@',1)[-1]
+        except HTTPException:pass
+    return None
+
+
+def profile_details(data,expected):
+    user=data.get('user') if isinstance(data,dict) else None
+    if not isinstance(user,dict):return None
+    username=user.get('uniqueId')
+    if not isinstance(username,str) or username.casefold()!=expected.casefold():return None
+    try:url=profile_url(username)
+    except HTTPException:return None
+    stats=data.get('statsV2') or data.get('stats') or {}
+    if not isinstance(stats,dict):stats={}
+    result={'username':username,'profile_url':url,'identity_verified':True,'checked_at':time.time(),
+            'display_name':str(user.get('nickname') or '')[:200],'bio':str(user.get('signature') or '')[:2000],
+            'avatar':cover(user.get('avatarLarger')) or cover(user.get('avatarMedium')),
+            'user_id':str(user.get('id') or '')[:100],'account_id':str(user.get('secUid') or '')[:150],
+            'verified':user.get('verified') if isinstance(user.get('verified'),bool) else None,
+            'private':user.get('privateAccount') if isinstance(user.get('privateAccount'),bool) else None}
+    for key,field in [('followers','followerCount'),('following','followingCount'),('likes','heartCount'),('video_count','videoCount')]:
+        value=stats.get(field)
+        if isinstance(value,str) and value.isdigit() and len(value)<20:value=int(value)
+        result[key]=value if isinstance(value,int) and not isinstance(value,bool) and 0<=value<10**19 else None
+    return result
+
+
 def video_state(info):
     state=availability.checked(info)
     if state['status']=='available' and not any(isinstance(f,dict) and f.get('vcodec') not in (None,'none') for f in (info or {}).get('formats',[]) or []):
@@ -138,6 +173,13 @@ class AccountManager:
     def run(self,id,url,offset,token,all_entries,seed_url=None):
         task=self.tasks[id];event=task['cancel'];cache=None;terminal='ready';detail=None
         manager=self
+        username=url.rsplit('@',1)[-1]
+        def receive_profile(data):
+            profile=profile_details(data,username)
+            if profile:
+                with self.lock:task['profile']=profile
+        with self.lock:
+            task['profile']={'username':username,'profile_url':url,'identity_verified':False}
         def checkpoint():
             if event.is_set():raise source_access.SourceCancelled()
             if time.monotonic()-task['created']>1800:raise HTTPException(408,'Account checks reached the 30-minute time limit. Checked entries remain reviewable; recheck unverified entries later.')
@@ -154,13 +196,15 @@ class AccountManager:
             if not token:
                 logger=Logger()
                 settings=self.main.options()|{'logger':logger,'noplaylist':False,'extract_flat':'in_playlist','lazy_playlist':True,
-                    'playliststart':offset+1,'playlistend':offset+BATCH+1,'ignoreerrors':False,'socket_timeout':20,'retries':1,'extractor_retries':1,'sleep_interval_requests':1}
+                    '_aaasoft_profile':receive_profile,'playliststart':offset+1,'playlistend':offset+BATCH+1,'ignoreerrors':False,'socket_timeout':20,'retries':1,'extractor_retries':1,'sleep_interval_requests':1}
                 entries=[]
                 extract_url=url
                 if seed_url:
                     seed=self.main.extract_video(seed_url,False,self.main.options()|{'logger':logger,'socket_timeout':20,'retries':1,'extractor_retries':1}) or {}
                     username=url.rsplit('@',1)[-1]
-                    if str(seed.get('uploader_id') or '').removeprefix('@').casefold()!=username.casefold():raise HTTPException(422,'The public video metadata did not confirm this account username. Use a direct video link from the same account.')
+                    actual=video_username(seed)
+                    if not actual or actual.casefold()!=username.casefold():raise HTTPException(422,'The public video belongs to @'+actual+' rather than @'+username+'. Use a video from the same account.' if actual else 'TikTok did not expose a verifiable username for this video. The numeric user ID alone cannot confirm the account.')
+                    receive_profile({'user':{'uniqueId':actual,'nickname':seed.get('uploader'),'id':seed.get('uploader_id'),'secUid':seed.get('channel_id')}})
                     secondary=seed.get('channel_id')
                     if not isinstance(secondary,str) or not re.fullmatch(r'MS4wLjABAAAA[A-Za-z0-9_-]{64}',secondary):raise HTTPException(422,'The public video did not provide a supported account ID. Account listing is unavailable from this source response.')
                     extract_url='tiktokuser:'+secondary
@@ -183,7 +227,7 @@ class AccountManager:
                     self.clean()
                     if len(self.previews)>=10:self.previews.pop(next(iter(self.previews)))
                     cache={'created':time.monotonic(),'busy':True,'submissions':{},'url':url,'username':username,'title':str(info.get('title') or '@'+username)[:200],
-                           'rows':rows,'offset':offset,'has_more':len(entries)>BATCH}
+                           'profile':task.get('profile'),'rows':rows,'offset':offset,'has_more':len(entries)>BATCH}
                     self.previews[token]=cache;task.update(token=token,total=len(rows),phase='checking')
             else:
                 with self.lock:cache=self.preview(token);task['total']=len(cache['rows'])
@@ -265,7 +309,7 @@ def register(main):
         with manager.lock:
             item=manager.tasks.get(id)
             if not item:raise HTTPException(404,'TikTok account task expired.')
-            return {key:item[key] for key in ('id','status','phase','checked','total','entries','token','detail') if key in item}
+            return {key:item[key] for key in ('id','status','phase','checked','total','entries','token','detail','profile') if key in item}
 
     @app.delete('/api/tiktok/tasks/{id}',status_code=204)
     def cancel(id:str):
@@ -278,7 +322,7 @@ def register(main):
         if page<1 or page>100000 or size not in (30,60,100) or len(q)>200 or status not in ('all','available','downloaded','unavailable','unknown'):raise HTTPException(400,'Invalid TikTok list filter or page.')
         with manager.lock:
             cache=manager.preview(token);rows,counts=manager.filtered(cache,q,status)
-            return {'token':token,'title':cache['title'],'account':cache['username'],'offset':cache['offset'],'has_more':cache['has_more'],'busy':cache['busy'],'submitted':False,'submitted_batches':len(cache['submissions']),
+            return {'profile':cache.get('profile'),'token':token,'title':cache['title'],'account':cache['username'],'offset':cache['offset'],'has_more':cache['has_more'],'busy':cache['busy'],'submitted':False,'submitted_batches':len(cache['submissions']),
                     'rows':rows[(page-1)*size:page*size],'total':len(rows),'counts':counts,'page':page,'size':size}
 
     @app.get('/api/tiktok/previews/{token}/selection')

@@ -6,6 +6,12 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## TikTok account details and identity fix (3.5.0)
+
+Username lookup now displays an **Account details** panel while loading videos. Public name, bio, username/profile URL, numeric user ID, source account ID, follower/following/like/video counts and verification/private flags appear when TikTok supplies them. Each field and the full details can be copied; IDs are used automatically. Missing fields say **Not provided**, and a requested profile link is clearly distinguished from a source-confirmed identity. Details already returned remain reviewable if subsequent video listing fails. Counts do not guarantee a matching number of downloadable videos.
+
+Fixed assisted lookup rejecting legitimate posts: yt-dlp's `uploader_id` is usually a **numeric user ID**, so the helper now matches the username from the source-provided `uploader_url`. A different/missing identity still prevents importing another account. The profile metadata is captured from the page the existing extractor already reads, without another lookup request. TikTok IP/authentication restrictions still apply; no successful live account listing from this cloud is claimed. See [verification](reports/tiktok-profile-v35.md).
+
 ## TikTok share-link fix (3.4.1)
 
 The optional account-lookup video now accepts `vt.tiktok.com`, `vm.tiktok.com` and `tiktok.com/t/` share links as well as direct post URLs. The existing TikTok extractor resolves a supported share link and verifies the actual uploader before listing the requested account. Unknown aliases must be opened in a browser to copy the final video URL; do not change their hostname manually. An account-listing failure no longer displays a misleading `Checks failed · 0 / 0` counter. Source IP/verification restrictions may still prevent listing. This fixes URL validation, not TikTok access restrictions.
