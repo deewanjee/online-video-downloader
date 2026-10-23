@@ -32,6 +32,8 @@ def video_key(url):
             identity = path.split('/')[-1]
     elif platform == 'TikTok' and re.search(r'/video/[0-9]{6,25}/?$',parsed.path):
         identity=path.split('/video/',1)[-1].strip('/')
+    elif platform == 'Instagram' and re.fullmatch(r'(?:p|reel|tv)/[A-Za-z0-9_-]{1,64}',path):
+        identity=path.split('/')[1]
     elif platform == 'X / Twitter' and '/status/' in '/' + path:
         identity = path.split('/status/', 1)[-1].split('/')[0]
     elif platform == 'Facebook':
@@ -48,6 +50,12 @@ def video_key(url):
 
 def video_keys(url):
     key=video_key(url)
+    if platform_name(url)=='Instagram':
+        parsed=urlparse(url);path=parsed.path.strip('/')
+        if re.fullmatch(r'(?:p|reel|tv)/[A-Za-z0-9_-]{1,64}',path):
+            code=path.split('/')[1]
+            return tuple(dict.fromkeys([key]+[hashlib.sha256(('Instagram:'+kind+'/'+code+'?').encode()).hexdigest() for kind in ('p','reel','tv')]))
+        return (key,)
     if platform_name(url)!='TikTok':return (key,)
     parsed=urlparse(url);query=parse_qs(parsed.query)
     meaningful={k:v for k,v in query.items() if k in ('v','id','story_fbid')}

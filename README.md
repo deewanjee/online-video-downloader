@@ -6,6 +6,14 @@ AAASoft-branded browser video downloader with a professional download workbench 
 
 The screenshot uses local test media and demonstration thumbnails; it does not represent live platform downloads.
 
+## Instagram account workspace and regression review (3.8.0)
+
+Platforms → Instagram now accepts an **@username or profile URL** and offers source-confirmed profile details, explicit public/private/unknown privacy, bounded post batches, video availability checks, filters, pagination, selection and download progress. Reels and single-video posts use the existing folder, queue, local player, recovery, completed archive, lifetime counters and activity log. Photos and carousel posts are shown as unsupported, rather than being submitted as broken single-video downloads. Instagram and TikTok maintain separate tasks, previews and selections.
+
+Duplicate protection now recognizes equivalent Instagram `/p/`, `/reel/` and `/tv/` URLs, including legacy retained completion records. YouTube analysis also tolerates metadata with a null format list instead of returning a server error. The existing YouTube/TikTok browser flows were regression-tested after the shared workspace refactor.
+
+**Live access limitation:** a bounded unauthenticated Instagram check from this environment returned **HTTP 401**. Public profile/feed access is therefore not confirmed here. This is shown as an authentication requirement, not a private account or a successful empty list. Optional authorized desktop sessions use `AAASOFT_INSTAGRAM_COOKIE_FILE`, separate from YouTube cookies; public server mode rejects this option. No private-account enumeration, carousel extraction, authenticated live access or universal platform availability is claimed. See [the English Instagram guide](app/static/help/instagram-accounts.md) and [verification report](reports/instagram-workspace-v38.md).
+
 ## Username/profile-first TikTok account lookup (3.7.0)
 
 A TikTok username or profile link is now the primary workflow; users do not need to find a video first. Inspection of `@gamingpclahore` found that TikTok returned a small native JavaScript challenge page instead of profile metadata. The upstream video extractor handles this challenge, but the username path previously read the challenge page as if it were the profile and failed to find its account ID.

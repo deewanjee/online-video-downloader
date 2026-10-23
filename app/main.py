@@ -26,6 +26,7 @@ from app import __version__
 from app.auth import AccessControl
 from app.threads import ThreadsIE
 from app.tiktok_profile import TikTokProfileIE
+from app.instagram_profile import InstagramProfileIE, session_settings as instagram_session_settings
 from app import source_access
 from app import destinations, recovery, discovery, availability
 from app.deferred import DeferredDownloads
@@ -43,6 +44,7 @@ async def lifespan(application):
         stop_playlist_loads()
         stop_previews()
         account_manager.stop()
+        instagram_manager.stop()
 
 
 app = FastAPI(title='AAASoft Video Studio', version=__version__, lifespan=lifespan)
@@ -135,6 +137,7 @@ def video_downloader(settings):
     downloader = yt_dlp.YoutubeDL(settings, auto_init=False)
     downloader.add_info_extractor(ThreadsIE())
     downloader.add_info_extractor(TikTokProfileIE())
+    downloader.add_info_extractor(InstagramProfileIE())
     downloader.add_default_info_extractors()
     return downloader
 
@@ -144,6 +147,7 @@ def extract_video(url, download, settings):
     playlist_cancel = settings.pop('_playlist_cancel', None)
     phase = settings.pop('_playlist_phase', None)
     if not source_access.youtube_url(url):
+        if storage.platform_name(url)=='Instagram':settings=instagram_session_settings(settings)
         with video_downloader(settings) as dl:
             return dl.extract_info(url, download=download)
     if phase:
@@ -305,10 +309,13 @@ def download_error(exc):
     if isinstance(exc, (source_access.SourceRateLimited, source_access.SourceBusy)):
         return str(exc)
     known_errors = ('Choose individual, non-live video links. Playlists and channels are not supported by the bulk queue.', 'The downloaded file is not valid media.', 'The source has no video track. Choose an audio format instead.', 'The source has no audio track. Choose a video format instead.',
-                    'The configured session cookie file is missing. Check STREAMVAULT_COOKIE_FILE locally.', 'Session cookies are available only in local desktop mode.')
+                    'The configured session cookie file is missing. Check STREAMVAULT_COOKIE_FILE locally.', 'Session cookies are available only in local desktop mode.',
+                    'Instagram session cookies are available only in local desktop mode.', 'The local Instagram session cookie file is missing. Check AAASOFT_INSTAGRAM_COOKIE_FILE locally.')
     for error in known_errors:
         if message == error.lower():
             return error
+    if re.search(r'http(?: error)?[ :=]+401\b',message):
+        return 'The source requires an authorized login session (HTTP 401). For Instagram, see Help → Instagram accounts for local session setup.'
     if 'netscape format cookies file' in message or 'failed to load cookies' in message:
         return 'The local session cookie file could not be read. Export a valid Netscape-format cookie file and check its permissions.'
     if 'ip address is blocked' in message:
@@ -508,9 +515,9 @@ def analyze(req: VideoRequest):
         info = extract_video(req.url, False, options())
         if not info or info.get('_type') in ('playlist', 'multi_video') or info.get('is_live'):
             raise HTTPException(400, 'Please choose a single, non-live video.')
-        heights = sorted({f['height'] for f in info.get('formats', []) if f.get('height') and f.get('vcodec') != 'none'}, reverse=True)
+        heights = sorted({f['height'] for f in (info.get('formats') or []) if isinstance(f,dict) and f.get('height') and f.get('vcodec') != 'none'}, reverse=True)
         result = {'title': info.get('title', 'Untitled video'), 'author': info.get('uploader', 'Unknown creator'), 'duration': info.get('duration'), 'thumbnail': info.get('thumbnail'), 'platform': info.get('extractor_key'), 'qualities': heights, 'url': req.url}
-        if storage.platform_name(req.url)=='TikTok':
+        if storage.platform_name(req.url) in ('TikTok','Instagram'):
             from app.accounts import video_visibility, video_state
             result.update(video_visibility(info));result['can_download']=video_state(info)['status']=='available'
         result['source_key']=storage.video_key(req.url)
@@ -526,7 +533,7 @@ def analyze(req: VideoRequest):
         raise HTTPException(429, str(exc), headers={'Retry-After': str(exc.retry_after)})
     except Exception as exc:
         message=download_error(exc)
-        if storage.platform_name(req.url)=='TikTok':
+        if storage.platform_name(req.url) in ('TikTok','Instagram'):
             from app.accounts import video_visibility
             privacy=video_visibility(error=exc)['visibility']
             if privacy=='private':message='TikTok reports that this video is private. Public access is unavailable.'
@@ -1518,3 +1525,6 @@ def export_activity(format:Literal['csv','json']='csv'):
 import sys
 from app import accounts
 account_manager=accounts.register(sys.modules[__name__])
+
+from app.instagram_accounts import InstagramManager, InstagramQueueRequest
+instagram_manager=accounts.register(sys.modules[__name__],"instagram",InstagramManager(sys.modules[__name__]),InstagramQueueRequest)

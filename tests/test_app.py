@@ -2886,3 +2886,170 @@ def test_numeric_user_id_resolves_only_when_source_id_matches(tiktok_accounts,mo
     assert '/@creator/video/' in data['rows'][0]['url']
     from app.accounts import profile_details
     assert profile_details({'user':{'uniqueId':'someone_else','id':'987654321'}},'123456789') is None
+
+
+@pytest.fixture
+def instagram_accounts(monkeypatch):
+    manager=main.instagram_manager
+    class Immediate:
+        def submit(self,fn,*args):fn(*args)
+    monkeypatch.setattr(manager,'tasks',{})
+    monkeypatch.setattr(manager,'previews',{})
+    monkeypatch.setattr(manager,'until',0)
+    monkeypatch.setattr(manager,'pool',Immediate())
+    monkeypatch.setattr(main.pool,'submit',lambda *a:None)
+    return manager
+
+
+def fake_instagram(monkeypatch,entries,checks=None,private=False):
+    calls=[]
+    def extract(dl,url,download=False,process=True):
+        calls.append((url,download,dl.params))
+        if url=='https://www.instagram.com/creator/':
+            if dl.params.get('_aaasoft_profile'):dl.params['_aaasoft_profile']({'username':'creator','id':'12345','full_name':'Instagram Creator','is_private':private,'edge_owner_to_timeline_media':{'count':len(entries)}})
+            if private:raise main.yt_dlp.utils.DownloadError('Instagram account is private.')
+            return {'_type':'playlist','entries':entries}
+        outcome=(checks or {}).get(url.rstrip('/').rsplit('/',1)[-1],{'formats':[{'vcodec':'h264','height':720}]})
+        if isinstance(outcome,Exception):raise outcome
+        return outcome
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',extract)
+    return calls
+
+
+def instagram_load(**extras):
+    result=client.post('/api/instagram/loads',json={'account':'@creator',**extras})
+    assert result.status_code==202,result.text
+    return client.get('/api/instagram/tasks/'+result.json()['id']).json()
+
+
+@pytest.mark.parametrize('value',['bad name','@creator.','a..b','https://evil.test/creator','https://www.instagram.com.evil.test/creator','https://user:secret@instagram.com/creator','https://instagram.com:8080/creator','https://instagram.com/p/CODE/','https://instagram.com/accounts/login/','https://instagram.com/reels/'])
+def test_instagram_account_input_rejects_wrong_or_untrusted_profiles(instagram_accounts,value):
+    assert client.post('/api/instagram/loads',json={'account':value}).status_code==400
+
+
+def test_instagram_checked_profile_filters_selection_history_and_queue(instagram_accounts,monkeypatch):
+    calls=fake_instagram(monkeypatch,[{'id':'PostA','media_type':2},{'id':'PhotoB','media_type':1},{'id':'CarouselC','media_type':8},{'id':'PrivateD','availability':'private'},{'id':'PostE','media_type':2}])
+    task=instagram_load();assert task['status']=='ready'
+    assert task['profile']['identity_verified'] and task['account_visibility']['status']=='public'
+    token=task['token'];url='/api/instagram/previews/'+token
+    rows=client.get(url).json()['rows']
+    assert [r['status'] for r in rows]==['available','unsupported','unsupported','private','available']
+    assert [c[0] for c in calls]==['https://www.instagram.com/creator/','https://www.instagram.com/p/PostA/','https://www.instagram.com/p/PostE/']
+    assert all(c[1] is False for c in calls)
+    assert rows[0]['provider']=='instagram'
+    main.storage.save(main.DATA,{'id':'ig-history','url':'https://www.instagram.com/reel/PostA/?igsh=tracking','title':'Saved','status':'completed','created':1})
+    main.storage.delete(main.DATA,'ig-history')
+    assert client.get(url+'/selection').json()['ids']==['PostE']
+    assert client.get(url+'?status=downloaded').json()['total']==1
+    rejected=client.post(url+'/download',json={'video_ids':['PhotoB']})
+    assert rejected.status_code==400
+    payload={'video_ids':['PostA','PostE'],'request_id':'instagram-batch-1'}
+    queued=client.post(url+'/download',json=payload)
+    assert queued.status_code==202 and queued.json()['added']==1 and queued.json()['duplicates_removed']==1
+    assert client.post(url+'/download',json=payload).json()['jobs']==queued.json()['jobs']
+    assert len(main.jobs)==1
+    # TikTok's private preview tokens cannot be used in the other workspace.
+    assert client.get('/api/tiktok/previews/'+token).status_code==410
+    log=client.get('/api/activity/export?format=json').text
+    assert 'https://www.instagram.com/p/PostE/' in log
+
+
+def test_instagram_private_account_is_confirmed_without_listing(instagram_accounts,monkeypatch):
+    fake_instagram(monkeypatch,[],private=True)
+    task=instagram_load()
+    assert task['status']=='failed' and task['account_visibility']['status']=='private' and not task.get('token')
+
+
+def test_instagram_auth_failure_keeps_unverified_entries_and_stops_checks(instagram_accounts,monkeypatch):
+    calls=fake_instagram(monkeypatch,[{'id':'A1'},{'id':'B2'}],{'A1':main.yt_dlp.utils.DownloadError('HTTP Error 401: Unauthorized')})
+    task=instagram_load();assert task['status']=='failed' and task['issue_code']=='authentication'
+    assert len(calls)==2
+    rows=client.get('/api/instagram/previews/'+task['token']).json()['rows']
+    assert all(r['status']=='unknown' and not r['selectable'] for r in rows)
+    assert 'login session' in task['detail']
+
+
+def test_instagram_batch_offset_and_recheck_do_not_queue_photos(instagram_accounts,monkeypatch):
+    calls=fake_instagram(monkeypatch,[{'id':'A1'},{'id':'Photo2','media_type':1},{'id':'B3'},{'id':'C4'}])
+    task=instagram_load(offset=1,batch_size=2);token=task['token']
+    data=client.get('/api/instagram/previews/'+token).json()
+    assert [r['id'] for r in data['rows']]==['Photo2','B3'] and data['has_more']
+    client.post('/api/instagram/previews/'+token+'/checks',json={'all_entries':True})
+    assert not any('/Photo2/' in c[0] for c in calls)
+    assert client.get('/api/instagram/previews/'+token+'/selection').json()['ids']==['B3']
+
+
+def test_instagram_profile_adapter_paginates_in_one_session(monkeypatch):
+    from app.instagram_profile import InstagramProfileIE
+    requests=[];profiles=[]
+    user={'username':'creator','id':'12345','is_private':False}
+    def json(ie,url,username,**kwargs):
+        requests.append((url,kwargs))
+        if 'web_profile_info' in url:return {'data':{'user':user}}
+        if kwargs['query'].get('max_id')=='next':return {'items':[{'code':'PostB','media_type':2}],'more_available':False}
+        return {'items':[{'code':'PostA','media_type':2}],'more_available':True,'next_max_id':'next'}
+    monkeypatch.setattr(InstagramProfileIE,'_download_json',json)
+    with main.video_downloader(main.options()|{'_aaasoft_profile':profiles.append}) as dl:
+        result=dl.extract_info('https://www.instagram.com/creator/',download=False,process=False)
+        assert [r['id'] for r in result['entries']]==['PostA','PostB']
+    assert profiles==[user] and len(requests)==3
+    for _,settings in requests:
+        assert settings['impersonate'] and settings['require_impersonation']
+        assert settings['headers']['Referer']=='https://www.instagram.com/creator/'
+        assert settings['headers']['X-IG-App-ID']
+
+
+@pytest.mark.parametrize('case',['wrong_account','private','login','cursor'])
+def test_instagram_profile_adapter_rejects_invalid_source_state(monkeypatch,case):
+    from app.instagram_profile import InstagramProfileIE
+    def json(ie,url,*args,**kwargs):
+        if case=='login':return {'message':'login_required'}
+        if 'web_profile_info' in url:return {'data':{'user':{'username':'someoneelse' if case=='wrong_account' else 'creator','id':'12345','is_private':case=='private'}}}
+        return {'items':[{'code':'PostA'}],'more_available':True,'next_max_id':'repeat'}
+    monkeypatch.setattr(InstagramProfileIE,'_download_json',json)
+    with main.video_downloader(main.options()) as dl:
+        with pytest.raises(main.yt_dlp.utils.ExtractorError):
+            result=InstagramProfileIE(dl)._real_extract('https://www.instagram.com/creator/')
+            list(result['entries'])
+
+
+def test_instagram_session_is_local_opt_in_only(tmp_path,monkeypatch):
+    from app.instagram_profile import session_settings
+    monkeypatch.delenv('AAASOFT_INSTAGRAM_COOKIE_FILE',raising=False)
+    assert session_settings({'quiet':True})=={'quiet':True}
+    cookie=tmp_path/'local-session.txt';cookie.write_text('# Netscape HTTP Cookie File\n')
+    monkeypatch.setenv('AAASOFT_INSTAGRAM_COOKIE_FILE',str(cookie))
+    monkeypatch.setenv('STREAMVAULT_PUBLIC','true')
+    with pytest.raises(RuntimeError,match='local desktop'):session_settings({})
+    monkeypatch.delenv('STREAMVAULT_PUBLIC')
+    assert session_settings({})['cookiefile']==str(cookie)
+    assert 'cookiefile' not in client.get('/api/health').text
+
+
+def test_instagram_equivalent_post_urls_share_identity():
+    from app import storage
+    urls=['https://www.instagram.com/'+kind+'/Ab_CD-12/?igsh=share' for kind in ('p','reel','tv')]
+    assert len({storage.video_key(url) for url in urls})==1
+    assert storage.video_key(urls[0])!=storage.video_key('https://www.instagram.com/p/Different/')
+    import hashlib
+    legacy=hashlib.sha256(b'Instagram:reel/Ab_CD-12?').hexdigest()
+    assert storage.history_count({legacy:2},urls[0])==2
+
+
+def test_analysis_accepts_missing_format_list(monkeypatch):
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',lambda *a,**k:{'title':'Metadata only','formats':None})
+    assert client.post('/api/analyze',json={'url':'https://youtu.be/abcdefghijk'}).json()['qualities']==[]
+
+
+def test_single_instagram_analysis_requires_video_stream(monkeypatch):
+    monkeypatch.setattr(main.yt_dlp.YoutubeDL,'extract_info',lambda *a,**k:{'title':'No video','formats':None})
+    response=client.post('/api/platform/instagram/analyze',json={'url':'https://www.instagram.com/p/SomePost/'})
+    assert response.status_code==200 and response.json()['can_download'] is False
+    assert response.json()['visibility']=='unknown'
+
+
+def test_instagram_help_is_separate_and_explains_source_limits():
+    page=client.get('/help/instagram-accounts')
+    assert page.status_code==200
+    assert 'AAASOFT_INSTAGRAM_COOKIE_FILE' in page.text and 'HTTP 401' in page.text
+    assert 'carousel' in page.text

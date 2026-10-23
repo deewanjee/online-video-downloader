@@ -35,6 +35,12 @@ def serve(port):
 
     def extracted(dl, url, download=False, process=True):
         if not download:
+            if url=='https://www.instagram.com/creator/':
+                if dl.params.get('_aaasoft_profile'):dl.params['_aaasoft_profile']({'username':'creator','id':'12345','full_name':'Instagram fixture creator','is_private':False,'edge_followed_by':{'count':456},'edge_owner_to_timeline_media':{'count':33}})
+                return {'_type':'playlist','title':'Instagram fixture creator','entries':[{'id':f'IgPost{i}','title':f'Instagram creator post {i}','media_type':1 if i==2 else 2,'thumbnail':'https://scontent.cdninstagram.com/fixture.jpg','duration':4} for i in range(1,34)]}
+            if url.startswith('https://www.instagram.com/p/'):
+                if '/IgPost3/' in url:raise main.yt_dlp.utils.DownloadError('Private video')
+                return {'title':'Instagram fixture video','formats':[{'vcodec':'h264','acodec':'aac','height':180}],'duration':4}
             if url=='https://vt.tiktok.com/Fixture123/':return {'uploader_url':'https://www.tiktok.com/@creator','uploader_id':'123456789','channel_id':'MS4wLjABAAAA'+'A'*64,'formats':[{'vcodec':'h264'}]}
             if 'tiktok.com/@blockedcreator' in url:raise main.yt_dlp.utils.DownloadError('Unable to extract secondary user ID')
             if 'tiktok.com/@' in url or url.startswith('tiktokuser:'):
@@ -104,7 +110,7 @@ def verify():
         env = os.environ.copy()
         env.update(DISCOVERY_TEST_ROOT=td, DOWNLOAD_DIR=str(Path(td)/'data'),
                    STREAMVAULT_DESKTOP='1', PYTHONPATH=str(ROOT))
-        for name in ('STREAMVAULT_PUBLIC', 'STREAMVAULT_PASSWORD', 'STREAMVAULT_COOKIE_FILE'):
+        for name in ('STREAMVAULT_PUBLIC', 'STREAMVAULT_PASSWORD', 'STREAMVAULT_COOKIE_FILE', 'AAASOFT_INSTAGRAM_COOKIE_FILE'):
             env.pop(name, None)
         with open(Path(td)/'server.log', 'w') as log:
             process = subprocess.Popen([os.environ.get('AAASOFT_TEST_PYTHON', sys.executable),
@@ -134,6 +140,8 @@ def verify():
                     page.route('https://www.youtube-nocookie.com/embed/**', embed)
                     page.route('https://www.dailymotion.com/embed/video/**', embed)
                     page.route('https://www.tiktok.com/player/v1/**',embed)
+                    page.route('https://www.instagram.com/p/*/embed/',embed)
+                    page.route('https://scontent.cdninstagram.com/**',lambda route:route.fulfill(content_type='image/svg+xml',body='<svg xmlns="http://www.w3.org/2000/svg" width="200" height="160"><rect width="200" height="160" fill="#714a90"/></svg>'))
                     page.route('https://p16.tiktokcdn.com/**',lambda route:route.fulfill(content_type='image/svg+xml',body='<svg xmlns="http://www.w3.org/2000/svg" width="200" height="160"><rect width="200" height="160" fill="#3b6172"/></svg>'))
                     page.goto(base, wait_until='domcontentloaded')
                     page.locator('[data-view=discover]').click()
@@ -386,13 +394,49 @@ def verify():
                     page.locator('#source-tabs [data-source=instagram]').click()
                     assert page.locator('#source-panels [data-source=instagram]').is_visible()
                     assert not page.locator('#source-panels [data-source=tiktok]').is_visible()
+                    page.select_option('#ig-account-size','100')
+                    page.fill('#ig-account-name','@creator')
+                    page.click('#ig-account-load')
+                    page.wait_for_function("document.querySelector('#ig-account-status').textContent.includes('Checks complete')")
+                    assert page.locator('#ig-account-profile').get_by_text('Instagram fixture creator',exact=True).is_visible()
+                    assert page.locator('#ig-account-privacy').inner_text()=='Public account · source confirmed'
+                    assert page.locator('#ig-account-videos .account-card').count()==30
+                    assert page.locator('#ig-account-videos input[value=IgPost2]').is_disabled()
+                    assert page.locator('#ig-account-videos input[value=IgPost3]').is_disabled()
+                    assert page.locator('#ig-account-videos .account-card[data-video-id=IgPost2] .account-badge').inner_text()=='Photo post'
+                    assert page.locator('#account-name').input_value()=='@creator'
+                    igcard=page.locator('#ig-account-videos .account-card[data-video-id=IgPost1]')
+                    igcard.locator('.account-preview').click()
+                    page.wait_for_selector('#source-preview-dialog[open] iframe')
+                    assert '/p/IgPost1/embed/' in page.locator('#source-preview-dialog iframe').get_attribute('src')
+                    assert page.locator('#source-preview-download').is_hidden()
+                    page.click('#source-preview-close')
+                    page.locator('#ig-account-pagination').get_by_role('button',name='Next',exact=True).click()
+                    page.wait_for_selector('#ig-account-videos input[value=IgPost31]')
+                    page.locator('#ig-account-videos input[value=IgPost31]').check()
+                    page.locator('#ig-account-pagination').get_by_role('button',name='Previous',exact=True).click()
+                    page.wait_for_selector('#ig-account-videos input[value=IgPost1]')
+                    page.locator('#ig-account-videos input[value=IgPost1]').check()
+                    assert page.locator('#ig-account-selected').inner_text()=='2 selected'
+                    if screenshot:page.screenshot(path=str(Path(screenshot).with_name('instagram-account-v38.png')),full_page=True)
+                    page.click('#ig-account-queue')
+                    page.wait_for_function("fetch('/api/jobs').then(r=>r.json()).then(rows=>rows.filter(j=>j.url.includes('instagram.com') && j.status==='completed').length===2)",timeout=20000)
+                    page.wait_for_function("document.querySelector('#ig-account-videos .account-card[data-video-id=IgPost1] .account-badge').textContent.includes('Already downloaded')")
+                    assert page.locator('#ig-account-videos input[value=IgPost1]').is_disabled()
+                    page.set_viewport_size({'width':390,'height':844})
+                    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+                    page.set_viewport_size({'width':1440,'height':1000})
+                    page.locator('[data-source=instagram] .source-single').get_by_role('button',name='View Instagram completed videos').click()
+                    assert page.locator('#source-filter').input_value()=='Instagram'
+                    page.wait_for_function("document.querySelectorAll('#all-jobs .job.completed').length===2")
+                    page.locator('[data-view=sources]').click()
                     page.locator('#source-tabs [data-source=tiktok]').click()
                     assert page.locator('#account-name').input_value()=='@creator'
                     page.set_viewport_size({'width': 390, 'height': 844})
                     assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
                     assert not errors, errors
                     browser.close()
-                    print('PASS: TikTok account checks, source workspaces, account paging/selection/preview/history/saves, exact platform filter, archive, persistent duplicate prevention, playlist history, retained/exportable activity, restored compact typography, preview without queueing, frame teardown, individual queues, live progress, duplicate guard, merging, completion, failure, saved playback, paging/search reconciliation, history-only badge, embed allowlist and responsive width; no JavaScript errors.')
+                    print('PASS: Instagram account checks, photo/private exclusion, independent source state, paging/selection, embed, downloads and completion history; TikTok account checks, source workspaces, account paging/selection/preview/history/saves, exact platform filter, archive, persistent duplicate prevention, playlist history, retained/exportable activity, restored compact typography, preview without queueing, frame teardown, individual queues, live progress, duplicate guard, merging, completion, failure, saved playback, paging/search reconciliation, history-only badge, embed allowlist and responsive width; no JavaScript errors.')
             finally:
                 process.terminate()
                 try:

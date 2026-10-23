@@ -138,6 +138,7 @@ function discoveryEmbedURL(row) {
   if(row.provider==='youtube' && /^[A-Za-z0-9_-]{11}$/.test(row.id))return 'https://www.youtube-nocookie.com/embed/'+row.id+'?autoplay=1&playsinline=1&rel=0&origin='+encodeURIComponent(location.origin);
   if(row.provider==='dailymotion' && /^[A-Za-z0-9]{3,30}$/.test(row.id))return 'https://www.dailymotion.com/embed/video/'+row.id+'?autoplay=1';
   if(row.provider==='tiktok' && /^[0-9]{6,25}$/.test(row.id))return 'https://www.tiktok.com/player/v1/'+row.id+'?autoplay=1';
+  if(row.provider==='instagram' && /^[A-Za-z0-9_-]{1,64}$/.test(row.id))return 'https://www.instagram.com/p/'+row.id+'/embed/';
   return null;
 }
 function stopSourcePreview() {

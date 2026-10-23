@@ -110,6 +110,7 @@ def source_issue(error):
     if any(word in text for word in ('failed to parse json','expecting value','invalid json')):return 'invalid_response'
     if source_access.is_rate_limit(text):return 'rate_limit'
     if 'ip address is blocked' in text:return 'ip_block'
+    if re.search(r'(?:http(?: error)?|status)[ :=]+401\b',text) or any(x in text for x in ('requires login','login required','login_required')):return 'authentication'
     if re.search(r'(?:http(?: error)?|status)[ :=]+403\b',text):return 'access_denied'
     if account_visibility(None,error)['status']=='private':return 'private_account'
     if any(word in text for word in ('secondary user id','secuid','captcha','challenge','not a bot','verification')):return 'lookup_unavailable'
@@ -177,9 +178,19 @@ class AccountQueueRequest(BaseModel):
 
 
 class AccountManager:
+    provider="tiktok"
+    label="TikTok"
+    details=staticmethod(profile_details)
+    row=staticmethod(account_row)
+    cover=staticmethod(cover)
+
+    def username(self,url):return url.rsplit("@",1)[-1]
+
+    def settings(self):return self.main.options()
+
     def __init__(self,main):
         self.main=main;self.lock=threading.RLock();self.tasks={};self.previews={};self.until=0
-        self.pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix='tiktok-account')
+        self.pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix=self.provider+'-account')
 
     def stop(self):
         with self.lock:
@@ -196,8 +207,8 @@ class AccountManager:
     def start(self,url=None,offset=0,token=None,all_entries=False,seed_url=None,batch_size=None):
         with self.lock:
             self.clean()
-            if self.until>time.monotonic():raise HTTPException(429,'TikTok account requests are paused after rate/access blocking. Wait before loading or checking again.',headers={'Retry-After':str(math.ceil(self.until-time.monotonic()))})
-            if any(item['status'] in ('queued','running','cancelling') for item in self.tasks.values()):raise HTTPException(409,'A TikTok account load/check is already running. Finish or cancel it first.')
+            if self.until>time.monotonic():raise HTTPException(429,self.label+' account requests are paused after rate/access blocking. Wait before loading or checking again.',headers={'Retry-After':str(math.ceil(self.until-time.monotonic()))})
+            if any(item['status'] in ('queued','running','cancelling') for item in self.tasks.values()):raise HTTPException(409,'A '+self.label+' account load/check is already running. Finish or cancel it first.')
             if len(self.tasks)>=10:self.tasks.pop(next(iter(self.tasks)))
             if token:
                 cache=self.preview(token)
@@ -209,12 +220,12 @@ class AccountManager:
             with self.lock:
                 self.tasks.pop(id,None)
                 if token:cache['busy']=False
-            raise HTTPException(503,'TikTok account worker unavailable. Restart the app.')
+            raise HTTPException(503,self.label+' account worker unavailable. Restart the app.')
         return {'id':id,'status':'queued'}
 
     def preview(self,token):
         item=self.previews.get(token)
-        if not item or (not item['busy'] and time.monotonic()-item['created']>1800):raise HTTPException(410,'TikTok account preview expired. Load the account again.')
+        if not item or (not item['busy'] and time.monotonic()-item['created']>1800):raise HTTPException(410,self.label+' account preview expired. Load the account again.')
         return item
 
     def fail_message(self,error):
@@ -234,10 +245,10 @@ class AccountManager:
         limit=batch_size or BATCH
         manager=self
         issue_code=None;failure=None
-        username=url.rsplit('@',1)[-1] if url else None
+        username=self.username(url) if url else None
         def receive_profile(data):
             nonlocal username,url
-            profile=profile_details(data,username)
+            profile=self.details(data,username)
             if profile:
                 username=profile['username'];url=profile['profile_url']
                 with self.lock:task['profile']=profile;task['account_url']=url
@@ -258,7 +269,7 @@ class AccountManager:
             if event.is_set():raise source_access.SourceCancelled()
             if not token:
                 logger=Logger()
-                settings=self.main.options()|{'logger':logger,'noplaylist':False,'extract_flat':'in_playlist','lazy_playlist':True,
+                settings=self.settings()|{'logger':logger,'noplaylist':False,'extract_flat':'in_playlist','lazy_playlist':True,
                     '_aaasoft_profile':receive_profile,'check_formats':False,'playliststart':offset+1,'playlistend':offset+limit+1,'ignoreerrors':False,'socket_timeout':20,'retries':1,'extractor_retries':1,'sleep_interval_requests':1}
                 entries=[]
                 extract_url=url
@@ -282,7 +293,7 @@ class AccountManager:
                     downloader.params['_aaasoft_account_url']=url
                     with self.lock:task['stage']='account_listing' if seed_url else 'profile_lookup'
                     info=downloader.extract_info(extract_url,download=False,process=False)
-                    if not info or info.get('_type')!='playlist':raise HTTPException(422,'TikTok did not return an account video list. Use a public account username.')
+                    if not info or info.get('_type')!='playlist':raise HTTPException(422,self.label+' did not return an account video list. Use a public account username.')
                     downloader.params['_aaasoft_account_url']=url
                     with self.lock:task['stage']='account_listing'
                     for index,entry in enumerate(islice(info.get('entries') or [],offset+limit+1)):
@@ -291,11 +302,11 @@ class AccountManager:
                         if index<offset:continue
                         entries.append(entry)
                         with self.lock:task['entries']=min(len(entries),limit)
-                    if logger.saw_error:raise HTTPException(422,'TikTok did not finish listing this account. No incomplete list was queued. Try again later.')
-                username=url.rsplit('@',1)[-1]
+                    if logger.saw_error:raise HTTPException(422,self.label+' did not finish listing this account. No incomplete list was queued. Try again later.')
+                username=self.username(url)
                 rows=[];seen=set()
                 for position,entry in enumerate(entries[:limit],offset+1):
-                    row=account_row(entry,username,position)
+                    row=self.row(entry,username,position)
                     if row['id'] in seen:continue
                     seen.add(row['id']);rows.append(row)
                 token=uuid.uuid4().hex
@@ -309,18 +320,19 @@ class AccountManager:
                 with self.lock:cache=self.preview(token);task['total']=len(cache['rows'])
             for row in cache['rows']:
                 checkpoint()
-                if row['url'] and (all_entries or row['status']=='unknown'):
+                if row['url'] and row['status'] not in ('unsupported','invalid') and (all_entries or row['status']=='unknown'):
                     try:
-                        info=self.main.extract_video(row['url'],False,self.main.options()|{'logger':Logger(),'socket_timeout':20,'retries':1,'extractor_retries':1,'sleep_interval_requests':1})
+                        info=self.main.extract_video(row['url'],False,self.settings()|{'logger':Logger(),'socket_timeout':20,'retries':1,'extractor_retries':1,'sleep_interval_requests':1})
                         state=video_state(info)
                         state['selectable']=state['status']=='available'
                         with self.lock:
                             row.update(state,checked_at=time.time())
                             if info:
-                                row['thumbnail']=cover(info.get('thumbnail')) or row['thumbnail']
+                                row['thumbnail']=self.cover(info.get('thumbnail')) or row['thumbnail']
                     except source_access.SourceCancelled:raise
                     except Exception as exc:
                         issue=self.main.recovery.classify(exc)
+                        if self.provider=='instagram' and source_issue(exc) in ('authentication','access_denied','lookup_unavailable','invalid_response'):raise
                         if issue['code'] in ('rate_limit','network','proxy','storage') or any(x in str(exc).lower() for x in ('captcha','challenge','secondary user id','not a bot','ip address is blocked','http error 403')):raise
                         state=video_state(error=exc);state['selectable']=state['status']=='available'
                         with self.lock:row.update(state,checked_at=time.time())
@@ -363,11 +375,16 @@ class AccountManager:
         return [row for row in rows if matches(row)],counts
 
 
-def register(main):
-    manager=AccountManager(main);app=main.app
-    @app.post('/api/tiktok/loads',status_code=202)
+def register(main,provider="tiktok",manager=None,queue_model=AccountQueueRequest):
+    manager=manager or AccountManager(main);app=main.app
+    prefix="/api/"+provider
+    @app.post(prefix+'/loads',status_code=202)
     def load(req:AccountRequest):
         value=req.account.strip();seed=None
+        if provider=="instagram":
+            from app.instagram_profile import profile_url as instagram_url
+            if req.seed_url:raise HTTPException(400,"Use an Instagram username or profile URL; no helper video is needed.")
+            return manager.start(instagram_url(value),req.offset,batch_size=req.batch_size)
         try:url=profile_url(value)
         except HTTPException:
             seed=public_video_url(value);url=None
@@ -376,43 +393,43 @@ def register(main):
             seed=public_video_url(req.seed_url,url.rsplit('@',1)[-1])
         return manager.start(url,req.offset,seed_url=seed,batch_size=req.batch_size)
 
-    @app.get('/api/tiktok/tasks/{id}')
+    @app.get(prefix+'/tasks/{id}')
     def task(id:str):
         with manager.lock:
             item=manager.tasks.get(id)
-            if not item:raise HTTPException(404,'TikTok account task expired.')
+            if not item:raise HTTPException(404,manager.label+' account task expired.')
             item['account_visibility']=account_visibility(item.get('profile')) if item['status'] in ('running','queued') else item.get('account_visibility',account_visibility(item.get('profile')))
             return {key:item[key] for key in ('id','status','phase','checked','total','entries','scanned','batch_size','token','detail','profile','account_url','issue_code','stage','failed_stage','error_type','account_visibility','video_visibility') if key in item}
 
-    @app.delete('/api/tiktok/tasks/{id}',status_code=204)
+    @app.delete(prefix+'/tasks/{id}',status_code=204)
     def cancel(id:str):
         with manager.lock:
             item=manager.tasks.get(id)
             if item and item['status'] in ('queued','running','cancelling'):item['cancel'].set();item['status']='cancelling'
 
-    @app.get('/api/tiktok/previews/{token}')
+    @app.get(prefix+'/previews/{token}')
     def preview(token:str,page:int=1,size:int=30,q:str='',status:str='all'):
-        if page<1 or page>100000 or size not in (30,60,100) or len(q)>200 or status not in ('all','available','downloaded','unavailable','unknown','public','private','restricted'):raise HTTPException(400,'Invalid TikTok list filter or page.')
+        if page<1 or page>100000 or size not in (30,60,100) or len(q)>200 or status not in ('all','available','downloaded','unavailable','unknown','public','private','restricted'):raise HTTPException(400,'Invalid '+manager.label+' list filter or page.')
         with manager.lock:
             cache=manager.preview(token);rows,counts=manager.filtered(cache,q,status)
             return {'account_visibility':account_visibility(cache.get('profile')),'profile':cache.get('profile'),'token':token,'title':cache['title'],'account':cache['username'],'offset':cache['offset'],'batch_size':cache.get('batch_size',BATCH),'has_more':cache['has_more'],'busy':cache['busy'],'submitted':False,'submitted_batches':len(cache['submissions']),
                     'rows':rows[(page-1)*size:page*size],'total':len(rows),'counts':counts,'page':page,'size':size}
 
-    @app.get('/api/tiktok/previews/{token}/selection')
+    @app.get(prefix+'/previews/{token}/selection')
     def selection(token:str,q:str='',status:str='all',allow_repeat:bool=False):
-        if len(q)>200 or status not in ('all','available','downloaded','unavailable','unknown','public','private','restricted'):raise HTTPException(400,'Invalid TikTok selection filter.')
+        if len(q)>200 or status not in ('all','available','downloaded','unavailable','unknown','public','private','restricted'):raise HTTPException(400,'Invalid '+manager.label+' selection filter.')
         with manager.lock:
             rows,_=manager.filtered(manager.preview(token),q,status)
             return {'ids':[r['id'] for r in rows if r['selectable'] and not r['already_queued'] and (allow_repeat or not r['previous_downloads'])]}
 
-    @app.post('/api/tiktok/previews/{token}/checks',status_code=202)
+    @app.post(prefix+'/previews/{token}/checks',status_code=202)
     def checks(token:str,req:AccountCheckRequest):return manager.start(token=token,all_entries=req.all_entries)
 
-    @app.post('/api/tiktok/previews/{token}/download',status_code=202)
-    def queue(token:str,req:AccountQueueRequest):
+    @app.post(prefix+'/previews/{token}/download',status_code=202)
+    def queue(token:str,req:queue_model):
         with manager.lock:
             cache=manager.preview(token)
-            if cache['busy']:raise HTTPException(409,'TikTok availability checks are running. Finish or stop them before queueing.')
+            if cache['busy']:raise HTTPException(409,manager.label+' availability checks are running. Finish or stop them before queueing.')
             signature=(tuple(sorted(set(req.video_ids))),req.format,req.quality,req.allow_repeat)
             key=req.request_id or signature
             previous=cache['submissions'].get(key)
@@ -426,6 +443,8 @@ def register(main):
             result=main.queue_batch([row['url'] for row in rows],options,main.MAX_PLAYLIST,{row['url']:{k:row[k] for k in ('title','thumbnail','duration','platform')} for row in rows})
             cache['submissions'][key]=(signature,result)
             return result
+
+    if provider!='tiktok':return manager
 
     @app.post('/api/platform/{provider}/analyze')
     def analyze_source(provider:str,req:main.VideoRequest):
